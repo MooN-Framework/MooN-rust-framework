@@ -1,0 +1,8 @@
+[package]
+name = "sw-fault-tolerance"
+version = "0.1.0"
+edition = "2026"
+
+[dependencies]
+if-addrs = "0.7"
+crc32fast = "1.5.0"
