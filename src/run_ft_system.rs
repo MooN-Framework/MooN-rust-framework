@@ -25,7 +25,7 @@ impl SystemConfigData {
         port: String,
     ) -> Option<Self> {
         Some(Self {
-            state : StateMachine::InitialSync,
+            state : StateMachine::Startup,
             system_id,
             system_timeout,
             udp_socket_info: UdpSocketInfo::new(port)
@@ -213,7 +213,7 @@ fn cyclic_synchronization(sys_info: &mut SystemInformation) -> bool {
         }
 
         if let Some(rec_msg) = sys_info.udp_socket_info.receive_upd_message()
-            && rec_msg.sender_state == StateMachine::VoterFetch
+            && rec_msg.sender_state == StateMachine::ExchangeCRC
             && !sys_info.curr_fetched_crcs.contains_key(&rec_msg.sender_id)
         {
             sys_info
@@ -237,9 +237,13 @@ pub fn system_run(
             .expect("Couldn't initiate system information struct.");
     loop {
         match sys_info.state {
+            StateMachine::Startup =>
+            {
+                sys_info.state = StateMachine::InitialSync;
+            }
             StateMachine::InitialSync => {
                 initial_synchronization(&mut sys_info);
-                sys_info.state = StateMachine::CalcCritical
+                sys_info.state = StateMachine::CalcCritical;
             }
             StateMachine::CycleSync => {
                 if cyclic_synchronization(&mut sys_info) {
@@ -249,19 +253,16 @@ pub fn system_run(
             }
             StateMachine::CalcCritical => {
                 sys_info.curr_crit_mem_alloc = critical_fn();
-                sys_info.state = StateMachine::CalcCrc;
-            }
-            StateMachine::CalcCrc => {
                 sys_info.curr_crc = sys_info.curr_crit_mem_alloc.calculate_crc();
-                sys_info.state = StateMachine::VoterFetch;
+                sys_info.state = StateMachine::ExchangeCRC;
             }
-            StateMachine::VoterFetch => {
+            StateMachine::ExchangeCRC => {
                 if voter_fetch(&mut sys_info) {
                     println!("Timeout occured in {}", sys_info.state);
                 }
-                sys_info.state = StateMachine::VoteLocally;
+                sys_info.state = StateMachine::Vote;
             }
-            StateMachine::VoteLocally => {
+            StateMachine::Vote => {
                 sys_info.curr_voted_crc = vote_on_crc32(&sys_info).expect("Failed to vote on the CRC32.");
                 sys_info.state = StateMachine::PublishVote;
             }
@@ -270,7 +271,11 @@ pub fn system_run(
                 publish_vote(&sys_info);
                 sys_info.state = StateMachine::CycleSync;
             }
-            StateMachine::FailSafe => loop {
+            StateMachine::ErrorHandling =>
+            {
+                continue;
+            }
+            StateMachine::Failsafe => loop {
                 std::thread::sleep(Duration::from_secs(2));
                 println!("{}: Currently in failsafe.", sys_info.system_id);
             },
