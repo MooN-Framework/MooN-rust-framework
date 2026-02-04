@@ -43,7 +43,7 @@ impl UdpSocketInfo {
         Some(Instant::now())
     }
 
-    pub fn receive_upd_message(&self) -> Option<SystemUdpMessage> {
+    pub fn receive_udp_message(&self) -> Option<SystemUdpMessage> {
         let mut buf = [0u8; 1024];
         match self.socket.recv_from(&mut buf) {
             Ok((amt, src)) => {
@@ -68,9 +68,9 @@ impl UdpSocketInfo {
 
 
 pub struct SystemUdpMessage {
-    sender_id: u8,
-    sender_state: StateMachine,
-    sender_value: u32,
+    pub sender_id: u8,
+    pub sender_state: StateMachine,
+    pub sender_value: u32,
 }
 
 impl SystemUdpMessage {

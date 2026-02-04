@@ -1,6 +1,7 @@
 ```mermaid
 stateDiagram-v2
 %% Initial synchronization if cases
+state startup_if <<choice>>
 state init_sync_if <<choice>>
 %% System loop if cases
 state cyclic_sync_if <<choice>>
@@ -22,8 +23,10 @@ state system_valid_if <<choice>>
         %% Initial System startup
         state SystemStartup
         {
-                [*] --> Startup 
-                Startup --> InitialSynchronization : Initial configuration and healthy check done
+                [*] --> Startup
+                Startup --> startup_if : Start health check
+                startup_if --> InitialSynchronization : Initial health check correct
+                startup_if --> GoToFailsafe : Initial health check failed
                 InitialSynchronization --> init_sync_if : Synchronize cur_sys_size nodes
                 init_sync_if --> GoToFailsafe: ALL INIT_SYNC messages receive before timeout
                 init_sync_if -->  GoToSystemLoop : Not all INIT_SYNC messages received before timeout
