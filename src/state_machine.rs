@@ -28,6 +28,30 @@ impl StateMachine {
             _ => None, // Return None if input string doesn't match any variant
         }
     }
+
+    pub fn get_next_state(self, last_state: StateMachine, ok: bool) -> Self {
+        use StateMachine::*;
+
+        match self {
+            Startup       => if ok { InitialSync } else { Failsafe },
+            InitialSync   => if ok { CycleSync }   else { Failsafe },
+            CycleSync     => if ok { CalcCritical } else { ErrorHandling },
+            CalcCritical  => if ok { ExchangeCRC }  else { ErrorHandling },
+            ExchangeCRC   => if ok { Vote }         else { ErrorHandling },
+            Vote          => if ok { PublishVote }  else { ErrorHandling },
+            PublishVote   => if ok { PublishVote }  else { ErrorHandling },
+
+            ErrorHandling => {
+                if ok {
+                    last_state.get_next_state(self, true)
+                } else {
+                    Failsafe
+                }
+            }
+
+            Failsafe => Failsafe,
+        }
+    }
 }
 
 impl fmt::Display for StateMachine {
@@ -45,20 +69,4 @@ impl fmt::Display for StateMachine {
         };
         write!(f, "{}", state_str)
     }
-}
-
-
-struct EvalState{
-    state : StateMachine,
-    result : bool
-}
-
-impl EvalState
-{
-    fn new(&self, state : StateMachine, result : bool)
-    {
-        self{state, result}
-    }
-
-
 }
