@@ -46,3 +46,19 @@ impl fmt::Display for StateMachine {
         write!(f, "{}", state_str)
     }
 }
+
+
+struct EvalState{
+    state : StateMachine,
+    result : bool
+}
+
+impl EvalState
+{
+    fn new(&self, state : StateMachine, result : bool)
+    {
+        self{state, result}
+    }
+
+
+}

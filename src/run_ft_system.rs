@@ -5,19 +5,7 @@ use crate::net::udp_com::{SystemUdpMessage};
 use crate::sys_run_info::{SystemConfigData, SystemCycleData};
 use crate::mem_alloc::MemAlloc;
 
-
 const SEND_CYCLE_DURATION : Duration = Duration::from_secs(2);
-
-fn try_add_id(received_ids: &mut Vec<u8>, new_id: &u8) -> bool {
-    if !received_ids.contains(new_id) {
-        received_ids.push(*new_id);
-        println!("Added ID: {}", new_id);
-        true
-    } else {
-        println!("Duplicate ID: {}", new_id);
-        false
-    }
-}
 
 fn startup() -> bool
 {
@@ -231,21 +219,17 @@ pub fn system_run(
                 initial_synchronization(&sys_config, &mut sys_cycle);
             }
             StateMachine::CycleSync => {
-                if cyclic_synchronization(&mut sys_info) {
-                    println!("Timeout occured in {}", sys_info.state);
-                }
+
             }
             StateMachine::CalcCritical => {
-                sys_info.curr_crit_mem_alloc = critical_fn();
-                sys_info.curr_crc = sys_info.curr_crit_mem_alloc.calculate_crc();
+                sys_cycle.curr_crit_mem_alloc = critical_fn();
+                sys_cycle.curr_own_crc = sys_cycle.curr_crit_mem_alloc.calculate_crc();
             }
             StateMachine::ExchangeCRC => {
-                if voter_fetch(&mut sys_info) {
-                    println!("Timeout occured in {}", sys_info.state);
-                }
+
             }
             StateMachine::Vote => {
-                sys_info.curr_voted_crc = vote_on_crc32(&sys_info).expect("Failed to vote on the CRC32.");
+                //sys_cycle.curr_voted_crc = vote_on_crc32(&sys_info).expect("Failed to vote on the CRC32.");
             }
             StateMachine::PublishVote => {
                 sys_info.curr_publisher = decide_on_vote_publisher(&sys_info);
