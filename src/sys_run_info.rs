@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use crate::state_machine::StateMachine;
 use crate::net::udp_com::UdpSocketInfo;
 use crate::mem_alloc::MemAlloc;
+use log::{error, warn, info, debug};
 
 pub struct  SystemHealthData {
     pub sys_participants : HashSet<u8>,
@@ -91,6 +92,7 @@ impl SystemRunnerData {
     pub fn next_state_transition(&mut self, ok : bool)
     {
         self.state = self.state.get_next_state(self.state, ok);
+        debug!("Entering {}", self.state);
     }
 }
 

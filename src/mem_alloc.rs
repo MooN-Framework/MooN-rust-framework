@@ -22,11 +22,12 @@ impl MemAlloc {
         let layout: Layout = Layout::from_size_align(1, 1).expect("Couldn't create 1 1 layout.");
         Some(Self { ptr, layout })
     }
-    pub fn free(&self) {
+    pub fn free(&mut self) {
         unsafe {
-            if !self.ptr.is_null(){
+            if !self.ptr.is_null() {
                 dealloc(self.ptr, self.layout);
-            }   
+                self.ptr = std::ptr::null_mut();
+            }
         }
     }
     pub fn calculate_crc(&self) -> u32 {

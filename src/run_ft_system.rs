@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use crate::state_machine::StateMachine;
 use crate::net::udp_com::SystemUdpMessage;
 use crate::sys_run_info::{SystemRunnerData, SystemHealthData};
 use crate::mem_alloc::MemAlloc;
+use crate::state_machine::StateMachine;
+use simple_logger;
+use log::{error, warn, info, debug};
 
 const SEND_CYCLE_DURATION : Duration = Duration::from_secs(2);
 
@@ -152,6 +154,8 @@ pub fn system_run(
     let mut sys_runner : SystemRunnerData = SystemRunnerData::new(sys_id, timeout_ms, port).expect("Failed to initialize sys_config.");
     let mut sys_health : SystemHealthData = SystemHealthData::new(sys_size, sys_size, min_sys_size);
     let mut state_success : bool = true;
+    simple_logger::init_with_level(log::Level::Debug).unwrap();
+    
     loop {
         match sys_runner.state {
             StateMachine::Startup =>
@@ -188,6 +192,7 @@ pub fn system_run(
             StateMachine::Reset => {
                 sys_runner.sys_cycle.reset();
                 sys_health.reset_sys_checklist();
+                sys_runner.next_state_transition(state_success);
             }
             StateMachine::CycleSync => {
                 state_success = cyclic_synchronization(&sys_runner, &mut sys_health);

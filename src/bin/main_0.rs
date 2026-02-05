@@ -17,7 +17,7 @@ fn main() {
     let pi_id: u8 = 0;
     let min_sys_size: u8 = 1;
     let sys_size: u8 = 2;
-    let timeout_ms: u16 = 0;
+    let timeout_ms: u16 = 10000;
     let port: String = "3841".to_string();
     run_ft_system::system_run(
         pi_id,

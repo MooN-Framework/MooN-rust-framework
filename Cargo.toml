@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 if-addrs = "0.7"
 crc32fast = "1.5.0"
+simple_logger = "5.1.0"
+log = "0.4.29"
