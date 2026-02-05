@@ -5,12 +5,12 @@ use crate::net::udp_com::UdpSocketInfo;
 use crate::mem_alloc::MemAlloc;
 
 pub struct  SystemHealthData {
-    sys_participants : HashSet<u8>,
-    curr_sys_size : u8,
-    initial_sys_size: u8,
-    min_sys_size: u8,
-    sys_checklist : HashMap<u8,u32>,
-    sys_fault_set : HashSet<u8>
+    pub sys_participants : HashSet<u8>,
+    pub curr_sys_size : u8,
+    pub initial_sys_size: u8,
+    pub min_sys_size: u8,
+    pub sys_checklist : HashMap<u8,u32>,
+    pub sys_fault_set : HashSet<u8>
 }
 
 impl SystemHealthData {
@@ -67,6 +67,7 @@ pub struct SystemRunnerData {
     pub last_state : StateMachine,
     pub system_id: u8,
     pub system_timeout : u16,
+    pub sys_cycle : SystemCycleData,
     pub udp_socket_info: UdpSocketInfo,
 }
 
@@ -81,22 +82,27 @@ impl SystemRunnerData {
             last_state : StateMachine::Startup,
             system_id,
             system_timeout,
+            sys_cycle : SystemCycleData::new(),
             udp_socket_info: UdpSocketInfo::new(port)
                 .expect("Couldn't create and bind udp socket.")
         })
     }
+
+    pub fn next_state_transition(&mut self, ok : bool)
+    {
+        self.state = self.state.get_next_state(self.state, ok);
+    }
 }
 
 pub struct SystemCycleData {
-    pub curr_own_crc: u32,
-    pub curr_voted_crc: u32,
+    pub crc: u32,
+    pub voted_crc: u32,
     pub publisher: u8,
-    pub curr_fetched_crcs: HashMap<u8, u32>,
-    pub curr_crit_mem_alloc: MemAlloc,
+    pub crit_mem_alloc: MemAlloc,
 }
 
 impl SystemCycleData {
     pub fn new() -> Self {
-        Self{curr_own_crc : 0, curr_voted_crc : 0, publisher : 0, curr_fetched_crcs : HashMap::new(), curr_crit_mem_alloc : MemAlloc::new_null().expect("MemAlloc null init failed.")}
+        Self{crc : 0, voted_crc : 0, publisher : 0, crit_mem_alloc : MemAlloc::new_null().expect("MemAlloc null init failed.")}
     }
 }

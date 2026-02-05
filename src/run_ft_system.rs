@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use crate::state_machine::StateMachine;
 use crate::net::udp_com::{SystemUdpMessage};
-use crate::sys_run_info::{SystemConfigData, SystemCycleData};
+use crate::sys_run_info::{SystemRunnerData, SystemCycleData, SystemHealthData};
 use crate::mem_alloc::MemAlloc;
 
 const SEND_CYCLE_DURATION : Duration = Duration::from_secs(2);
@@ -22,81 +22,64 @@ fn startup() -> bool
     }
 }
 
-fn sys_send_receive_loop(sys_config : &SystemConfigData, sys_cycle : &mut SystemCycleData, sender_value : u32) -> bool
+fn sys_rec_gather_participants(sys_runner : &SystemRunnerData, sys_health : &mut SystemHealthData, connection_counter : &mut u8) -> u8
+{
+    if let Some(rec_msg) = sys_runner.udp_socket_info.receive_udp_message()
+        && rec_msg.sender_state == sys_runner.state
+        && sys_health.try_add_participant(rec_msg.sender_id)
+    {
+        *connection_counter += 1;
+    }
+    *connection_counter
+}
+
+fn sys_rec_sys_msg_participants(sys_runner : &SystemRunnerData, sys_health : &mut SystemHealthData, connection_counter : &mut u8) -> u8
+{
+    if let Some(rec_msg) = sys_runner.udp_socket_info.receive_udp_message()
+        && rec_msg.sender_state == sys_runner.state
+        && sys_health.is_id_participant(rec_msg.sender_id)
+        && !sys_health.sys_checklist.contains_key(&rec_msg.sender_id)
+    {
+        sys_health.sys_checklist.insert(rec_msg.sender_id, rec_msg.sender_value);
+        *connection_counter += 1;
+    }
+    *connection_counter
+}
+
+fn sys_send_receive_loop(sys_runner : &SystemRunnerData, sys_health : &mut SystemHealthData, sender_value : u32, receiv_fn : fn(&SystemRunnerData, &mut SystemHealthData, &mut u8)->u8) -> bool
 {
     let mut last_send = Instant::now();
     let mut connection_counter = 0;
-    try_add_id(&mut sys_cycle.curr_system_ids, &sys_config.system_id);
     let timeout_start = Instant::now();
     loop {
-        if sys_config.system_timeout != 0
-            && timeout_start.elapsed() >= Duration::from_millis(sys_config.system_timeout.into())
+        if sys_runner.system_timeout != 0
+            && timeout_start.elapsed() >= Duration::from_millis(sys_runner.system_timeout.into())
         {
             return false;
         }
 
         if last_send.elapsed() >= SEND_CYCLE_DURATION {
             let send_msg: SystemUdpMessage =
-                SystemUdpMessage::new(sys_config.system_id, sys_config.state.get(), sender_value);
-            last_send = sys_config
+                SystemUdpMessage::new(sys_runner.system_id, sys_runner.state, sender_value);
+            last_send = sys_runner
                 .udp_socket_info
                 .send_udp_message(send_msg)
                 .expect("Couldn't sent udp message.");
-            if connection_counter >= (sys_config.sys_size.get() - 1) {
+            if connection_counter == (sys_health.curr_sys_size - 1) {
                 return true;
             }
         }
 
-        if let Some(rec_msg) = sys_config.udp_socket_info.receive_udp_message()
-            && rec_msg.sender_state == sys_config.state.get()
-            && try_add_id(&mut sys_cycle.curr_system_ids, &rec_msg.sender_id)
-        {
-            connection_counter += 1;
-        }
+        connection_counter = receiv_fn(sys_runner, sys_health, &mut connection_counter);
     }
 }
 
-fn initial_synchronization(sys_config : &SystemConfigData, sys_cycle : &mut SystemCycleData) {
-    let state_result = sys_send_receive_loop(sys_config, sys_cycle, 0);
-
+fn initial_synchronization(sys_config : &SystemRunnerData, sys_health : &mut SystemHealthData) -> bool{
+   sys_send_receive_loop(sys_config, sys_health, 0, sys_rec_gather_participants)
 }
 
-fn voter_fetch(sys_info: &mut SystemInformation) -> bool {
-    let mut last_send = Instant::now();
-    let mut fetched_counter: u8 = 0;
-    sys_info
-        .curr_fetched_crcs
-        .insert(sys_info.system_id, sys_info.curr_crc);
-    let timeout_start = Instant::now();
-    loop {
-        if sys_info.system_timeout != 0
-            && timeout_start.elapsed() >= Duration::from_millis(sys_info.system_timeout.into())
-        {
-            return true;
-        }
-
-        if last_send.elapsed() >= SEND_CYCLE_DURATION {
-            let send_msg: SystemUdpMessage =
-                SystemUdpMessage::new(sys_info.system_id, sys_info.state, sys_info.curr_crc);
-            last_send = sys_info
-                .udp_socket_info
-                .send_udp_message(send_msg)
-                .expect("Couldn't sent udp message.");
-            if fetched_counter >= sys_info.curr_sys_size - 1 {
-                return false;
-            }
-        }
-
-        if let Some(rec_msg) = sys_info.udp_socket_info.receive_upd_message()
-            && rec_msg.sender_state == StateMachine::VoterFetch
-            && !sys_info.curr_fetched_crcs.contains_key(&rec_msg.sender_id)
-        {
-            sys_info
-                .curr_fetched_crcs
-                .insert(rec_msg.sender_id, rec_msg.sender_value);
-            fetched_counter += 1;
-        }
-    }
+fn exchange_crc(sys_runner: &SystemRunnerData, sys_health : &mut SystemHealthData) -> bool {
+    sys_send_receive_loop(sys_runner, sys_health, 0, sys_rec_sys_msg_participants)
 }
 
 fn vote_on_crc32(sys_info: &SystemInformation) -> Option<u32> {
@@ -204,44 +187,50 @@ pub fn system_run(
     timeout_ms: u16,
     critical_fn: fn() -> MemAlloc,
 ) {
-    let sys_config : SystemConfigData = SystemConfigData::new(sys_id, timeout_ms, sys_size, min_sys_size, port).expect("");
-    let mut sys_cycle : SystemCycleData = SystemCycleData::new();
-    let state_success : bool = true;
-
+    let mut sys_runner : SystemRunnerData = SystemRunnerData::new(sys_id, timeout_ms, port).expect("Failed to initialize sys_config.");
+    let mut sys_health : SystemHealthData = SystemHealthData::new(sys_size, sys_size, min_sys_size);
+    let mut state_success : bool = true;
     loop {
-        match sys_config.state.get() {
+        match sys_runner.state {
             StateMachine::Startup =>
             {
                 state_success = startup();
-                sys_config.state.set(StateMachine::InitialSync);
+                sys_runner.next_state_transition(state_success);
             }
             StateMachine::InitialSync => {
-                initial_synchronization(&sys_config, &mut sys_cycle);
-            }
-            StateMachine::CycleSync => {
-
+                state_success = initial_synchronization(&sys_runner, &mut sys_health);
+                sys_runner.next_state_transition(state_success);
             }
             StateMachine::CalcCritical => {
-                sys_cycle.curr_crit_mem_alloc = critical_fn();
-                sys_cycle.curr_own_crc = sys_cycle.curr_crit_mem_alloc.calculate_crc();
+                sys_runner.sys_cycle.crit_mem_alloc = critical_fn();
+                sys_runner.sys_cycle.crc = sys_runner.sys_cycle.crit_mem_alloc.calculate_crc();
+                // TODO change to proper error handling!
+                state_success = true;
+                sys_runner.next_state_transition(state_success);
             }
             StateMachine::ExchangeCRC => {
-
+                state_success = exchange_crc(&sys_runner, &mut sys_health);
+                sys_runner.next_state_transition(state_success);
             }
             StateMachine::Vote => {
                 //sys_cycle.curr_voted_crc = vote_on_crc32(&sys_info).expect("Failed to vote on the CRC32.");
+                sys_runner.next_state_transition(state_success);
             }
             StateMachine::PublishVote => {
-                sys_info.curr_publisher = decide_on_vote_publisher(&sys_info);
-                publish_vote(&sys_info);
+                //sys_info.curr_publisher = decide_on_vote_publisher(&sys_info);
+                //publish_vote(&sys_info);
+                sys_runner.next_state_transition(state_success);
+            }
+            StateMachine::CycleSync => {
+                sys_runner.next_state_transition(state_success);
             }
             StateMachine::ErrorHandling =>
             {
-                continue;
+                sys_runner.next_state_transition(state_success);
             }
             StateMachine::Failsafe => loop {
                 std::thread::sleep(Duration::from_secs(2));
-                println!("{}: Currently in failsafe.", sys_config.system_id);
+                println!("{}: Currently in failsafe.", sys_runner.system_id);
             },
         }
     }
