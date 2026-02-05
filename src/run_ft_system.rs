@@ -46,6 +46,7 @@ fn sys_send_receive_loop(sys_runner : &SystemRunnerData, sys_health : &mut Syste
     let mut last_send = Instant::now();
     let mut connection_counter = 0;
     let timeout_start = Instant::now();
+    sys_health.reset_sys_checklist();
     loop {
         if sys_runner.system_timeout != 0
             && timeout_start.elapsed() >= Duration::from_millis(sys_runner.system_timeout.into())
@@ -185,7 +186,8 @@ pub fn system_run(
                 sys_runner.next_state_transition(state_success);
             }
             StateMachine::Reset => {
-
+                sys_runner.sys_cycle.reset();
+                sys_health.reset_sys_checklist();
             }
             StateMachine::CycleSync => {
                 state_success = cyclic_synchronization(&sys_runner, &mut sys_health);
