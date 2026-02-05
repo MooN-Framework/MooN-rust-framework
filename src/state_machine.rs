@@ -36,7 +36,7 @@ impl StateMachine {
 
         match self {
             Startup       => if ok { InitialSync } else { Failsafe },
-            InitialSync   => if ok { CycleSync }   else { Failsafe },
+            InitialSync   => if ok { CalcCritical }   else { Failsafe },
             CycleSync     => if ok { CalcCritical } else { ErrorHandling },
             CalcCritical  => if ok { ExchangeCRC }  else { ErrorHandling },
             ExchangeCRC   => if ok { Vote }         else { ErrorHandling },

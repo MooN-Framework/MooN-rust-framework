@@ -1,6 +1,8 @@
 use std::net::{Ipv4Addr, UdpSocket};
 use std::time::{Instant};
 use std::fmt;
+use log::{debug, error, trace};
+
 use crate::state_machine::StateMachine;
 use crate::net::network_helper;
 
@@ -24,9 +26,9 @@ impl UdpSocketInfo {
             .set_nonblocking(true)
             .expect("Couldn't set socket to nonblocking.");
 
-        println!("Device IPv4: {}", ipv4_addr);
-        println!("Listening on 0.0.0.0:{}", port);
-        println!("Sending to broadcast: {}", broadcast_addr);
+        debug!("Device IPv4: {}", ipv4_addr);
+        debug!("Listening on 0.0.0.0:{}", port);
+        debug!("Sending to broadcast: {}", broadcast_addr);
         Some(Self {
             socket,
             ipv4_addr,
@@ -39,7 +41,7 @@ impl UdpSocketInfo {
         self.socket
             .send_to(msg.as_bytes(), &self.broadcast_addr)
             .expect("Couldn't send!");
-        println!("Sent: {}", msg);
+        trace!("Sent: {}", msg);
         Some(Instant::now())
     }
 
@@ -51,7 +53,7 @@ impl UdpSocketInfo {
                         let parsed_udp_msg: SystemUdpMessage =
                             SystemUdpMessage::new_from_string(&String::from_utf8_lossy(&buf[..amt]))
                                 .expect("Couldn't create SystemUdpMessage from string.");
-                        println!(
+                        trace!(
                             "Received Message{} STATE:{} VALUE:{}",
                             parsed_udp_msg.sender_id,
                             parsed_udp_msg.sender_state,
@@ -93,7 +95,6 @@ impl SystemUdpMessage {
                 })
             }
             [part1, part2] => {
-                println!("{} {}", part1, part2);
                 let sender_id: u8 = part1
                     .parse::<u8>()
                     .expect("Error couldn't parse the sender_id from udp msg.");
@@ -107,7 +108,7 @@ impl SystemUdpMessage {
                 })
             }
             _ => {
-                println!("Unexpected format");
+                error!("Unexpected udp message format.");
                 None
             }
         }

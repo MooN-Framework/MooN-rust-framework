@@ -127,20 +127,19 @@ fn decide_on_vote_publisher(sys_runner : &SystemRunnerData, sys_health: &SystemH
 
 fn publish_vote(sys_runner : &SystemRunnerData) {
     if sys_runner.system_id == sys_runner.sys_cycle.publisher {
-        println!(
-            "PUBLISH_VOTE: IM PI:{}, publishing value.",
-            sys_runner.system_id
-        );
+        info!("I am the publisher.");
     } else {
-        println!(
-            "Publisher is {}",
-            sys_runner.sys_cycle.publisher
-        );
+        info!("Publisher is node {}",sys_runner.sys_cycle.publisher);
     }
 }
 
 fn cyclic_synchronization(sys_runner : &SystemRunnerData, sys_health : &mut SystemHealthData) -> bool {
     sys_send_receive_loop(sys_runner, sys_health, 0, sys_rec_sys_msg_participants)
+}
+
+fn error_handling(sys_runner : &SystemRunnerData, sys_health: &mut SystemHealthData) -> bool
+{
+    true
 }
 
 pub fn system_run(
@@ -200,11 +199,11 @@ pub fn system_run(
             }
             StateMachine::ErrorHandling =>
             {
+                state_success = error_handling(&sys_runner, &mut sys_health);
                 sys_runner.next_state_transition(state_success);
             }
             StateMachine::Failsafe => loop {
                 std::thread::sleep(Duration::from_secs(2));
-                println!("{}: Currently in failsafe.", sys_runner.system_id);
             },
         }
     }

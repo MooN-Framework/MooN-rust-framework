@@ -31,6 +31,11 @@ impl SystemHealthData {
         self.sys_participants.contains(&sys_id)
     }
 
+    pub fn check_self_fault(&self)
+    {
+        
+    }
+
     pub fn try_add_participant(&mut self, sys_id : u8) -> bool
     {
         if !self.is_id_participant(sys_id) {
