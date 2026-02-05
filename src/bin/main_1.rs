@@ -1,5 +1,6 @@
-use crate::mem_alloc;
-use crate::run_ft_system;
+use std::mem;
+use swb_fault_tolerance::mem_alloc::MemAlloc;
+use swb_fault_tolerance::run_ft_system;
 
 pub fn critical_task() -> MemAlloc {
     println!("Starting critical task..");
