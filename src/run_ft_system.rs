@@ -14,12 +14,7 @@ fn startup() -> bool
     const HEALTH_CHECK_CMP_VAL : u8 = 0x20;
     let mut test_variable : u8 = 0;
     test_variable += HEALTH_CHECK_VAL + HEALTH_CHECK_VAL;
-    if test_variable == HEALTH_CHECK_CMP_VAL
-    {
-        true
-    }else{
-        false
-    }
+    test_variable == HEALTH_CHECK_CMP_VAL
 }
 
 fn sys_rec_gather_participants(sys_runner : &SystemRunnerData, sys_health : &mut SystemHealthData, connection_counter : &mut u8) -> u8
@@ -188,6 +183,9 @@ pub fn system_run(
                 sys_runner.sys_cycle.publisher = decide_on_vote_publisher(&sys_runner, &sys_health);
                 publish_vote(&sys_runner);
                 sys_runner.next_state_transition(state_success);
+            }
+            StateMachine::Reset => {
+
             }
             StateMachine::CycleSync => {
                 state_success = cyclic_synchronization(&sys_runner, &mut sys_health);

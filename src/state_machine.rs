@@ -11,6 +11,7 @@ pub enum StateMachine {
     PublishVote,
     ErrorHandling,
     Failsafe,
+    Reset,
 }
 
 impl StateMachine {
@@ -25,6 +26,7 @@ impl StateMachine {
             "PublishVote" => Some(StateMachine::PublishVote),
             "ErrorHandling" => Some(StateMachine::ErrorHandling),
             "Failsafe" => Some(StateMachine::Failsafe),
+            "Reset" => Some(StateMachine::Reset),
             _ => None, // Return None if input string doesn't match any variant
         }
     }
@@ -39,8 +41,8 @@ impl StateMachine {
             CalcCritical  => if ok { ExchangeCRC }  else { ErrorHandling },
             ExchangeCRC   => if ok { Vote }         else { ErrorHandling },
             Vote          => if ok { PublishVote }  else { ErrorHandling },
-            PublishVote   => if ok { PublishVote }  else { ErrorHandling },
-
+            PublishVote   => if ok { Reset }  else { ErrorHandling },
+            Reset         => CycleSync,
             ErrorHandling => {
                 if ok {
                     last_state.get_next_state(self, true)
@@ -48,7 +50,6 @@ impl StateMachine {
                     Failsafe
                 }
             }
-
             Failsafe => Failsafe,
         }
     }
@@ -64,6 +65,7 @@ impl fmt::Display for StateMachine {
             StateMachine::ExchangeCRC => "ExchangeCRC",
             StateMachine::Vote => "Vote",
             StateMachine::PublishVote => "PublishVote",
+            StateMachine::Reset => "Reset",
             StateMachine::ErrorHandling => "ErrorHandling",
             StateMachine::Failsafe => "Failsafe",
         };

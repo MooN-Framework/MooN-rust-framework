@@ -60,7 +60,7 @@ impl UdpSocketInfo {
                         return Some(parsed_udp_msg);
                     }
                 }
-                Err(e) => {}
+                Err(_e) => {}
             }
             None
         }

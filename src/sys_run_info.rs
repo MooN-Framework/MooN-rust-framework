@@ -105,4 +105,13 @@ impl SystemCycleData {
     pub fn new() -> Self {
         Self{crc : 0, voted_crc : 0, publisher : 0, crit_mem_alloc : MemAlloc::new_null().expect("MemAlloc null init failed.")}
     }
+
+    pub fn reset(&mut self){
+        self.crc = 0;
+        self.voted_crc = 0;
+        self.publisher = 0;
+        self.crit_mem_alloc.free();
+    }
 }
+
+impl Default for SystemCycleData { fn default() -> Self {Self::new()}}
