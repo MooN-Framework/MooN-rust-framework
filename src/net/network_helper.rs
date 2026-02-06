@@ -1,5 +1,5 @@
-use std::net::Ipv4Addr;
 use if_addrs::{IfAddr, get_if_addrs};
+use std::net::Ipv4Addr;
 
 pub fn get_eth0_ipv4_and_broadcast() -> Option<(Ipv4Addr, Ipv4Addr)> {
     if let Ok(ifaces) = get_if_addrs() {

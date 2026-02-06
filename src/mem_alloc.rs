@@ -1,6 +1,6 @@
-use std::slice;
-use std::alloc::{Layout, alloc, dealloc};
 use crc32fast::Hasher;
+use std::alloc::{Layout, alloc, dealloc};
+use std::slice;
 
 pub struct MemAlloc {
     pub ptr: *mut u8,

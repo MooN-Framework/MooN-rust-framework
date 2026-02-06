@@ -7,6 +7,7 @@ state init_sync_if <<choice>>
 state cyclic_sync_if <<choice>>
 state exchange_crc_if <<choice>>
 state vote_if <<choice>>
+state exchange_vote_if <<choice>>
 %% Error Handling if cases
 state error_if <<choice>>
 state system_valid_if <<choice>>
@@ -44,10 +45,15 @@ state system_valid_if <<choice>>
                 exchange_crc_if --> EnterErrorHandling : Atleast one CRC missing => timeout
                 
                 Vote --> vote_if : Voted locally
-                vote_if --> PublishVote : Voting with no errors detected
-                vote_if --> EnterErrorHandling : Faulty device detected
+                vote_if --> ExchangeVote : Voting with no errors detected
+                vote_if --> EnterErrorHandling : Faulty CRC detected while voting
 
-                PublishVote --> CyclicSynchronization : Published voting result
+                ExchangeVote --> exchange_vote_if : Exchange CRCs
+                exchange_vote_if --> PublishVote : No wrong Voter occured
+                exchange_vote_if --> EnterErrorHandling : A node voted a wrong publisher/crc
+
+                PublishVote --> Reset : Published voting result from voted publisher
+                Reset --> CyclicSynchronization : Reset for next iteration
                 
                 CyclicSynchronization --> cyclic_sync_if : CurSys = InitSysSize before timeout
                 cyclic_sync_if --> CalcCritical : ALL CYCLE_SYNC messages received before timeout

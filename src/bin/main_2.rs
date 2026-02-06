@@ -13,8 +13,8 @@ pub fn critical_task() -> MemAlloc {
 
 fn main() {
     let pi_id: u8 = 2;
-    let min_sys_size: u8 = 1;
-    let sys_size: u8 = 2;
+    let min_sys_size: u8 = 2;
+    let sys_size: u8 = 3;
     let timeout_ms: u16 = 0;
     let port: String = "3841".to_string();
     run_ft_system::system_run(

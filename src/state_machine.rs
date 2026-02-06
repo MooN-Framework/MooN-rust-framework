@@ -35,14 +35,56 @@ impl StateMachine {
         use StateMachine::*;
 
         match self {
-            Startup       => if ok { InitialSync } else { Failsafe },
-            InitialSync   => if ok { CalcCritical }   else { Failsafe },
-            CycleSync     => if ok { CalcCritical } else { ErrorHandling },
-            CalcCritical  => if ok { ExchangeCRC }  else { ErrorHandling },
-            ExchangeCRC   => if ok { Vote }         else { ErrorHandling },
-            Vote          => if ok { PublishVote }  else { ErrorHandling },
-            PublishVote   => if ok { Reset }  else { ErrorHandling },
-            Reset         => CycleSync,
+            Startup => {
+                if ok {
+                    InitialSync
+                } else {
+                    Failsafe
+                }
+            }
+            InitialSync => {
+                if ok {
+                    CalcCritical
+                } else {
+                    Failsafe
+                }
+            }
+            CycleSync => {
+                if ok {
+                    CalcCritical
+                } else {
+                    ErrorHandling
+                }
+            }
+            CalcCritical => {
+                if ok {
+                    ExchangeCRC
+                } else {
+                    ErrorHandling
+                }
+            }
+            ExchangeCRC => {
+                if ok {
+                    Vote
+                } else {
+                    ErrorHandling
+                }
+            }
+            Vote => {
+                if ok {
+                    PublishVote
+                } else {
+                    ErrorHandling
+                }
+            }
+            PublishVote => {
+                if ok {
+                    Reset
+                } else {
+                    ErrorHandling
+                }
+            }
+            Reset => CycleSync,
             ErrorHandling => {
                 if ok {
                     last_state.get_next_state(self, true)

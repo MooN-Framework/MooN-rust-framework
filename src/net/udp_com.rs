@@ -1,10 +1,10 @@
-use std::net::{Ipv4Addr, UdpSocket};
-use std::time::{Instant};
-use std::fmt;
 use log::{debug, error, trace};
+use std::fmt;
+use std::net::{Ipv4Addr, UdpSocket};
+use std::time::Instant;
 
-use crate::state_machine::StateMachine;
 use crate::net::network_helper;
+use crate::state_machine::StateMachine;
 
 pub struct UdpSocketInfo {
     socket: UdpSocket,
@@ -14,8 +14,9 @@ pub struct UdpSocketInfo {
 
 impl UdpSocketInfo {
     pub fn new(port: String) -> Option<Self> {
-        let (ipv4_addr, broadcast_ipv4addr): (Ipv4Addr, Ipv4Addr) = network_helper::get_eth0_ipv4_and_broadcast()
-            .expect("Couldn't retrieve ipv4 addr of device and broadcast addr.");
+        let (ipv4_addr, broadcast_ipv4addr): (Ipv4Addr, Ipv4Addr) =
+            network_helper::get_eth0_ipv4_and_broadcast()
+                .expect("Couldn't retrieve ipv4 addr of device and broadcast addr.");
         let broadcast_addr = format!("{}:{}", broadcast_ipv4addr, port);
         let socket = UdpSocket::bind(format!("{}:{}", "0.0.0.0", port))
             .expect("Couldn't bind to ip socket.");
@@ -50,24 +51,23 @@ impl UdpSocketInfo {
         match self.socket.recv_from(&mut buf) {
             Ok((amt, src)) => {
                 if src.ip() != std::net::IpAddr::V4(self.ipv4_addr) {
-                        let parsed_udp_msg: SystemUdpMessage =
-                            SystemUdpMessage::new_from_string(&String::from_utf8_lossy(&buf[..amt]))
-                                .expect("Couldn't create SystemUdpMessage from string.");
-                        trace!(
-                            "Received Message{} STATE:{} VALUE:{}",
-                            parsed_udp_msg.sender_id,
-                            parsed_udp_msg.sender_state,
-                            parsed_udp_msg.sender_value
-                        );
-                        return Some(parsed_udp_msg);
-                    }
+                    let parsed_udp_msg: SystemUdpMessage =
+                        SystemUdpMessage::new_from_string(&String::from_utf8_lossy(&buf[..amt]))
+                            .expect("Couldn't create SystemUdpMessage from string.");
+                    trace!(
+                        "Received Message{} STATE:{} VALUE:{}",
+                        parsed_udp_msg.sender_id,
+                        parsed_udp_msg.sender_state,
+                        parsed_udp_msg.sender_value
+                    );
+                    return Some(parsed_udp_msg);
                 }
-                Err(_e) => {}
             }
-            None
+            Err(_e) => {}
         }
+        None
+    }
 }
-
 
 pub struct SystemUdpMessage {
     pub sender_id: u8,
