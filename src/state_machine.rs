@@ -8,6 +8,7 @@ pub enum StateMachine {
     CalcCritical,
     ExchangeCRC,
     Vote,
+    ExchangeVote,
     PublishVote,
     ErrorHandling,
     Failsafe,
@@ -23,6 +24,7 @@ impl StateMachine {
             "CalcCritical" => Some(StateMachine::CalcCritical),
             "ExchangeCRC" => Some(StateMachine::ExchangeCRC),
             "Vote" => Some(StateMachine::Vote),
+            "ExchangeVote" => Some(StateMachine::ExchangeVote),
             "PublishVote" => Some(StateMachine::PublishVote),
             "ErrorHandling" => Some(StateMachine::ErrorHandling),
             "Failsafe" => Some(StateMachine::Failsafe),
@@ -72,6 +74,13 @@ impl StateMachine {
             }
             Vote => {
                 if ok {
+                    ExchangeVote
+                } else {
+                    ErrorHandling
+                }
+            }
+            ExchangeVote => {
+                if ok {
                     PublishVote
                 } else {
                     ErrorHandling
@@ -106,6 +115,7 @@ impl fmt::Display for StateMachine {
             StateMachine::CalcCritical => "CalcCritical",
             StateMachine::ExchangeCRC => "ExchangeCRC",
             StateMachine::Vote => "Vote",
+            StateMachine::ExchangeVote => "ExchangeVote",
             StateMachine::PublishVote => "PublishVote",
             StateMachine::Reset => "Reset",
             StateMachine::ErrorHandling => "ErrorHandling",
