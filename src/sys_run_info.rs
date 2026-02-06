@@ -15,10 +15,10 @@ pub struct  SystemHealthData {
 }
 
 impl SystemHealthData {
-    pub fn new(initial_sys_size : u8, curr_system_id :u8, min_sys_size : u8) -> Self
+    pub fn new(initial_sys_size : u8, node_sys_id :u8, min_sys_size : u8) -> Self
     {
         let mut sys_participants = HashSet::new();
-        sys_participants.insert(curr_system_id);
+        sys_participants.insert(node_sys_id);
         Self{sys_participants, initial_sys_size, curr_sys_size : initial_sys_size, min_sys_size, sys_checklist : HashMap::new(), sys_fault_set : HashSet::new()}
     }
 
@@ -31,9 +31,9 @@ impl SystemHealthData {
         self.sys_participants.contains(&sys_id)
     }
 
-    pub fn check_self_fault(&self)
+    pub fn check_self_fault(&self, sys_runner : &SystemRunnerData) -> bool
     {
-        
+        self.sys_fault_set.contains(&sys_runner.system_id)
     }
 
     pub fn try_add_participant(&mut self, sys_id : u8) -> bool
@@ -62,9 +62,15 @@ impl SystemHealthData {
         false
     }
 
-    pub fn reset_sys_checklist(&mut self)
+    pub fn reset_sys_checklist(&mut self, sys_runner : &SystemRunnerData, sender_val : u32)
     {
         self.sys_checklist.clear();
+        self.sys_checklist.insert(sys_runner.system_id, sender_val);
+    }
+
+    pub fn reset_sys_fault_set(&mut self)
+    {
+        self.sys_fault_set.clear();
     }
 }
 
@@ -94,11 +100,14 @@ impl SystemRunnerData {
         })
     }
 
-    pub fn next_state_transition(&mut self, ok : bool)
-    {
-        self.state = self.state.get_next_state(self.state, ok);
-        debug!("Entering {}", self.state);
-    }
+pub fn next_state_transition(&mut self, ok: bool) {
+    let curr = self.state;
+    let prev = self.last_state;
+    let next = curr.get_next_state(prev, ok);
+    self.last_state = curr;
+    self.state = next;
+    debug!("Last State {}, Next State {}", self.last_state, self.state);
+}
 }
 
 pub struct SystemCycleData {

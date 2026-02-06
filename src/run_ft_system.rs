@@ -48,11 +48,19 @@ fn sys_send_receive_loop(sys_runner : &SystemRunnerData, sys_health : &mut Syste
     let mut last_send = Instant::now();
     let mut connection_counter = 0;
     let timeout_start = Instant::now();
-    sys_health.reset_sys_checklist();
+    sys_health.reset_sys_checklist(sys_runner, sender_value);
     loop {
         if sys_runner.system_timeout != 0
             && timeout_start.elapsed() >= Duration::from_millis(sys_runner.system_timeout.into())
         {
+            warn!("Timeout triggered in {},", sys_runner.state);
+            for sys_id in sys_health.sys_participants.iter()
+            {
+                if !sys_health.sys_checklist.contains_key(sys_id)
+                {
+                    sys_health.sys_fault_set.insert(*sys_id);
+                }
+            }
             return false;
         }
 
@@ -97,7 +105,7 @@ fn vote_on_crc32(sys_runner : &SystemRunnerData, sys_health : &mut SystemHealthD
         .max_by_key(|&(_, count)| count)
         .and_then(|(crc, count)| {
             if count > total / 2 {
-                println!("PI{}: Voted {:X}", sys_runner.system_id, crc);
+                debug!("PI{}: Voted {:X}", sys_runner.system_id, crc);
                 Some(crc)
             } else {
                 None
@@ -109,12 +117,6 @@ fn decide_on_vote_publisher(sys_runner : &SystemRunnerData, sys_health: &SystemH
     let mut curr_main_cpu: u8 = u8::MAX;
     for &system_id in sys_health.sys_participants.iter() {
         if system_id < curr_main_cpu {
-            println!(
-                "CURRENT SYSTEMD ID: {}; CURRENT_MAIN_CPU{}; Current systemIdsLen{}",
-                system_id,
-                curr_main_cpu,
-                sys_health.sys_participants.len()
-            );
             if let Some(crc) = sys_health.sys_checklist.get(&system_id)
                 && *crc == sys_runner.sys_cycle.voted_crc
             {
@@ -139,6 +141,31 @@ fn cyclic_synchronization(sys_runner : &SystemRunnerData, sys_health : &mut Syst
 
 fn error_handling(sys_runner : &SystemRunnerData, sys_health: &mut SystemHealthData) -> bool
 {
+    if sys_health.check_self_fault(sys_runner)
+    {
+        error!("Fault was detected on device SYS_ID:{}",sys_runner.system_id);
+        return false;
+    }
+    
+    if !sys_health.sys_fault_set.is_empty()
+    {
+        for sys_id in sys_health.sys_fault_set.iter()
+        {
+            info!("Removing participant SYS_ID:{}",sys_id);
+            sys_health.sys_participants.remove(sys_id);
+            sys_health.curr_sys_size -= 1;
+        }
+    }
+
+    if sys_health.sys_participants.len() < sys_health.min_sys_size.into()
+    {
+        error!("Current system size shrinked below minimal system size, moving to failsafe.");
+        return false
+    }
+
+    info!("Running system in degraded mode, current system size {}", sys_health.curr_sys_size);
+
+    sys_health.reset_sys_fault_set();
     true
 }
 
@@ -151,10 +178,11 @@ pub fn system_run(
     critical_fn: fn() -> MemAlloc,
 ) {
     let mut sys_runner : SystemRunnerData = SystemRunnerData::new(sys_id, timeout_ms, port).expect("Failed to initialize sys_config.");
-    let mut sys_health : SystemHealthData = SystemHealthData::new(sys_size, sys_size, min_sys_size);
+    let mut sys_health : SystemHealthData = SystemHealthData::new(sys_size, sys_id, min_sys_size);
     let mut state_success : bool = true;
-    simple_logger::init_with_level(log::Level::Debug).unwrap();
-    
+    let mut iteration_counter = 0;
+    simple_logger::init_with_level(log::Level::Info).unwrap();
+    info!("Starting up system ID:{}",sys_runner.system_id);
     loop {
         match sys_runner.state {
             StateMachine::Startup =>
@@ -178,7 +206,7 @@ pub fn system_run(
                 sys_runner.next_state_transition(state_success);
             }
             StateMachine::Vote => {
-                sys_runner.sys_cycle.crc = vote_on_crc32(&sys_runner, &mut sys_health).expect("Failed to vote on the CRC32.");
+                sys_runner.sys_cycle.voted_crc = vote_on_crc32(&sys_runner, &mut sys_health).expect("Failed to vote on the CRC32.");
                 //TODO change to proper error handling!
                 state_success = true;
                 sys_runner.next_state_transition(state_success);
@@ -190,8 +218,10 @@ pub fn system_run(
             }
             StateMachine::Reset => {
                 sys_runner.sys_cycle.reset();
-                sys_health.reset_sys_checklist();
                 sys_runner.next_state_transition(state_success);
+                
+                info!("Finished Iteration Num {iteration_counter}");
+                iteration_counter += 1
             }
             StateMachine::CycleSync => {
                 state_success = cyclic_synchronization(&sys_runner, &mut sys_health);
@@ -204,6 +234,7 @@ pub fn system_run(
             }
             StateMachine::Failsafe => loop {
                 std::thread::sleep(Duration::from_secs(2));
+                error!("Node in failsafe")
             },
         }
     }
