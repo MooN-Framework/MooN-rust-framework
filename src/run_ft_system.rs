@@ -9,15 +9,6 @@ use std::time::{Duration, Instant};
 
 const SEND_CYCLE_DURATION: Duration = Duration::from_secs(2);
 
-fn startup() -> bool {
-    /* Do some dummy calculation to check if device is working correct */
-    const HEALTH_CHECK_VAL: u8 = 0x10;
-    const HEALTH_CHECK_CMP_VAL: u8 = 0x20;
-    let mut test_variable: u8 = 0;
-    test_variable += HEALTH_CHECK_VAL + HEALTH_CHECK_VAL;
-    test_variable == HEALTH_CHECK_CMP_VAL
-}
-
 fn sys_rec_gather_participants(
     sys_runner: &SystemRunnerData,
     sys_health: &mut SystemHealthData,
@@ -89,6 +80,65 @@ fn sys_send_receive_loop(
     }
 }
 
+fn std_majority_vote(sys_runner: &SystemRunnerData, sys_health: &mut SystemHealthData, save_result: Option<&mut u32>,) -> bool
+{
+    let mut counter: HashMap<u32, usize> = HashMap::new();
+    for &publisher in sys_health.sys_checklist.values() {
+        *counter.entry(publisher).or_insert(0) += 1;
+    }
+
+    let majority = counter
+        .iter()
+        .max_by_key(|(_k, v)| *v)
+        .map(|(k, v)| (*k, *v));
+
+    let (majority_value, major_count) = match majority {
+        None => 
+        {
+            sys_health.sys_fault_set.insert(sys_runner.system_id);
+            return false;
+        }
+        Some(x) => x,
+    };
+
+    if let Some(out) = save_result {
+        *out = majority_value;
+    }
+
+    debug!("Node:{} MajorValue:{} MajorCount:{}",sys_runner.system_id, majority_value, major_count);
+
+    if major_count < sys_health.min_sys_size.into() {
+        for id in sys_health.sys_participants.iter()
+        {
+            sys_health.sys_fault_set.insert(*id);
+        }
+        return false;
+    }
+
+    for (&id, &value) in sys_health.sys_checklist.iter()
+    {
+        if value != majority_value
+        {
+            sys_health.sys_fault_set.insert(id);
+        }
+
+        if !sys_health.sys_fault_set.is_empty()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn startup() -> bool {
+    /* Do some dummy calculation to check if device is working correct */
+    const HEALTH_CHECK_VAL: u8 = 0x10;
+    const HEALTH_CHECK_CMP_VAL: u8 = 0x20;
+    let mut test_variable: u8 = 0;
+    test_variable += HEALTH_CHECK_VAL + HEALTH_CHECK_VAL;
+    test_variable == HEALTH_CHECK_CMP_VAL
+}
+
 fn initial_synchronization(
     sys_config: &SystemRunnerData,
     sys_health: &mut SystemHealthData,
@@ -105,28 +155,11 @@ fn exchange_crc(sys_runner: &SystemRunnerData, sys_health: &mut SystemHealthData
     )
 }
 
-fn vote_on_crc32(sys_health: &mut SystemHealthData) -> Option<u32> {
-    let total = sys_health.sys_checklist.len();
-    if total == 0 {
-        return None;
-    }
-
-    let mut counts: HashMap<u32, usize> = HashMap::new();
-
-    for &crc in sys_health.sys_checklist.values() {
-        *counts.entry(crc).or_insert(0) += 1;
-    }
-
-    counts
-        .into_iter()
-        .max_by_key(|&(_, count)| count)
-        .and_then(|(crc, count)| {
-            if count > total / 2 {
-                Some(crc)
-            } else {
-                None
-            }
-        })
+fn vote_on_crc32(sys_runner: &mut SystemRunnerData, sys_health: &mut SystemHealthData) -> bool {
+    let mut voted_crc : u32 = 0;
+    let success : bool = std_majority_vote(sys_runner, sys_health, Some(&mut voted_crc));
+    sys_runner.sys_cycle.voted_crc = voted_crc;
+    success
 }
 
 fn decide_on_vote_publisher(sys_runner: &SystemRunnerData, sys_health: &SystemHealthData) -> u8 {
@@ -155,48 +188,7 @@ fn exchange_vote(sys_runner: &SystemRunnerData, sys_health: &mut SystemHealthDat
         return false;
     }
 
-    let mut counter: HashMap<u32, usize> = HashMap::new();
-    for &publisher in sys_health.sys_checklist.values() {
-        *counter.entry(publisher).or_insert(0) += 1;
-    }
-
-    let majority = counter
-        .iter()
-        .max_by_key(|(_k, v)| *v)
-        .map(|(k, v)| (*k, *v));
-
-    let (major_id, major_count) = match majority {
-        None => 
-        {
-            sys_health.sys_fault_set.insert(sys_runner.system_id);
-            return false;
-        }
-        Some(x) => x,
-    };
-
-    debug!("Node:{} MajorID:{} MajorCount:{}",sys_runner.system_id, major_id, major_count);
-
-    if major_count < sys_health.min_sys_size.into() {
-        for id in sys_health.sys_participants.iter()
-        {
-            sys_health.sys_fault_set.insert(*id);
-        }
-        return false;
-    }
-
-    for (&id, &value) in sys_health.sys_checklist.iter()
-    {
-        if value != major_id
-        {
-            sys_health.sys_fault_set.insert(id);
-        }
-
-        if !sys_health.sys_fault_set.is_empty()
-        {
-            return false;
-        }
-    }
-    true
+    std_majority_vote(sys_runner, sys_health, None)
 }
 
 fn publish_vote(sys_runner: &SystemRunnerData) {
@@ -282,9 +274,8 @@ pub fn system_run(
                 sys_runner.next_state_transition(state_success);
             }
             StateMachine::Vote => {
-                sys_runner.sys_cycle.voted_crc = vote_on_crc32(&mut sys_health)
-                    .expect("Failed to vote on the CRC32.");
-                state_success = true;
+                //sys_runner.sys_cycle.voted_crc = 
+                state_success = vote_on_crc32(&mut sys_runner, &mut sys_health);
                 debug!("Node{}: Voted CRC 0x{:X}", sys_runner.system_id, sys_runner.sys_cycle.voted_crc);
                 sys_runner.next_state_transition(state_success);
             }
