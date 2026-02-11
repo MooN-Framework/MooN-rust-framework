@@ -80,8 +80,11 @@ fn sys_send_receive_loop(
     }
 }
 
-fn std_majority_vote(sys_runner: &SystemRunnerData, sys_health: &mut SystemHealthData, save_result: Option<&mut u32>,) -> bool
-{
+fn std_majority_vote(
+    sys_runner: &SystemRunnerData,
+    sys_health: &mut SystemHealthData,
+    save_result: Option<&mut u32>,
+) -> bool {
     let mut counter: HashMap<u32, usize> = HashMap::new();
     for &publisher in sys_health.sys_checklist.values() {
         *counter.entry(publisher).or_insert(0) += 1;
@@ -93,8 +96,7 @@ fn std_majority_vote(sys_runner: &SystemRunnerData, sys_health: &mut SystemHealt
         .map(|(k, v)| (*k, *v));
 
     let (majority_value, major_count) = match majority {
-        None => 
-        {
+        None => {
             sys_health.sys_fault_set.insert(sys_runner.system_id);
             return false;
         }
@@ -105,25 +107,24 @@ fn std_majority_vote(sys_runner: &SystemRunnerData, sys_health: &mut SystemHealt
         *out = majority_value;
     }
 
-    debug!("Node:{} MajorValue:{} MajorCount:{}",sys_runner.system_id, majority_value, major_count);
+    debug!(
+        "Node:{} MajorValue:{} MajorCount:{}",
+        sys_runner.system_id, majority_value, major_count
+    );
 
     if major_count < sys_health.min_sys_size.into() {
-        for id in sys_health.sys_participants.iter()
-        {
+        for id in sys_health.sys_participants.iter() {
             sys_health.sys_fault_set.insert(*id);
         }
         return false;
     }
 
-    for (&id, &value) in sys_health.sys_checklist.iter()
-    {
-        if value != majority_value
-        {
+    for (&id, &value) in sys_health.sys_checklist.iter() {
+        if value != majority_value {
             sys_health.sys_fault_set.insert(id);
         }
 
-        if !sys_health.sys_fault_set.is_empty()
-        {
+        if !sys_health.sys_fault_set.is_empty() {
             return false;
         }
     }
@@ -156,8 +157,8 @@ fn exchange_crc(sys_runner: &SystemRunnerData, sys_health: &mut SystemHealthData
 }
 
 fn vote_on_crc32(sys_runner: &mut SystemRunnerData, sys_health: &mut SystemHealthData) -> bool {
-    let mut voted_crc : u32 = 0;
-    let success : bool = std_majority_vote(sys_runner, sys_health, Some(&mut voted_crc));
+    let mut voted_crc: u32 = 0;
+    let success: bool = std_majority_vote(sys_runner, sys_health, Some(&mut voted_crc));
     sys_runner.sys_cycle.voted_crc = voted_crc;
     success
 }
@@ -175,8 +176,7 @@ fn decide_on_vote_publisher(sys_runner: &SystemRunnerData, sys_health: &SystemHe
     curr_main_cpu
 }
 
-fn exchange_vote(sys_runner: &SystemRunnerData, sys_health: &mut SystemHealthData) -> bool
-{
+fn exchange_vote(sys_runner: &SystemRunnerData, sys_health: &mut SystemHealthData) -> bool {
     let state_success = sys_send_receive_loop(
         sys_runner,
         sys_health,
@@ -265,7 +265,10 @@ pub fn system_run(
             StateMachine::CalcCritical => {
                 sys_runner.sys_cycle.crit_mem_alloc = critical_fn();
                 sys_runner.sys_cycle.crc = sys_runner.sys_cycle.crit_mem_alloc.calculate_crc();
-                debug!("Node:{} got CRC 0x{:X}", sys_runner.system_id ,sys_runner.sys_cycle.crc);
+                debug!(
+                    "Node:{} got CRC 0x{:X}",
+                    sys_runner.system_id, sys_runner.sys_cycle.crc
+                );
                 state_success = true;
                 sys_runner.next_state_transition(state_success);
             }
@@ -275,7 +278,10 @@ pub fn system_run(
             }
             StateMachine::Vote => {
                 state_success = vote_on_crc32(&mut sys_runner, &mut sys_health);
-                debug!("Node{}: Voted CRC 0x{:X}", sys_runner.system_id, sys_runner.sys_cycle.voted_crc);
+                debug!(
+                    "Node{}: Voted CRC 0x{:X}",
+                    sys_runner.system_id, sys_runner.sys_cycle.voted_crc
+                );
                 sys_runner.next_state_transition(state_success);
             }
             StateMachine::ExchangeVote => {

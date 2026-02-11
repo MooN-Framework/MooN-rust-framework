@@ -1,7 +1,7 @@
 use crate::mem_alloc::MemAlloc;
 use crate::net::udp_com::UdpSocketInfo;
 use crate::state_machine::StateMachine;
-use log::{trace};
+use log::trace;
 use std::collections::HashMap;
 use std::collections::HashSet;
 

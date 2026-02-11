@@ -1,15 +1,15 @@
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct SystemConfig {
-    pub system_id : u8,
-    pub system_size : u8,
-    pub min_sys_size : u8,
-    pub timeout_ms : u16,
-    pub port : String
+    pub system_id: u8,
+    pub system_size: u8,
+    pub min_sys_size: u8,
+    pub timeout_ms: u16,
+    pub port: String,
 }
 
 /// Loads and parses a JSON config file into a struct.
