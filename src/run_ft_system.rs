@@ -274,7 +274,6 @@ pub fn system_run(
                 sys_runner.next_state_transition(state_success);
             }
             StateMachine::Vote => {
-                //sys_runner.sys_cycle.voted_crc = 
                 state_success = vote_on_crc32(&mut sys_runner, &mut sys_health);
                 debug!("Node{}: Voted CRC 0x{:X}", sys_runner.system_id, sys_runner.sys_cycle.voted_crc);
                 sys_runner.next_state_transition(state_success);
