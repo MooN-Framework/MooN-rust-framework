@@ -14,7 +14,7 @@ fi
 if [ "$(docker ps -a -q -f name="^${CONTAINER_NAME}$")" ]; then
     docker start "$CONTAINER_NAME"
 else
-    docker run -dit --name "$CONTAINER_NAME" --network "$NETWORK_NAME" -v "${HOST_DIR}:${CONTAINER_DIR}" "$IMAGE_NAME"
+    docker run -dit --name "$CONTAINER_NAME" --network "$NETWORK_NAME" -e CONFIG_PATH=/root/app/config/config_$1.json -v "${HOST_DIR}:${CONTAINER_DIR}" "$IMAGE_NAME"
 fi
 
 docker exec -it $CONTAINER_NAME /bin/bash
