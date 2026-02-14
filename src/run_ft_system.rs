@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const SEND_CYCLE_DURATION: Duration = Duration::from_secs(2);
+const MASTER_ID: u8 = 255;
 
 fn sys_rec_gather_participants(
     sys_runner: &SystemRunnerData,
@@ -29,15 +30,21 @@ fn sys_rec_sys_msg_participants(
     connection_counter: &mut u8,
 ) -> u8 {
     if let Some(rec_msg) = sys_runner.udp_socket_info.receive_udp_message()
-        && rec_msg.sender_state == sys_runner.state
-        && sys_health.is_id_participant(rec_msg.sender_id)
-        && !sys_health.sys_checklist.contains_key(&rec_msg.sender_id)
     {
-        sys_health
-            .sys_checklist
-            .insert(rec_msg.sender_id, rec_msg.sender_value);
-        *connection_counter += 1;
+        if rec_msg.sender_state == sys_runner.state
+            && rec_msg.sender_id != MASTER_ID
+            && sys_health.is_id_participant(rec_msg.sender_id)
+            && !sys_health.sys_checklist.contains_key(&rec_msg.sender_id)
+        {
+            sys_health
+                .sys_checklist
+                .insert(rec_msg.sender_id, rec_msg.sender_value);
+            *connection_counter += 1;
+        }else if rec_msg.sender_id == MASTER_ID && rec_msg.sender_value == sys_runner.system_id as u32 {
+            info!("RECEIVED A MESSAGE FROM MASTER!");
+        }
     }
+        
     *connection_counter
 }
 

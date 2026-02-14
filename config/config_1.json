@@ -1,7 +1,7 @@
 {
     "system_id":1,
-    "system_size":3,
-    "min_sys_size":2,
+    "system_size":2,
+    "min_sys_size":1,
     "timeout_ms":10000,
     "port":"3841"
 }
