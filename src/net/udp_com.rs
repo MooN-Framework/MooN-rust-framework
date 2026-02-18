@@ -1,10 +1,10 @@
+use crate::net::network_helper;
+use crate::state_machine::StateMachine;
 use log::{debug, error, trace};
 use std::fmt;
 use std::net::{Ipv4Addr, UdpSocket};
+use std::str::FromStr;
 use std::time::Instant;
-
-use crate::net::network_helper;
-use crate::state_machine::StateMachine;
 
 pub struct UdpSocketInfo {
     socket: UdpSocket,
@@ -69,7 +69,37 @@ impl UdpSocketInfo {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum SystemMessageType {
+    System,
+    Master,
+    Log
+}
+
+impl FromStr for SystemMessageType {
+    type Err = ();
+    fn from_str(input: &str) -> Result<SystemMessageType, Self::Err> {
+        match input {
+            "MASTER" => Ok(SystemMessageType::Master),
+            "SYSTEM" => Ok(SystemMessageType::System),
+            "LOG" => Ok(SystemMessageType::Log),
+            _ => Err(()),
+        }
+    }
+}
+
+impl fmt::Display for SystemMessageType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SystemMessageType::Master => write!(f, "MASTER"),
+            SystemMessageType::System => write!(f, "SYSTEM"),
+            SystemMessageType::Log => write!(f, "LOG"),
+        }
+    }
+}
+
 pub struct SystemUdpMessage {
+    pub message_type: SystemMessageType,
     pub sender_id: u8,
     pub sender_state: StateMachine,
     pub sender_value: u32,
@@ -77,31 +107,36 @@ pub struct SystemUdpMessage {
 
 impl SystemUdpMessage {
     pub fn new_from_string(msg: &str) -> Option<Self> {
-        let msg_parts: Vec<&str> = msg.splitn(3, ':').collect();
+        let msg_parts: Vec<&str> = msg.splitn(4, ':').collect();
         match msg_parts.as_slice() {
-            [part1, part2, part3] => {
-                let sender_id: u8 = part1
+            [part1, part2, part3, part4] => {
+                let message_type = SystemMessageType::from_str(part1).expect("");
+                let sender_id: u8 = part2
                     .parse::<u8>()
                     .expect("Error couldn't parse the sender_id from udp msg.");
-                let sender_state: StateMachine = StateMachine::parse_state(part2)
+                let sender_state: StateMachine = StateMachine::parse_state(part3)
                     .expect("Couldn't parse the sender_state from udp msg.");
-                let sender_value: u32 = part3
+                let sender_value: u32 = part4
                     .parse::<u32>()
                     .expect("Couldn't parse the sender_value from udp msg");
                 Some(Self {
+                    message_type,
                     sender_id,
                     sender_state,
                     sender_value,
                 })
             }
-            [part1, part2] => {
-                let sender_id: u8 = part1
+            [part1, part2, part3] => {
+                let message_type = SystemMessageType::from_str(part1)
+                    .expect("Error couldn't parse the message_type from udp msg.");
+                let sender_id: u8 = part2
                     .parse::<u8>()
                     .expect("Error couldn't parse the sender_id from udp msg.");
-                let sender_state: StateMachine = StateMachine::parse_state(part2)
+                let sender_state: StateMachine = StateMachine::parse_state(part3)
                     .expect("Couldn't parse the sender_state from udp msg.");
                 let sender_value: u32 = 0;
                 Some(Self {
+                    message_type,
                     sender_id,
                     sender_state,
                     sender_value,
@@ -113,8 +148,14 @@ impl SystemUdpMessage {
             }
         }
     }
-    pub fn new(sender_id: u8, sender_state: StateMachine, sender_value: u32) -> Self {
+    pub fn new(
+        message_type: SystemMessageType,
+        sender_id: u8,
+        sender_state: StateMachine,
+        sender_value: u32,
+    ) -> Self {
         Self {
+            message_type,
             sender_id,
             sender_state,
             sender_value,
@@ -127,11 +168,15 @@ impl fmt::Display for SystemUdpMessage {
         if self.sender_value != 0 {
             write!(
                 f,
-                "{}:{}:{}",
-                self.sender_id, self.sender_state, self.sender_value
+                "{}:{}:{}:{}",
+                self.message_type, self.sender_id, self.sender_state, self.sender_value
             )
         } else {
-            write!(f, "{}:{}", self.sender_id, self.sender_state)
+            write!(
+                f,
+                "{}:{}:{}",
+                self.message_type, self.sender_id, self.sender_state
+            )
         }
     }
 }

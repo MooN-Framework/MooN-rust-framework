@@ -12,6 +12,8 @@ pub struct SystemHealthData {
     pub min_sys_size: u8,
     pub sys_checklist: HashMap<u8, u32>,
     pub sys_fault_set: HashSet<u8>,
+    pub induce_crc_fault : bool,
+    pub induce_voter_fault : bool
 }
 
 impl SystemHealthData {
@@ -25,6 +27,8 @@ impl SystemHealthData {
             min_sys_size,
             sys_checklist: HashMap::new(),
             sys_fault_set: HashSet::new(),
+            induce_crc_fault : false,
+            induce_voter_fault : false
         }
     }
 

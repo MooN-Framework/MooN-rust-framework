@@ -1,5 +1,5 @@
 use crate::mem_alloc::MemAlloc;
-use crate::net::udp_com::SystemUdpMessage;
+use crate::net::udp_com::{SystemMessageType, SystemUdpMessage};
 use crate::state_machine::StateMachine;
 use crate::sys_run_info::{SystemHealthData, SystemRunnerData};
 use log::{debug, error, info, warn};
@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const SEND_CYCLE_DURATION: Duration = Duration::from_secs(2);
-const MASTER_ID: u8 = 255;
 
 fn sys_rec_gather_participants(
     sys_runner: &SystemRunnerData,
@@ -16,6 +15,7 @@ fn sys_rec_gather_participants(
     connection_counter: &mut u8,
 ) -> u8 {
     if let Some(rec_msg) = sys_runner.udp_socket_info.receive_udp_message()
+        && rec_msg.message_type == SystemMessageType::System
         && rec_msg.sender_state == sys_runner.state
         && sys_health.try_add_participant(rec_msg.sender_id)
     {
@@ -29,10 +29,9 @@ fn sys_rec_sys_msg_participants(
     sys_health: &mut SystemHealthData,
     connection_counter: &mut u8,
 ) -> u8 {
-    if let Some(rec_msg) = sys_runner.udp_socket_info.receive_udp_message()
-    {
-        if rec_msg.sender_state == sys_runner.state
-            && rec_msg.sender_id != MASTER_ID
+    if let Some(rec_msg) = sys_runner.udp_socket_info.receive_udp_message() {
+        if rec_msg.message_type == SystemMessageType::System
+            && rec_msg.sender_state == sys_runner.state
             && sys_health.is_id_participant(rec_msg.sender_id)
             && !sys_health.sys_checklist.contains_key(&rec_msg.sender_id)
         {
@@ -40,11 +39,24 @@ fn sys_rec_sys_msg_participants(
                 .sys_checklist
                 .insert(rec_msg.sender_id, rec_msg.sender_value);
             *connection_counter += 1;
-        }else if rec_msg.sender_id == MASTER_ID && rec_msg.sender_value == sys_runner.system_id as u32 {
-            info!("RECEIVED A MESSAGE FROM MASTER!");
+        } else if rec_msg.message_type == SystemMessageType::Master
+            && rec_msg.sender_id == sys_runner.system_id
+        {
+            if rec_msg.sender_value == 0
+            {
+                info!("RECEIVED MSG FROM MASTER.");
+            }else if rec_msg.sender_value == 1
+            {
+                info!("RECEIVED CMD INDUCE CRC FAULT FROM MASTER.");
+                sys_health.induce_crc_fault  = true;
+            }else if rec_msg.sender_value == 2
+            {
+                info!("RECEIVED CMD INDUCE VOTING FAULT FROM MASTER.");
+                sys_health.induce_voter_fault = true;
+            }
         }
     }
-        
+
     *connection_counter
 }
 
@@ -72,8 +84,12 @@ fn sys_send_receive_loop(
         }
 
         if last_send.elapsed() >= SEND_CYCLE_DURATION {
-            let send_msg: SystemUdpMessage =
-                SystemUdpMessage::new(sys_runner.system_id, sys_runner.state, sender_value);
+            let send_msg: SystemUdpMessage = SystemUdpMessage::new(
+                SystemMessageType::System,
+                sys_runner.system_id,
+                sys_runner.state,
+                sender_value,
+            );
             last_send = sys_runner
                 .udp_socket_info
                 .send_udp_message(send_msg)
@@ -276,6 +292,13 @@ pub fn system_run(
                     "Node:{} got CRC 0x{:X}",
                     sys_runner.system_id, sys_runner.sys_cycle.crc
                 );
+
+                if sys_health.induce_crc_fault
+                {
+                    info!("Inducing CRC fault!");
+                    sys_runner.sys_cycle.crc = 0x0;
+                    sys_health.induce_crc_fault = false;
+                }
                 state_success = true;
                 sys_runner.next_state_transition(state_success);
             }
