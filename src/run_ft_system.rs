@@ -268,12 +268,12 @@ pub fn system_run(
     timeout_ms: u16,
     critical_fn: fn() -> MemAlloc,
 ) {
+    simple_logger::init_with_level(log::Level::Trace).unwrap();
     let mut sys_runner: SystemRunnerData =
         SystemRunnerData::new(sys_id, timeout_ms, port).expect("Failed to initialize sys_config.");
     let mut sys_health: SystemHealthData = SystemHealthData::new(sys_size, sys_id, min_sys_size);
     let mut state_success: bool = true;
     let mut iteration_counter = 0;
-    simple_logger::init_with_level(log::Level::Debug).unwrap();
     info!("Starting up system ID:{}", sys_runner.system_id);
     loop {
         match sys_runner.state {

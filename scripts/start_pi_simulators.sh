@@ -1,5 +1,4 @@
 #!/bin/bash
-
 IMAGE_NAME="rust-pie-image"
 HOST_DIR="/home/kevmatz/repos/master-projekt/"
 CONTAINER_DIR="/root/app/"
