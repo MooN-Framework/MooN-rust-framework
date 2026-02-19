@@ -60,6 +60,20 @@ fn sys_rec_sys_msg_participants(
     *connection_counter
 }
 
+fn send_udp_log(sys_runner: &SystemRunnerData)
+{
+    let send_msg: SystemUdpMessage = SystemUdpMessage::new(
+            SystemMessageType::Log,
+            sys_runner.system_id,
+            sys_runner.state,
+            0,
+    );
+    _ = sys_runner
+        .udp_socket_info
+        .send_udp_message(send_msg)
+        .expect("Couldn't sent udp log message.");
+}
+
 fn sys_send_receive_loop(
     sys_runner: &SystemRunnerData,
     sys_health: &mut SystemHealthData,
@@ -276,6 +290,7 @@ pub fn system_run(
     let mut iteration_counter = 0;
     info!("Starting up system ID:{}", sys_runner.system_id);
     loop {
+        send_udp_log(&sys_runner);
         match sys_runner.state {
             StateMachine::Startup => {
                 state_success = startup();

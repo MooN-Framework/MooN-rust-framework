@@ -12,12 +12,6 @@ pub struct SystemConfig {
     pub port: String,
 }
 
-/// Loads and parses a JSON config file into a struct.
-///
-/// # Example
-/// ```
-/// let config: MyConfig = load_json_config("config.json").unwrap();
-/// ```
 pub fn load_json_config<T: DeserializeOwned, P: AsRef<Path>>(path: P) -> Result<T, String> {
     let path_ref = path.as_ref();
 
