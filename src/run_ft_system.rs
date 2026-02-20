@@ -60,20 +60,6 @@ fn sys_rec_sys_msg_participants(
     *connection_counter
 }
 
-fn send_udp_log(sys_runner: &SystemRunnerData)
-{
-    let send_msg: SystemUdpMessage = SystemUdpMessage::new(
-            SystemMessageType::Log,
-            sys_runner.system_id,
-            sys_runner.state,
-            0,
-    );
-    _ = sys_runner
-        .udp_socket_info
-        .send_udp_message(send_msg)
-        .expect("Couldn't sent udp log message.");
-}
-
 fn sys_send_receive_loop(
     sys_runner: &SystemRunnerData,
     sys_health: &mut SystemHealthData,
@@ -282,7 +268,7 @@ pub fn system_run(
     timeout_ms: u16,
     critical_fn: fn() -> MemAlloc,
 ) {
-    simple_logger::init_with_level(log::Level::Trace).unwrap();
+    simple_logger::init_with_level(log::Level::Debug).unwrap();
     let mut sys_runner: SystemRunnerData =
         SystemRunnerData::new(sys_id, timeout_ms, port).expect("Failed to initialize sys_config.");
     let mut sys_health: SystemHealthData = SystemHealthData::new(sys_size, sys_id, min_sys_size);
@@ -290,7 +276,6 @@ pub fn system_run(
     let mut iteration_counter = 0;
     info!("Starting up system ID:{}", sys_runner.system_id);
     loop {
-        send_udp_log(&sys_runner);
         match sys_runner.state {
             StateMachine::Startup => {
                 state_success = startup();
@@ -303,14 +288,9 @@ pub fn system_run(
             StateMachine::CalcCritical => {
                 sys_runner.sys_cycle.crit_mem_alloc = critical_fn();
                 sys_runner.sys_cycle.crc = sys_runner.sys_cycle.crit_mem_alloc.calculate_crc();
-                debug!(
-                    "Node:{} got CRC 0x{:X}",
-                    sys_runner.system_id, sys_runner.sys_cycle.crc
-                );
-
                 if sys_health.induce_crc_fault
                 {
-                    info!("Inducing CRC fault!");
+                    debug!("Inducing CRC fault!");
                     sys_runner.sys_cycle.crc = 0x0;
                     sys_health.induce_crc_fault = false;
                 }
@@ -323,10 +303,6 @@ pub fn system_run(
             }
             StateMachine::Vote => {
                 state_success = vote_on_crc32(&mut sys_runner, &mut sys_health);
-                debug!(
-                    "Node{}: Voted CRC 0x{:X}",
-                    sys_runner.system_id, sys_runner.sys_cycle.voted_crc
-                );
                 sys_runner.next_state_transition(state_success);
             }
             StateMachine::ExchangeVote => {
