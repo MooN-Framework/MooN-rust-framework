@@ -1,5 +1,5 @@
 use crate::mem_alloc::MemAlloc;
-use crate::net::udp_com::{SystemMessageType, SystemUdpMessage};
+use crate::net::udp_com::{SystemMessageType, SystemUdpMessage, SystemMessagePayload};
 use crate::state_machine::StateMachine;
 use crate::sys_run_info::{SystemHealthData, SystemRunnerData};
 use log::{debug, error, info, warn};
@@ -8,6 +8,17 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const SEND_CYCLE_DURATION: Duration = Duration::from_secs(2);
+
+fn send_udp_log(sys_runner: &SystemRunnerData,log_msg : &str)
+{
+    let send_msg: SystemUdpMessage = SystemUdpMessage::new_log(
+        sys_runner.system_id,
+        sys_runner.state,
+        log_msg.to_string());
+    sys_runner.udp_socket_info
+                .send_udp_message(send_msg)
+                .expect("Couldn't sent udp log.");
+}
 
 fn sys_rec_gather_participants(
     sys_runner: &SystemRunnerData,
@@ -29,34 +40,40 @@ fn sys_rec_sys_msg_participants(
     sys_health: &mut SystemHealthData,
     connection_counter: &mut u8,
 ) -> u8 {
-    if let Some(rec_msg) = sys_runner.udp_socket_info.receive_udp_message() {
-        if rec_msg.message_type == SystemMessageType::System
-            && rec_msg.sender_state == sys_runner.state
-            && sys_health.is_id_participant(rec_msg.sender_id)
-            && !sys_health.sys_checklist.contains_key(&rec_msg.sender_id)
-        {
-            sys_health
-                .sys_checklist
-                .insert(rec_msg.sender_id, rec_msg.sender_value);
-            *connection_counter += 1;
-        } else if rec_msg.message_type == SystemMessageType::Master
-            && rec_msg.sender_id == sys_runner.system_id
-        {
-            if rec_msg.sender_value == 0
-            {
-                info!("RECEIVED MSG FROM MASTER.");
-            }else if rec_msg.sender_value == 1
-            {
-                info!("RECEIVED CMD INDUCE CRC FAULT FROM MASTER.");
-                sys_health.induce_crc_fault  = true;
-            }else if rec_msg.sender_value == 2
-            {
-                info!("RECEIVED CMD INDUCE VOTING FAULT FROM MASTER.");
-                sys_health.induce_voter_fault = true;
-            }
-        }
-    }
+    if let Some(rec_msg) = sys_runner.udp_socket_info.receive_udp_message()
+        && let SystemMessagePayload::Value(val) = rec_msg.payload {
 
+            if rec_msg.message_type == SystemMessageType::System
+                && rec_msg.sender_state == sys_runner.state
+                && sys_health.is_id_participant(rec_msg.sender_id)
+                && !sys_health.sys_checklist.contains_key(&rec_msg.sender_id)
+            {
+                sys_health
+                    .sys_checklist
+                    .insert(rec_msg.sender_id, val);
+
+                *connection_counter += 1;
+            } 
+            else if rec_msg.message_type == SystemMessageType::Master
+                && rec_msg.sender_id == sys_runner.system_id
+            {
+                match val {
+                    0 => {
+                        info!("RECEIVED MSG FROM MASTER.");
+                    }
+                    1 => {
+                        info!("RECEIVED CMD INDUCE CRC FAULT FROM MASTER.");
+                        sys_health.induce_crc_fault = true;
+                    }
+                    2 => {
+                        info!("RECEIVED CMD INDUCE VOTING FAULT FROM MASTER.");
+                        sys_health.induce_voter_fault = true;
+                    }
+                    _ => {}
+                }
+            }
+
+        }
     *connection_counter
 }
 
@@ -84,7 +101,7 @@ fn sys_send_receive_loop(
         }
 
         if last_send.elapsed() >= SEND_CYCLE_DURATION {
-            let send_msg: SystemUdpMessage = SystemUdpMessage::new(
+            let send_msg: SystemUdpMessage = SystemUdpMessage::new_value(
                 SystemMessageType::System,
                 sys_runner.system_id,
                 sys_runner.state,
@@ -276,6 +293,7 @@ pub fn system_run(
     let mut iteration_counter = 0;
     info!("Starting up system ID:{}", sys_runner.system_id);
     loop {
+        send_udp_log(&sys_runner,"");
         match sys_runner.state {
             StateMachine::Startup => {
                 state_success = startup();

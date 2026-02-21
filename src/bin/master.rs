@@ -3,7 +3,7 @@ use swb_fault_tolerance::state_machine::StateMachine;
 
 fn sys_send_master_msg_loop(udp_socket: &UdpSocketInfo) {
     let send_msg: SystemUdpMessage =
-        SystemUdpMessage::new(SystemMessageType::Master, 0, StateMachine::Startup, 1);
+        SystemUdpMessage::new_value(SystemMessageType::Master, 0, StateMachine::Startup, 1);
     udp_socket.send_udp_message(send_msg).expect("Couldn't sent udp message.");
 }
 
