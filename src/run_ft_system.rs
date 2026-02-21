@@ -60,13 +60,16 @@ fn sys_rec_sys_msg_participants(
                 match val {
                     0 => {
                         info!("RECEIVED MSG FROM MASTER.");
+                        send_udp_log(sys_runner, "Received msg from Master");
                     }
                     1 => {
                         info!("RECEIVED CMD INDUCE CRC FAULT FROM MASTER.");
+                        send_udp_log(sys_runner, "Received cmd 'induce crc fault' from Master");
                         sys_health.induce_crc_fault = true;
                     }
                     2 => {
                         info!("RECEIVED CMD INDUCE VOTING FAULT FROM MASTER.");
+                        send_udp_log(sys_runner, "Received cmd 'induce voting fault' from Master");
                         sys_health.induce_voter_fault = true;
                     }
                     _ => {}
@@ -309,6 +312,7 @@ pub fn system_run(
                 if sys_health.induce_crc_fault
                 {
                     debug!("Inducing CRC fault!");
+                    send_udp_log(&sys_runner, "Inducing CRC fault now.");
                     sys_runner.sys_cycle.crc = 0x0;
                     sys_health.induce_crc_fault = false;
                 }
@@ -325,6 +329,13 @@ pub fn system_run(
             }
             StateMachine::ExchangeVote => {
                 sys_runner.sys_cycle.publisher = decide_on_vote_publisher(&sys_runner, &sys_health);
+                if sys_health.induce_voter_fault
+                {
+                    debug!("Inducing Voting fault!");
+                    send_udp_log(&sys_runner, "Inducing voting fault now.");
+                    sys_runner.sys_cycle.publisher = 233;
+                    sys_health.induce_voter_fault = false;
+                }
                 state_success = exchange_vote(&sys_runner, &mut sys_health);
                 sys_runner.next_state_transition(state_success);
             }
