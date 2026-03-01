@@ -62,13 +62,11 @@ impl UdpSocketInfo {
                 if src.ip() != std::net::IpAddr::V4(self.ipv4_addr) {
                     let msg_str = String::from_utf8_lossy(&buf[..amt]);
 
-                    let parsed_udp_msg =
-                        SystemUdpMessage::new_from_string(&msg_str)?;
+                    let parsed_udp_msg = SystemUdpMessage::new_from_string(&msg_str)?;
 
                     trace!(
                         "Received Message {} STATE:{}",
-                        parsed_udp_msg.sender_id,
-                        parsed_udp_msg.sender_state
+                        parsed_udp_msg.sender_id, parsed_udp_msg.sender_state
                     );
 
                     return Some(parsed_udp_msg);
@@ -141,11 +139,7 @@ impl SystemUdpMessage {
         }
     }
 
-    pub fn new_log(
-        sender_id: u8,
-        sender_state: StateMachine,
-        log: String,
-    ) -> Self {
+    pub fn new_log(sender_id: u8, sender_state: StateMachine, log: String) -> Self {
         Self {
             message_type: SystemMessageType::Log,
             sender_id,
@@ -164,9 +158,7 @@ impl SystemUdpMessage {
                 let sender_state = StateMachine::parse_state(part3)?;
 
                 let payload = match message_type {
-                    SystemMessageType::Log => {
-                        SystemMessagePayload::Log(part4.to_string())
-                    }
+                    SystemMessageType::Log => SystemMessagePayload::Log(part4.to_string()),
                     _ => {
                         let value = part4.parse::<u32>().ok()?;
                         SystemMessagePayload::Value(value)
