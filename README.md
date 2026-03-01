@@ -5,15 +5,16 @@ implement on raspberry pies. For development and simulation purposes a
 docker file and according scripts were developed and used to simulate the
 behavior of raspberry pies before deploying on to the hardware.
 
-##
-
 ## Project Structure
+```console
+|_ config/ Contains the configuration files for different nodes, in this case for nodes 0 to 2
+|_ docs/ Contains the documentation for this repository, atm only includes the mermaid chart
+|_ scripts/ Contains useful scripts for deploying, configure on to real pies/docker containers
+|_ src/ Contains the rust source files for this project.
+```
 
-
-## Simulation setup
-
-
-## Deployment setup
+## How it works
+Below you can see the general process of how each individual system node will run. All of the nodes are ideally running the same binary without any needed changes due to different configuration files covered later. Due to this project not being implemented with a specific use case in mind, you have to implement the interfaces given through a function pointer to the function containing your critical calculations as f.e. gathering sensor data. This function needs to return a mem_alloc struct so the application can check calculate a CRC over the critical functions memory and then compare it with the different nodes. In src/bin/main.rs is an example how to implement and pass such a critical function to the main application.
 
 ```mermaid
 stateDiagram-v2
@@ -99,3 +100,29 @@ state system_valid_if <<choice>>
         }
         %% Failsafe
 ```
+### Configuration files
+Each node needs a configuration file (config.json) to work. The configuration files contain information about:
+```console
+{
+    "system_id":0, => Exact identification of a single node, should be a unique number between 0 - 255
+    "system_size":3, => Number of system size upon start f.e. a 2-of-3 system would have a system_size of 3
+    "min_sys_size":2, => Contains the minimal number to be able to run the system
+    "timeout_ms":10000, => The timeout in miliseconds between send-receiv loops for gathering/sending system info
+    "port":"3841" => udp port were messages are sent and received from.
+}
+```
+Like this you can start multiple nodes with the same built binary, but if you f.e. want different binaries with different critical functions (for which are also plenty uses cases) this can be done aswell. The configuration file will be loaded by the environment variable **CONFIG_PATH**, which therefore have to be set to the path of the config.json file of the specific node.
+
+### Communication
+The different system nodes communicate over udp broadcast messages, were the broadcast addresses are at the moment automatically fetched from the **eth0** interface of the different nodes. The port of the udp messages is set via the configuartion files described above. Due to listening on all interfaces (0.0.0.0) we don't another listening udp address.
+
+## General error cases
+
+# Setup
+
+## General setup and prerequisites
+
+## Simulation setup
+
+## Deployment setup
+
