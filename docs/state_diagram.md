@@ -29,8 +29,9 @@ state system_valid_if <<choice>>
                 startup_if --> InitialSynchronization : Initial health check correct
                 startup_if --> GoToFailsafe : Initial health check failed
                 InitialSynchronization --> init_sync_if : Synchronize cur_sys_size nodes
-                init_sync_if --> GoToFailsafe: ALL INIT_SYNC messages receive before timeout
-                init_sync_if -->  GoToSystemLoop : Not all INIT_SYNC messages received before timeout
+                init_sync_if --> GoToFailsafe : Not all INIT_SYNC messages received before timeout
+                init_sync_if --> GoToSystemLoop: ALL INIT_SYNC messages receive before timeout
+                
         }
 
         %% Running system loop
