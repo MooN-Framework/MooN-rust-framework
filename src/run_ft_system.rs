@@ -67,6 +67,22 @@ fn sys_rec_sys_msg_participants(
                     send_udp_log(sys_runner, "Received cmd 'induce voting fault' from Master");
                     sys_health.induce_voter_fault = true;
                 }
+                3 => {
+                    info!("RECEIVED CMD [DISABLE RECEIV SYS MSG] FROM MASTER.");
+                    send_udp_log(sys_runner, "Received cmd 'disable recv sys msg' from Master");
+                    sys_health.disable_msg_receiv = true;
+                }
+                4 => {
+
+                    info!("RECEIVED CMD [DISABLE SEND SYS MSG] FROM MASTER.");
+                    send_udp_log(sys_runner, "Received cmd 'disable send sys msg' from Master");
+                    sys_health.disable_msg_send = true;
+                }
+                5 => {
+                    info!("Received force failsafe from other node.");
+                    send_udp_log(sys_runner, "Received force failsafe from other node.");
+                    sys_health.force_failsafe = true;
+                }
                 _ => {}
             }
         }
@@ -97,7 +113,7 @@ fn sys_send_receive_loop(
             return false;
         }
 
-        if last_send.elapsed() >= SEND_CYCLE_DURATION {
+        if last_send.elapsed() >= SEND_CYCLE_DURATION  && !sys_health.disable_msg_send{
             let send_msg: SystemUdpMessage = SystemUdpMessage::new_value(
                 SystemMessageType::System,
                 sys_runner.system_id,
@@ -113,7 +129,10 @@ fn sys_send_receive_loop(
             }
         }
 
-        connection_counter = receiv_fn(sys_runner, sys_health, &mut connection_counter);
+        if !sys_health.disable_msg_receiv
+        {
+            connection_counter = receiv_fn(sys_runner, sys_health, &mut connection_counter);
+        }
     }
 }
 
@@ -254,7 +273,18 @@ fn error_handling(sys_runner: &SystemRunnerData, sys_health: &mut SystemHealthDa
 
     if !sys_health.sys_fault_set.is_empty() {
         for sys_id in sys_health.sys_fault_set.iter() {
-            info!("Removing participant SYS_ID:{}", sys_id);
+
+            let send_msg: SystemUdpMessage = SystemUdpMessage::new_value(
+                SystemMessageType::Master,
+                *sys_id,
+                sys_runner.state,
+                5,
+            );
+            sys_runner
+                .udp_socket_info
+                .send_udp_message(send_msg)
+                .expect("Couldn't sent udp message.");
+
             sys_health.sys_participants.remove(sys_id);
             sys_health.curr_sys_size -= 1;
         }
@@ -290,6 +320,10 @@ pub fn system_run(
     let mut iteration_counter = 0;
     info!("Starting up system ID:{}", sys_runner.system_id);
     loop {
+        if sys_health.force_failsafe
+        {
+            sys_runner.state = StateMachine::Failsafe;
+        }
         send_udp_log(&sys_runner, "");
         match sys_runner.state {
             StateMachine::Startup => {

@@ -14,6 +14,9 @@ pub struct SystemHealthData {
     pub sys_fault_set: HashSet<u8>,
     pub induce_crc_fault: bool,
     pub induce_voter_fault: bool,
+    pub disable_msg_send : bool,
+    pub disable_msg_receiv : bool,
+    pub force_failsafe : bool,
 }
 
 impl SystemHealthData {
@@ -29,6 +32,9 @@ impl SystemHealthData {
             sys_fault_set: HashSet::new(),
             induce_crc_fault: false,
             induce_voter_fault: false,
+            disable_msg_send : false,
+            disable_msg_receiv : false,
+            force_failsafe : false,
         }
     }
 
