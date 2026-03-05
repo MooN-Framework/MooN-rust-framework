@@ -58,23 +58,23 @@ sudo nmcli connection up \$CONN
 # Copy config file and set ENV
 # -----------------------------
 echo "==> Copying config file to home directory..."
-sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no $CONFIG_FILE $USER@$HOST:/tmp/
+sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no "$CONFIG_FILE" "$USER@$HOST:/tmp/"
 
-sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no $USER@$HOST "
-# Ensure home directory
+sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "$USER@$HOST" bash -c "'
+# Use the remote $HOME
 HOME_DIR=\$HOME
 
 # Move and rename config file
-mv /tmp/$(basename $CONFIG_FILE) \$HOME_DIR/config.json
+mv /tmp/$(basename "$CONFIG_FILE") \$HOME_DIR/config.json
 
-# Set environment variable for current user
+# Set environment variable for the user
 ENV_FILE=\$HOME_DIR/.bashrc
-if ! grep -q 'CONFIG_PATH=' \$ENV_FILE; then
+if ! grep -q \"CONFIG_PATH=\" \$ENV_FILE; then
     echo \"export CONFIG_PATH=\$HOME_DIR/config.json\" >> \$ENV_FILE
 else
     # Replace existing entry
-    sed -i 's|^export CONFIG_PATH=.*|export CONFIG_PATH=\$HOME_DIR/config.json|' \$ENV_FILE
+    sed -i \"s|^export CONFIG_PATH=.*|export CONFIG_PATH=\$HOME_DIR/config.json|\" \$ENV_FILE
 fi
-"
+'"
 
 echo "==> Deployment finished on $HOST"

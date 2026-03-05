@@ -134,7 +134,7 @@ Firstly the image needs to be built.
 cd project-dir/
 sudo docker build . -t rust-pie:latest
 ```
-Then you can start the container using script/start_pi_simulator.sh ID, where ID stands for the id you want your pie to have, also the needed file in config/ needs to be for id 0 f.e. you would need a config_0.json.
+Then you can start the container using script/start_pi_simulator.sh ID, where ID stands for the id you want your pie to have, also the needed file in config/ needs to be for id 0 f.e. you would need a config_0.json. Also to use my provided script you have to change the variable HOST_DIR to the location of the cloned repository since the project directory gets mounted into the docker containers.
 ```console
 # To start the the pie sim container
 cd project-dir/
