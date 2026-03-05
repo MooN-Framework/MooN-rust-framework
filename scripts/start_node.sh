@@ -3,9 +3,9 @@ set -e
 
 # -----------------------------
 # Usage:
-# ./run_remote.sh <user> <password> <host>
+# ./start_node.sh <user> <password> <host>
 # Example:
-# ./run_remote.sh generic 123 192.168.178.26
+# ./start_node.sh generic 123 192.168.178.26
 # -----------------------------
 
 USER=$1

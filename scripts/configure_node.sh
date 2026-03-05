@@ -2,9 +2,9 @@
 
 # -----------------------------
 # Usage:
-# ./deploy_pi.sh user host password config_file static_ip gateway dns update_flag
+# ./configure_node.sh user host password config_file static_ip gateway dns update_flag
 # Example:
-# ./deploy_pi.sh pi 192.168.178.20 raspberry config.yaml 192.168.178.50 192.168.178.1 "1.1.1.1 8.8.8.8" true
+# ./configure_node.sh pi 192.168.178.20 raspberry config.yaml 192.168.178.50 192.168.178.1 "1.1.1.1 8.8.8.8" true
 # -----------------------------
 
 USER=$1

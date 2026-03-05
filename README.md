@@ -162,6 +162,8 @@ To deploy to the application to the hardware (on our case raspberry pies 4) we n
 
 To configure a node through the configure_node.sh we need ssh access to the node with a specfic user, how you provide that it's up to you but keep in mind that upon running the script the eth0 interface will get a static ip address to which you set it. To configure multiple nodes in my case, i connected them via wifi and gave them host names, through them I then ran the script with following parameters:
 ```console
+scripts/configure_node.sh USER HOST PASSWORD PATH_TO_CONFIG STATIC_IPV4 STD_GATEWAY DNS_ADDRESS UPDATE_NODE(Either true or false)
+# example input
 scripts/configure_node.sh generic node0 123 config/config_0.json 192.168.1.2 192.168.1.1 "1.1.1.1" true
 scripts/configure_node.sh generic node1 123 config/config_1.json 192.168.1.3 192.168.1.1 "1.1.1.1" true
 scripts/configure_node.sh generic node2 123 config/config_2.json 192.168.1.4 192.168.1.1 "1.1.1.1" true
@@ -171,9 +173,24 @@ This script will fully configure the nodes how you want them to be to achieve th
 If you want to configure the nodes manually for whatever reason, keep in mind to do all mandatory steps, because otherwise the application will either not run or not run correctly.
 
 ### Deploying the application
-
+To deploy the application you can use another script which automates building and deploying the application to multiple given hosts, if set different users or passwords for the different hosts you need to call the script seperatly for all hosts. Otherwhise you  can call the script once for all hosts like this:
+```console
+scripts/deploy_to_nodes.sh USER PASSWORD OPTIONAL_CONFIG_FILE N_HOSTS
+# example input
+scripts/deploy_to_nodes.sh generic 123 "" host0 host1 host2
+```
+if you wanna update an config file of a single node you can do it like this with the same script:
+```console
+scripts/deploy_to_nodes.sh generic 123 path/to/config.json host0
+```
 ### Running the application
+Finally to start the application on the pie run the following script
+```console
+scripts/start_node.sh USER PASSWORD HOST
+# example input
+scripts/start_node.sh generic 123 node2
 
+```
 ## General error cases
 It's important to know which general error cases are existing in the system, to be able to handle them in the running system.
 Therefore here is a short overview over possible error cases:
