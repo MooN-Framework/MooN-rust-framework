@@ -1,70 +1,80 @@
 #!/bin/bash
-set -e
 
-# --- CONFIG -------
-TARGET_USER="generic"
-TARGET_PW="123"
-IP_OFFSET=5
-TARGETS=("node0" "node1" "node2")
-REMOTE_FILE="/run/NetworkManager/system-connections/netplan-eth0.nmconnection"
-GATEWAY="192.168.1.1"
-DNS="192.168.1.1;1.1.1.1"
-# ----------------
+# -----------------------------
+# Usage:
+# ./deploy_pi.sh user host password config_file static_ip gateway dns update_flag
+# Example:
+# ./deploy_pi.sh pi 192.168.178.20 raspberry config.yaml 192.168.178.50 192.168.178.1 "1.1.1.1 8.8.8.8" true
+# -----------------------------
 
-for HOST in "${TARGETS[@]}"; do
-  echo "---- Configuring $HOST ----"
+USER=$1
+HOST=$2
+PASSWORD=$3
+CONFIG_FILE=$4
+STATIC_IP=$5
+GATEWAY=$6
+DNS=$7
+UPDATE_FLAG=$8  # "true" oder "false"
 
-  NODE_NUM=$(echo $HOST | grep -oE '[0-9]+')
-  IP_LAST=$((NODE_NUM + IP_OFFSET))
-  IP_ADDR="192.168.1.$IP_LAST/24"
+if [ $# -lt 8 ]; then
+  echo "Usage:"
+  echo "./deploy_pi.sh user host password config_file static_ip gateway dns update_flag"
+  exit 1
+fi
 
-  echo "Setting static IP: $IP_ADDR"
+# -----------------------------
+# System Update (optional)
+# -----------------------------
+if [ "$UPDATE_FLAG" = "true" ]; then
+    echo "==> Updating system on $HOST..."
+    sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no $USER@$HOST "
+    sudo apt update &&
+    sudo apt -y upgrade
+    "
+else
+    echo "==> Skipping system update on $HOST..."
+fi
 
-  # Erstelle die neue Config temporär lokal
-  TMPFILE=$(mktemp)
-  cat > "$TMPFILE" <<EOF
-[connection]
-id=netplan-eth0
-type=ethernet
-uuid=$(uuidgen)
+# -----------------------------
+# Set static IP
+# -----------------------------
+echo "==> Setting static IP on eth0..."
+sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no $USER@$HOST "
+# Find the active eth0 connection
+CONN=\$(nmcli -t -f NAME,DEVICE connection show | grep eth0 | cut -d: -f1)
 
-[ethernet]
-wake-on-lan=0
+# Set static IP
+sudo nmcli connection modify \$CONN \
+ipv4.addresses $STATIC_IP/24 \
+ipv4.gateway $GATEWAY \
+ipv4.dns '$DNS' \
+ipv4.method manual
 
-[ipv4]
-method=manual
-address1=$IP_ADDR
-gateway=$GATEWAY
-dns=$DNS
+# Bring connection up
+sudo nmcli connection up \$CONN
+"
 
-[ipv6]
-method=auto
-ip6-privacy=0
+# -----------------------------
+# Copy config file and set ENV
+# -----------------------------
+echo "==> Copying config file to home directory..."
+sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no $CONFIG_FILE $USER@$HOST:/tmp/
 
-[proxy]
-EOF
+sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no $USER@$HOST "
+# Ensure home directory
+HOME_DIR=\$HOME
 
-  # Upload in /tmp
-  sshpass -p "$TARGET_PW" scp "$TMPFILE" $TARGET_USER@$HOST:/tmp/netplan-eth0.nmconnection
+# Move and rename config file
+mv /tmp/$(basename $CONFIG_FILE) \$HOME_DIR/config.json
 
-  # Move + Rechte + NM reload + Connection down/up
-  sshpass -p "$TARGET_PW" ssh $TARGET_USER@$HOST "
-      sudo mv /tmp/netplan-eth0.nmconnection $REMOTE_FILE
-      sudo chmod 600 $REMOTE_FILE
-      sudo nmcli connection reload
-      # Finde die aktive Connection für eth0
-      CON_NAME=\$(nmcli -t -f NAME,DEVICE connection show --active | grep eth0 | cut -d: -f1)
-      sudo nmcli connection down \"\$CON_NAME\"
-      sudo nmcli connection up \"\$CON_NAME\"
-  "
+# Set environment variable for current user
+ENV_FILE=\$HOME_DIR/.bashrc
+if ! grep -q 'CONFIG_PATH=' \$ENV_FILE; then
+    echo \"export CONFIG_PATH=\$HOME_DIR/config.json\" >> \$ENV_FILE
+else
+    # Replace existing entry
+    sed -i 's|^export CONFIG_PATH=.*|export CONFIG_PATH=\$HOME_DIR/config.json|' \$ENV_FILE
+fi
+"
 
-  # CONFIG_PATH nur einfügen, falls nicht existiert
-  sshpass -p "$TARGET_PW" ssh -o StrictHostKeyChecking=no $TARGET_USER@$HOST "
-      if ! grep -q '^export CONFIG_PATH=/home/$TARGET_USER/config.json' ~/.bashrc; then
-          echo 'export CONFIG_PATH=/home/$TARGET_USER/config.json' >> ~/.bashrc
-      fi
-  "
-
-  rm "$TMPFILE"
-  echo "✅ $HOST configured with IP $IP_ADDR"
-done
+echo "==> Deployment finished on $HOST"

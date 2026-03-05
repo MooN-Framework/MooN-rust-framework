@@ -1,5 +1,5 @@
 #!/bin/bash
-IMAGE_NAME="rust-pie-image"
+IMAGE_NAME="rust-pie"
 HOST_DIR="/home/kevmatz/repos/master-projekt/"
 CONTAINER_DIR="/root/app/"
 NETWORK_NAME="pie-net"
