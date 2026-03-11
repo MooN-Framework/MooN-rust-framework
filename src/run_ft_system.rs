@@ -280,10 +280,16 @@ fn error_handling(sys_runner: &SystemRunnerData, sys_health: &mut SystemHealthDa
                 sys_runner.state,
                 5,
             );
-            sys_runner
-                .udp_socket_info
-                .send_udp_message(send_msg)
-                .expect("Couldn't sent udp message.");
+
+            if sys_health.sys_fault_set.len() < (sys_health.curr_sys_size -1).into()
+            {
+                sys_runner
+                    .udp_socket_info
+                    .send_udp_message(send_msg)
+                    .expect("Couldn't sent udp message.");
+            }else {
+                send_udp_log(sys_runner, "Im faulty, moving to failsafe.");
+            }
 
             sys_health.sys_participants.remove(sys_id);
             sys_health.curr_sys_size -= 1;
@@ -386,7 +392,8 @@ pub fn system_run(
             }
             StateMachine::Failsafe => loop {
                 std::thread::sleep(Duration::from_secs(2));
-                error!("Node in failsafe")
+                error!("Node in failsafe");
+                send_udp_log(&sys_runner, "Node in failsafe");
             },
         }
     }
