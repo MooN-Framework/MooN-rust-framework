@@ -33,5 +33,4 @@ Themen und Software-synchronisierte m-oo-n Systeme
 
 MA Kevin Weiss
 ==============
-
-
+BBB-Meetings: https://vc2.sonia.de/b/rooms/cla-xx9-242/join
