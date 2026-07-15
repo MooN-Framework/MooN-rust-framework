@@ -1,7 +1,7 @@
 use std::fmt;
 
 #[derive(PartialEq, Copy, Clone, Debug)]
-pub enum StateMachine {
+pub enum NodeState {
     Startup,
     InitialSync,
     CycleSync,
@@ -15,26 +15,26 @@ pub enum StateMachine {
     Reset,
 }
 
-impl StateMachine {
+impl NodeState {
     pub fn parse_state(s: &str) -> Option<Self> {
         match s {
-            "Startup" => Some(StateMachine::Startup),
-            "InitialSync" => Some(StateMachine::InitialSync),
-            "CycleSync" => Some(StateMachine::CycleSync),
-            "CalcCritical" => Some(StateMachine::CalcCritical),
-            "ExchangeCRC" => Some(StateMachine::ExchangeCRC),
-            "Vote" => Some(StateMachine::Vote),
-            "ExchangeVote" => Some(StateMachine::ExchangeVote),
-            "PublishVote" => Some(StateMachine::PublishVote),
-            "ErrorHandling" => Some(StateMachine::ErrorHandling),
-            "Failsafe" => Some(StateMachine::Failsafe),
-            "Reset" => Some(StateMachine::Reset),
+            "Startup" => Some(NodeState::Startup),
+            "InitialSync" => Some(NodeState::InitialSync),
+            "CycleSync" => Some(NodeState::CycleSync),
+            "CalcCritical" => Some(NodeState::CalcCritical),
+            "ExchangeCRC" => Some(NodeState::ExchangeCRC),
+            "Vote" => Some(NodeState::Vote),
+            "ExchangeVote" => Some(NodeState::ExchangeVote),
+            "PublishVote" => Some(NodeState::PublishVote),
+            "ErrorHandling" => Some(NodeState::ErrorHandling),
+            "Failsafe" => Some(NodeState::Failsafe),
+            "Reset" => Some(NodeState::Reset),
             _ => None, // Return None if input string doesn't match any variant
         }
     }
 
-    pub fn get_next_state(self, last_state: StateMachine, ok: bool) -> Self {
-        use StateMachine::*;
+    pub fn get_next_state(self, last_state: NodeState, ok: bool) -> Self {
+        use NodeState::*;
 
         match self {
             Startup => {
@@ -106,20 +106,20 @@ impl StateMachine {
     }
 }
 
-impl fmt::Display for StateMachine {
+impl fmt::Display for NodeState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state_str = match self {
-            StateMachine::Startup => "Startup",
-            StateMachine::InitialSync => "InitialSync",
-            StateMachine::CycleSync => "CycleSync",
-            StateMachine::CalcCritical => "CalcCritical",
-            StateMachine::ExchangeCRC => "ExchangeCRC",
-            StateMachine::Vote => "Vote",
-            StateMachine::ExchangeVote => "ExchangeVote",
-            StateMachine::PublishVote => "PublishVote",
-            StateMachine::Reset => "Reset",
-            StateMachine::ErrorHandling => "ErrorHandling",
-            StateMachine::Failsafe => "Failsafe",
+            NodeState::Startup => "Startup",
+            NodeState::InitialSync => "InitialSync",
+            NodeState::CycleSync => "CycleSync",
+            NodeState::CalcCritical => "CalcCritical",
+            NodeState::ExchangeCRC => "ExchangeCRC",
+            NodeState::Vote => "Vote",
+            NodeState::ExchangeVote => "ExchangeVote",
+            NodeState::PublishVote => "PublishVote",
+            NodeState::Reset => "Reset",
+            NodeState::ErrorHandling => "ErrorHandling",
+            NodeState::Failsafe => "Failsafe",
         };
         write!(f, "{}", state_str)
     }
