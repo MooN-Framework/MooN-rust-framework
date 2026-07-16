@@ -8,8 +8,8 @@ fn main() -> ExitCode {
         interface_name: "lo".into(),
         multicast_group: Ipv4Addr::new(239, 10, 0, 1),
         port: 3881,
-        self_node_id: 1,
-        self_session_id: 220303,
+        self_node_id: 0,
+        self_session_id: 4,
         initial_sequenz_num: 0,
     };
 
@@ -52,8 +52,23 @@ fn main() -> ExitCode {
             RecvOutcome::Malformed(e)  => eprintln!("kaputter Frame: {:?}", e),
             RecvOutcome::Duplicate { peer_id, seen, last } =>
                 eprintln!("Duplikat von {}: seen={} last={}", peer_id, seen, last),
-            RecvOutcome::NewSession { peer_id, previous_session, new_session, .. } =>
-                println!("Peer {} rebootete: {} → {}", peer_id, previous_session, new_session),
+            RecvOutcome::NewSession { peer_id, previous_session, new_session, frame } => {
+                println!(
+                    "Peer {} rebootete: {} → {}, akzeptiere neue Session",
+                    peer_id, previous_session, new_session,
+                );
+                tx.accept(&frame);
+
+                // Frame direkt wie einen Valid behandeln, damit der erste Frame der
+                // neuen Session nicht verloren geht
+                println!(
+                    "empfangen: node={} session={} seq={} state={:?}",
+                    frame.node_id(),
+                    frame.session_id(),
+                    frame.seq_num(),
+                    frame.node_state(),
+                );
+            },
             RecvOutcome::SeqGap { peer_id, gap, .. } =>
                 eprintln!("Lücke bei Peer {}: {} Frames verpasst", peer_id, gap),
         }

@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-if-addrs = "0.7"
+if-addrs = "0.13"
 crc32fast = "1.5.0"
+socket2 = { version = "0.5.10", features = ["all"] }
 simple_logger = "5.1.0"
 log = "0.4.29"
 serde = { version = "1.0", features = ["derive"] }
