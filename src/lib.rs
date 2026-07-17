@@ -1,3 +1,3 @@
-pub mod braking_curve;
+pub mod input;
 pub mod net;
-pub mod state_machine;
+pub mod sys_state;

@@ -5,8 +5,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
 use crate::net::node_mask::NodeMask;
 use crate::net::udp_frame::{FrameError, MAX_FRAME_SIZE, UdpFrame};
-use crate::state_machine::NodeState;
-use crate::braking_curve::BrakeResult;
+use crate::sys_state::state_machine::NodeState;
+use crate::input::braking_curve::BrakeResult;
 
 pub struct TransportConfig {
     pub interface_name: String,      // z.B. "eth0"

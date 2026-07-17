@@ -1,9 +1,9 @@
 // -------------------------------------------------------------
 // udp_frame.rs
 // -------------------------------------------------------------
-use crate::braking_curve::BrakeResult;
+use crate::input::braking_curve::BrakeResult;
 use crate::net::node_mask::NodeMask;
-use crate::state_machine::NodeState;
+use crate::sys_state::state_machine::NodeState;
 use crc32fast::Hasher;
 use std::convert::TryFrom;
 

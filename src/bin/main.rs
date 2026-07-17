@@ -1,7 +1,7 @@
 use std::{net::Ipv4Addr, time::{Duration, Instant}};
-
-use swb_fault_tolerance::{net::udp_transport::{RecvOutcome, TransportConfig, UdpTransport}, state_machine::NodeState};
 use std::process::ExitCode;
+
+use swb_fault_tolerance::{net::udp_transport::{RecvOutcome, TransportConfig, UdpTransport}, sys_state::state_machine::NodeState};
 
 fn main() -> ExitCode {
     let config = TransportConfig {
