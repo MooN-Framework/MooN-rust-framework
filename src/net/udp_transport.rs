@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
-use crate::net::node_mask::NodeMask;
 use crate::net::udp_frame::{FrameError, MAX_FRAME_SIZE, UdpFrame};
+use crate::sys_state::state_loop_iface::PeerMask;
 use crate::sys_state::state_machine::NodeState;
 use crate::input::braking_curve::BrakeResult;
 
@@ -143,7 +143,7 @@ impl UdpTransport {
 
     pub fn send_ack(
         &mut self, node_state: NodeState,
-        received_from: NodeMask, publisher_candidate: u8,
+        received_from: PeerMask, publisher_candidate: u8,
     ) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
         let frame = UdpFrame::ack_frame(

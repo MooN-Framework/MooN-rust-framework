@@ -1,15 +1,9 @@
-// -------------------------------------------------------------
-// udp_frame.rs
-// -------------------------------------------------------------
 use crate::input::braking_curve::BrakeResult;
-use crate::net::node_mask::NodeMask;
 use crate::sys_state::state_machine::NodeState;
+use crate::sys_state::state_loop_iface::PeerMask;
 use crc32fast::Hasher;
 use std::convert::TryFrom;
 
-// -------------------------------------------------------------
-// Wire-Kategorie: field-less Kopie von NodeState nur fürs Frame-Byte.
-// -------------------------------------------------------------
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireState {
@@ -85,7 +79,7 @@ pub enum Payload {
     State,
     Result(BrakeResult),
     Ack {
-        received_from: NodeMask,
+        received_from: PeerMask,
         publisher_candidate: u8,
     },
 }
@@ -142,7 +136,7 @@ impl UdpFrame {
         session_id: u64,
         seq_num: u32,
         node_state: NodeState,
-        received_from: NodeMask,
+        received_from: PeerMask,
         publisher_candidate: u8,
     ) -> Self {
         Self::new(
@@ -262,7 +256,7 @@ impl UdpFrame {
                 if bytes.len() < HEADER_SIZE + ACK_BODY + CRC_SIZE {
                     return Err(FrameError::TooShort);
                 }
-                let mask = NodeMask::from_u8(bytes[HEADER_SIZE]);
+                let mask = PeerMask::from_u8(bytes[HEADER_SIZE]);
                 let cand = bytes[HEADER_SIZE + 1];
                 (
                     Payload::Ack {
