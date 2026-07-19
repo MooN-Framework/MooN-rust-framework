@@ -1,154 +1,123 @@
-// -------------------------------------------------------------
-// state_machine.rs
-// -------------------------------------------------------------
-
-/// Wie viele erfolgreiche Zyklen ein Knoten in Probation
-/// absolvieren muss, bevor er voll teilnimmt.
-pub const PROBATION_CYCLES: u8 = 5;
-
-/// Der äußere Zustand eines Voting-Knotens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeState {
+pub enum SystemState {
     Startup,
-    Sync,
-    Probation { cycles_remaining: u8 },
-    Operational { phase: CyclePhase },
-    Degraded { phase: CyclePhase, missing_peer: u8 },
+    Operational,
+    Degraded,
     Failsafe,
 }
 
-/// Sub-Zustand innerhalb Operational und Degraded:
-/// die aktuelle Phase des Voting-Zyklus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CyclePhase {
-    CycleWait,
-    ReadInputs,
-    CalcCritical,
-    SendResult,
-    VoteResult,
-    SendAck,
-    VotePublisher,
-    Publish,
+#[repr(u8)]
+pub enum NodeState {
+    Startup           = 0x01,
+    Sync              = 0x02,
+    ReadInputs        = 0x03,
+    CalculateCritical = 0x04,
+    ShareResult       = 0x05,
+    SendACK           = 0x06,
+    PublishResult     = 0x07,
+    StateManagement   = 0x08,
+    Probation         = 0x09,
+    Failsafe          = 0xFF,
 }
 
-/// Ereignisse, die einen Zustandsübergang auslösen.
-#[derive(Debug, Clone, Copy)]
-pub enum Event {
-    SelfTestOk,
-    SelfTestFailed,
-    PeersFound { rejoining: bool },
-    PeersTimeout,
-    ProbationCycleOk,
-    PhaseDone,
-    PhaseTimeout { peer_id: u8 },
-    ConsensusFailed,
-    PeerReturned,
-    SecondPeerLost,
-    UnrecoverableError,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateEvent {
+    /* SelfTest */
+    SelfTestOK,
+    SelfTestErr,
+    /* Sync */
+    SyncDetectedReentry,
+    InitialSyncOk,
+    InitialSyncPeerTimeout,
+    CycleSyncOk,
+    CycleSyncTimeout,
+    /* Operational cycle — Platzhalter, bitte final benennen */
+    InputsRead,
+    CalculationDone,
+    ResultShared,
+    AckReceived,
+    ResultPublished,
+    /* State management / probation */
+    StateOk,
+    StateDiverged,
+    ProbationPassed,
+    ProbationFailed,
+    /* Generisch */
+    Fault,
 }
 
 impl NodeState {
-    /// Gib zum aktuellen Zustand + Ereignis den Folgezustand zurück.
-    /// Failsafe ist eine Trap-State: keine Transition führt heraus.
-    pub fn next(self, event: Event) -> Self {
-        use Event::*;
+    pub fn next(self, event: StateEvent) -> NodeState {
         use NodeState::*;
+        use StateEvent::*;
 
         match (self, event) {
-            // -------- Startup --------
-            (Startup, SelfTestOk) => Sync,
-            (Startup, SelfTestFailed) => Failsafe,
+            // --- Startup ---
+            (Startup, SelfTestOK)  => Sync,
+            (Startup, SelfTestErr) => Failsafe,
 
-            // -------- Sync --------
-            (Sync, PeersFound { rejoining: false }) => Operational {
-                phase: CyclePhase::CycleWait,
-            },
-            (Sync, PeersFound { rejoining: true }) => Probation {
-                cycles_remaining: PROBATION_CYCLES,
-            },
-            (Sync, PeersTimeout) => Failsafe,
+            // --- Sync ---
+            (Sync, InitialSyncOk) | (Sync, CycleSyncOk)              => ReadInputs,
+            (Sync, InitialSyncPeerTimeout) | (Sync, CycleSyncTimeout) => Failsafe,
+            (Sync, SyncDetectedReentry)                              => Sync,
 
-            // -------- Probation --------
-            (
-                Probation {
-                    cycles_remaining: 1,
-                },
-                ProbationCycleOk,
-            ) => Operational {
-                phase: CyclePhase::CycleWait,
-            },
-            (
-                Probation {
-                    cycles_remaining: n,
-                },
-                ProbationCycleOk,
-            ) => Probation {
-                cycles_remaining: n - 1,
-            },
-            (Probation { .. }, UnrecoverableError) => Failsafe,
+            // --- Operational cycle ---
+            (ReadInputs,        InputsRead)       => CalculateCritical,
+            (CalculateCritical, CalculationDone)  => ShareResult,
+            (ShareResult,       ResultShared)     => SendACK,
+            (SendACK,           AckReceived)      => PublishResult,
+            (PublishResult,     ResultPublished)  => StateManagement,
 
-            // -------- Operational (2oo3, alles läuft) --------
-            (Operational { phase }, PhaseDone) => Operational {
-                phase: phase.next(),
-            },
-            (Operational { phase }, PhaseTimeout { peer_id }) => Degraded {
-                phase,
-                missing_peer: peer_id,
-            },
-            (Operational { .. }, ConsensusFailed) => Failsafe,
-            (Operational { .. }, UnrecoverableError) => Failsafe,
+            // --- State management ---
+            (StateManagement, StateOk)       => Sync,        // nächster Zyklus
+            (StateManagement, StateDiverged) => Probation,
 
-            // -------- Degraded (2oo2, ein Peer weg) --------
-            (
-                Degraded {
-                    phase,
-                    missing_peer,
-                },
-                PhaseDone,
-            ) => Degraded {
-                phase: phase.next(),
-                missing_peer,
-            },
-            (Degraded { .. }, PeerReturned) => Operational {
-                phase: CyclePhase::CycleWait,
-            },
-            (Degraded { .. }, SecondPeerLost) => Failsafe,
-            (Degraded { .. }, ConsensusFailed) => Failsafe,
-            (Degraded { .. }, UnrecoverableError) => Failsafe,
+            // --- Probation ---
+            (Probation, ProbationPassed) => Sync,
+            (Probation, ProbationFailed) => Failsafe,
 
-            // -------- Failsafe ist terminal --------
+            // --- Failsafe ist terminal ---
             (Failsafe, _) => Failsafe,
 
-            // -------- Alles andere: Zustand halten --------
-            (state, _) => state,
+            // --- Fail-stop: alles Unerwartete ---
+            (_, Fault) => Failsafe,
+            _          => Failsafe,
         }
     }
 
-    pub fn category(&self) -> u8 {
-        match self {
-            NodeState::Startup => 0,
-            NodeState::Sync => 1,
-            NodeState::Probation { .. } => 2,
-            NodeState::Operational { .. } => 3,
-            NodeState::Degraded { .. } => 4,
-            NodeState::Failsafe => 5,
-        }
+    #[inline]
+    pub fn to_wire(self) -> u8 {
+        self as u8
+    }
+
+    #[inline]
+    pub fn from_wire(v: u8) -> Result<Self, InvalidNodeState> {
+        use NodeState::*;
+        Ok(match v {
+            0x01 => Startup,
+            0x02 => Sync,
+            0x03 => ReadInputs,
+            0x04 => CalculateCritical,
+            0x05 => ShareResult,
+            0x06 => SendACK,
+            0x07 => PublishResult,
+            0x08 => StateManagement,
+            0x09 => Probation,
+            0xFF => Failsafe,
+            other => return Err(InvalidNodeState(other)),
+        })
     }
 }
 
-impl CyclePhase {
-    /// Nächste Phase im Zyklus. Publish → CycleWait ist der Loop.
-    pub fn next(self) -> Self {
-        use CyclePhase::*;
-        match self {
-            CycleWait => ReadInputs,
-            ReadInputs => CalcCritical,
-            CalcCritical => SendResult,
-            SendResult => VoteResult,
-            VoteResult => SendAck,
-            SendAck => VotePublisher,
-            VotePublisher => Publish,
-            Publish => CycleWait,
-        }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidNodeState(pub u8);
+
+impl core::fmt::Display for InvalidNodeState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "invalid NodeState wire value: 0x{:02X}", self.0)
     }
 }
+
+impl std::error::Error for InvalidNodeState {}

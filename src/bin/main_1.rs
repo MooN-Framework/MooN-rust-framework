@@ -43,7 +43,7 @@ fn main() -> ExitCode {
                     frame.node_id(),
                     frame.session_id(),
                     frame.seq_num(),
-                    frame.node_state(),
+                    frame.node_state_wire(),
                 );
             }
             RecvOutcome::Timeout       => { /* okay, weiter */ }
@@ -66,7 +66,7 @@ fn main() -> ExitCode {
                     frame.node_id(),
                     frame.session_id(),
                     frame.seq_num(),
-                    frame.node_state(),
+                    frame.node_state_wire(),
                 );
             },
             RecvOutcome::SeqGap { peer_id, gap, .. } =>

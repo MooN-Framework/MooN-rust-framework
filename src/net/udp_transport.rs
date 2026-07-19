@@ -3,10 +3,20 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
-use crate::net::udp_frame::{FrameError, MAX_FRAME_SIZE, UdpFrame};
-use crate::sys_state::state_loop_iface::PeerMask;
+
+use crate::net::udp_frame::{FrameError, UdpFrame, MAX_PAYLOAD_WIRE_SIZE};
+use crate::sys_state::traits::CyclePayload;
 use crate::sys_state::state_machine::NodeState;
-use crate::input::braking_curve::BrakeResult;
+use crate::sys_state::types::PeerMask;
+
+/// Obere Grenze fuer die Puffergroesse beim Empfang.
+///
+/// Deckt jeden `UdpFrame<P>` mit `P::WIRE_SIZE <= MAX_PAYLOAD_WIRE_SIZE` ab,
+/// unabhaengig vom konkreten Payload-Typ. Damit bleibt der Empfangspuffer
+/// stack-allokiert und typ-agnostisch.
+const HEADER_SIZE: usize = 15;
+const CRC_SIZE: usize = 4;
+pub const RECV_BUFFER_SIZE: usize = HEADER_SIZE + MAX_PAYLOAD_WIRE_SIZE + CRC_SIZE;
 
 pub struct TransportConfig {
     pub interface_name: String,      // z.B. "eth0"
@@ -14,27 +24,27 @@ pub struct TransportConfig {
     pub port: u16,                   // z.B. 5555
     pub self_node_id: u8,
     pub self_session_id: u64,
-    pub initial_sequenz_num : u32,
+    pub initial_sequenz_num: u32,
 }
 
 #[derive(Debug)]
-pub enum RecvOutcome {
+pub enum RecvOutcome<P: CyclePayload> {
     /// Frame vom erwarteten Peer mit passender seq_num — kann direkt genutzt werden.
-    Valid(UdpFrame),
+    Valid(UdpFrame<P>),
 
     /// Timeout beim Empfang (kein Frame innerhalb read_timeout).
     Timeout,
 
-    /// Eigener Frame per Multicast-Loopback zurückgekommen — ignorieren.
+    /// Eigener Frame per Multicast-Loopback zurueckgekommen — ignorieren.
     SelfLoopback,
 
-    /// CRC schlägt fehl — Frame verwerfen.
+    /// CRC schlaegt fehl — Frame verwerfen.
     CrcError,
 
-    /// Frame ist strukturell kaputt (zu kurz, ungültiger Discriminator, ...).
+    /// Frame ist strukturell kaputt (zu kurz, ungueltiger Discriminator, ...).
     Malformed(FrameError),
 
-    /// Selbe oder ältere seq_num vom selben Peer (in derselben Session).
+    /// Selbe oder aeltere seq_num vom selben Peer (in derselben Session).
     /// Klassischer Replay/Duplikat, verwerfen.
     Duplicate {
         peer_id: u8,
@@ -42,21 +52,21 @@ pub enum RecvOutcome {
         last: u32,
     },
 
-    /// Peer hat eine andere Session-ID als beim letzten Frame → er hat rebootet
+    /// Peer hat eine andere Session-ID als beim letzten Frame -> er hat rebootet
     /// oder ist neu gestartet. State-Machine entscheidet, ob Resync/Rejoin.
     NewSession {
         peer_id: u8,
         previous_session: u64,
         new_session: u64,
-        frame: UdpFrame,
+        frame: UdpFrame<P>,
     },
 
-    /// seq_num ist größer als erwartet — Lücke erkannt (Pakete verloren).
+    /// seq_num ist groesser als erwartet — Luecke erkannt (Pakete verloren).
     /// State-Machine entscheidet, ob akzeptieren (Resync) oder ignorieren.
     SeqGap {
         peer_id: u8,
         gap: u32,
-        frame: UdpFrame,
+        frame: UdpFrame<P>,
     },
 }
 
@@ -77,16 +87,17 @@ struct PeerCursor {
     last_seq: u32,
 }
 
-pub struct UdpTransport {
+pub struct UdpTransport<P: CyclePayload> {
     socket: UdpSocket,
     group_addr: SocketAddrV4,
     self_node_id: u8,
-    self_session_id : u64,
+    self_session_id: u64,
     next_seq_num: u32,
     peers: HashMap<u8, PeerCursor>,
+    _payload: core::marker::PhantomData<P>,
 }
 
-impl UdpTransport {
+impl<P: CyclePayload> UdpTransport<P> {
     pub fn new(cfg: TransportConfig) -> Result<Self, TransportError> {
         let iface_ip = interface_ipv4(&cfg.interface_name)?;
 
@@ -102,7 +113,7 @@ impl UdpTransport {
         )))?;
 
         s.join_multicast_v4(&cfg.multicast_group, &iface_ip)?;
-        s.set_multicast_loop_v4(false)?; // eigene Frames nicht per Multicast zurück
+        s.set_multicast_loop_v4(false)?; // eigene Frames nicht per Multicast zurueck
         s.set_multicast_ttl_v4(1)?;      // nur lokales Segment
 
         let socket: UdpSocket = s.into();
@@ -114,15 +125,19 @@ impl UdpTransport {
             self_node_id: cfg.self_node_id,
             self_session_id: cfg.self_session_id,
             peers: HashMap::new(),
-            next_seq_num : cfg.initial_sequenz_num,
+            next_seq_num: cfg.initial_sequenz_num,
+            _payload: core::marker::PhantomData,
         })
     }
 
-    /// Sendet einen State-Frame mit automatisch hochgezählter seq_num.
+    /// Sendet einen State-Frame mit automatisch hochgezaehlter seq_num.
     pub fn send_state(&mut self, node_state: NodeState) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
-        let frame = UdpFrame::state_frame(
-            self.self_node_id, self.self_session_id, seq, node_state,
+        let frame = UdpFrame::<P>::state_frame(
+            self.self_node_id,
+            self.self_session_id,
+            seq,
+            node_state,
         );
         self.socket.send_to(&frame.encode(), self.group_addr)?;
         self.next_seq_num = self.next_seq_num.wrapping_add(1);
@@ -130,11 +145,17 @@ impl UdpTransport {
     }
 
     pub fn send_result(
-        &mut self, node_state: NodeState, result: BrakeResult,
+        &mut self,
+        node_state: NodeState,
+        result: P,
     ) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
-        let frame = UdpFrame::result_frame(
-            self.self_node_id, self.self_session_id, seq, node_state, result,
+        let frame = UdpFrame::<P>::result_frame(
+            self.self_node_id,
+            self.self_session_id,
+            seq,
+            node_state,
+            result,
         );
         self.socket.send_to(&frame.encode(), self.group_addr)?;
         self.next_seq_num = self.next_seq_num.wrapping_add(1);
@@ -142,21 +163,27 @@ impl UdpTransport {
     }
 
     pub fn send_ack(
-        &mut self, node_state: NodeState,
-        received_from: PeerMask, publisher_candidate: u8,
+        &mut self,
+        node_state: NodeState,
+        received_from: PeerMask,
+        publisher_candidate: u8,
     ) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
-        let frame = UdpFrame::ack_frame(
-            self.self_node_id, self.self_session_id, seq, node_state,
-            received_from, publisher_candidate,
+        let frame = UdpFrame::<P>::ack_frame(
+            self.self_node_id,
+            self.self_session_id,
+            seq,
+            node_state,
+            received_from,
+            publisher_candidate,
         );
         self.socket.send_to(&frame.encode(), self.group_addr)?;
         self.next_seq_num = self.next_seq_num.wrapping_add(1);
         Ok(seq)
     }
 
-    pub fn recv(&mut self) -> RecvOutcome {
-        let mut buf = [0u8; MAX_FRAME_SIZE];
+    pub fn recv(&mut self) -> RecvOutcome<P> {
+        let mut buf = [0u8; RECV_BUFFER_SIZE];
         let (n, _src) = match self.socket.recv_from(&mut buf) {
             Ok(x) => x,
             Err(e)
@@ -168,7 +195,7 @@ impl UdpTransport {
             Err(_) => return RecvOutcome::Timeout,
         };
 
-        let frame = match UdpFrame::decode(&buf[..n]) {
+        let frame = match UdpFrame::<P>::decode(&buf[..n]) {
             Ok(f) => f,
             Err(FrameError::CrcMismatch) => return RecvOutcome::CrcError,
             Err(e) => return RecvOutcome::Malformed(e),
@@ -181,7 +208,7 @@ impl UdpTransport {
         self.classify(frame)
     }
 
-    pub fn recv_before(&mut self, deadline: Instant) -> RecvOutcome {
+    pub fn recv_before(&mut self, deadline: Instant) -> RecvOutcome<P> {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or(Duration::ZERO);
@@ -194,7 +221,7 @@ impl UdpTransport {
             return RecvOutcome::Timeout;
         }
 
-        let mut buf = [0u8; MAX_FRAME_SIZE];
+        let mut buf = [0u8; RECV_BUFFER_SIZE];
         let (n, _src) = match self.socket.recv_from(&mut buf) {
             Ok(x) => x,
             Err(e)
@@ -206,7 +233,7 @@ impl UdpTransport {
             Err(_) => return RecvOutcome::Timeout,
         };
 
-        let frame = match UdpFrame::decode(&buf[..n]) {
+        let frame = match UdpFrame::<P>::decode(&buf[..n]) {
             Ok(f) => f,
             Err(FrameError::CrcMismatch) => return RecvOutcome::CrcError,
             Err(e) => return RecvOutcome::Malformed(e),
@@ -219,10 +246,10 @@ impl UdpTransport {
         self.classify(frame)
     }
 
-    fn classify(&mut self, frame: UdpFrame) -> RecvOutcome {
+    fn classify(&mut self, frame: UdpFrame<P>) -> RecvOutcome<P> {
         let peer_id = frame.node_id();
         match self.peers.get(&peer_id).copied() {
-            // Erster Frame von diesem Peer überhaupt → einfach akzeptieren.
+            // Erster Frame von diesem Peer ueberhaupt -> einfach akzeptieren.
             None => {
                 self.peers.insert(
                     peer_id,
@@ -234,7 +261,7 @@ impl UdpTransport {
                 RecvOutcome::Valid(frame)
             }
 
-            // Peer hat eine neue Session-ID → er hat rebootet.
+            // Peer hat eine neue Session-ID -> er hat rebootet.
             // Cursor NICHT automatisch aktualisieren — die State-Machine soll
             // entscheiden, ob sie den neuen Peer akzeptiert (via accept()).
             Some(cur) if frame.session_id() != cur.session_id => RecvOutcome::NewSession {
@@ -244,14 +271,14 @@ impl UdpTransport {
                 frame,
             },
 
-            // Selbe Session, aber alte oder identische seq_num → Duplikat/Replay.
+            // Selbe Session, aber alte oder identische seq_num -> Duplikat/Replay.
             Some(cur) if frame.seq_num() <= cur.last_seq => RecvOutcome::Duplicate {
                 peer_id,
                 seen: frame.seq_num(),
                 last: cur.last_seq,
             },
 
-            // Selbe Session, seq_num genau um 1 höher → normaler Fall.
+            // Selbe Session, seq_num genau um 1 hoeher -> normaler Fall.
             Some(cur) if frame.seq_num() == cur.last_seq + 1 => {
                 self.peers.insert(
                     peer_id,
@@ -263,7 +290,7 @@ impl UdpTransport {
                 RecvOutcome::Valid(frame)
             }
 
-            // Selbe Session, seq_num > last_seq + 1 → Pakete verloren.
+            // Selbe Session, seq_num > last_seq + 1 -> Pakete verloren.
             Some(cur) => {
                 let gap = frame.seq_num() - cur.last_seq - 1;
                 RecvOutcome::SeqGap {
@@ -276,9 +303,9 @@ impl UdpTransport {
     }
 
     /// Von der State-Machine aufzurufen, wenn sie einen `NewSession`- oder
-    /// `SeqGap`-Frame nach Prüfung akzeptiert (z.B. Peer-Rejoin in Probation).
-    /// Damit übernimmt der Transport die neuen Cursor-Werte.
-    pub fn accept(&mut self, frame: &UdpFrame) {
+    /// `SeqGap`-Frame nach Pruefung akzeptiert (z.B. Peer-Rejoin in Probation).
+    /// Damit uebernimmt der Transport die neuen Cursor-Werte.
+    pub fn accept(&mut self, frame: &UdpFrame<P>) {
         self.peers.insert(
             frame.node_id(),
             PeerCursor {
