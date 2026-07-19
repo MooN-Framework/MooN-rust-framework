@@ -1,64 +1,94 @@
-use std::{net::Ipv4Addr, time::{Duration, Instant}};
-use std::process::ExitCode;
+use std::net::Ipv4Addr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use swb_fault_tolerance::{net::udp_transport::{RecvOutcome, TransportConfig, UdpTransport}, sys_state::state_machine::NodeState};
+use swb_fault_tolerance::brake::braking_curve::BrakeInput;
+use swb_fault_tolerance::brake::computation::BrakeComputation;
+use swb_fault_tolerance::brake::sink::BrakeSink;
+use swb_fault_tolerance::brake::voter::BrakeVoter;
+use swb_fault_tolerance::framework::run_state::RunState;
+use swb_fault_tolerance::framework::runner::{CycleTiming, Runner};
+use swb_fault_tolerance::framework::udp_transport::{TransportConfig, UdpTransport};
 
-fn main() -> ExitCode {
-    let config = TransportConfig {
-        interface_name: "lo".into(),
+fn main() {
+    // -------------------------------------------------------------
+    // Konfiguration (spaeter aus Datei/CLI laden)
+    // -------------------------------------------------------------
+
+    // Kapazitaet des Peer-Arrays (compile-time Obergrenze).
+    // Bei 2-oo-3 sind 2 Peers aktiv; N=7 laesst bis zu 8 Nodes zu.
+    const MAX_PEERS: usize = 7;
+
+    let own_id: u8 = read_env_u8("NODE_ID").expect("NODE_ID env var");
+    let session_id: u64 = fresh_session_id();
+    let interface_name: String =
+        std::env::var("NET_IFACE").unwrap_or_else(|_| "eth0".to_string());
+
+    // -------------------------------------------------------------
+    // Framework-Komponenten
+    // -------------------------------------------------------------
+
+    let voter = BrakeVoter::new(
+        /* required */ 2,
+        /* distance_tolerance in Metern */ 0.5,
+    );
+
+    let state: RunState<BrakeVoter, MAX_PEERS> =
+        RunState::new(own_id, session_id, voter);
+
+    let transport = UdpTransport::<_>::new(TransportConfig {
+        interface_name,
         multicast_group: Ipv4Addr::new(239, 10, 0, 1),
-        port: 3881,
-        self_node_id: 1,
-        self_session_id: 220303,
+        port: 5555,
+        self_node_id: own_id,
+        self_session_id: session_id,
         initial_sequenz_num: 0,
+    })
+    .expect("transport init failed");
+
+    let timing = CycleTiming {
+        cycle_duration: Duration::from_millis(100),
+        sync_timeout:   Duration::from_millis(500),
+        share_timeout:  Duration::from_millis(30),
+        ack_timeout:    Duration::from_millis(20),
     };
 
-    let mut tx = match UdpTransport::new(config) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Transport-Init fehlgeschlagen: {:?}", e);
-            return ExitCode::FAILURE;
-        }
-    };
+    // -------------------------------------------------------------
+    // Anwendungskomponenten
+    // -------------------------------------------------------------
 
-    let send_interval = Duration::from_secs(2);
-    let recv_slice    = Duration::from_millis(100);
-    let mut next_send = Instant::now();
-    loop
-    {
-        if Instant::now() >= next_send {
-            match tx.send_state(NodeState::Startup) {
-                Ok(seq)  => println!("gesendet: state-frame seq={}", seq),
-                Err(e)   => eprintln!("send fehlgeschlagen: {:?}", e),
-            }
-            next_send += send_interval;
-        }
+    let computation = BrakeComputation;
+    let sink = BrakeSink::new();
 
-        // Bis zum nächsten Sende-Zeitpunkt (max. recv_slice) lauschen
-        let deadline = std::cmp::min(next_send, Instant::now() + recv_slice);
-        match tx.recv_before(deadline) {
-            RecvOutcome::Valid(frame) => {
-                println!(
-                    "empfangen: node={} session={} seq={} state={:?}",
-                    frame.node_id(),
-                    frame.session_id(),
-                    frame.seq_num(),
-                    frame.node_state(),
-                );
-            }
-            RecvOutcome::Timeout       => { /* okay, weiter */ }
-            RecvOutcome::SelfLoopback  => { /* eigenen Frame ignorieren */ }
-            RecvOutcome::CrcError      => eprintln!("CRC-Fehler"),
-            RecvOutcome::Malformed(e)  => eprintln!("kaputter Frame: {:?}", e),
-            RecvOutcome::Duplicate { peer_id, seen, last } =>
-                eprintln!("Duplikat von {}: seen={} last={}", peer_id, seen, last),
-            RecvOutcome::NewSession { peer_id, previous_session, new_session, .. } =>
-                println!("Peer {} rebootete: {} → {}", peer_id, previous_session, new_session),
-            RecvOutcome::SeqGap { peer_id, gap, .. } =>
-                eprintln!("Lücke bei Peer {}: {} Frames verpasst", peer_id, gap),
-        }
+    // Fester Start-Input. Ueber set_input im Runner spaeter durch das
+    // Diagnose-Tool per UDP ueberschreibbar.
+    let initial_input = BrakeInput::new(
+        /* current_speed */    80.0,
+        /* target_speed */      0.0,
+        /* available_distance */ 1200.0,
+    );
 
-    }
+    // -------------------------------------------------------------
+    // Loop
+    // -------------------------------------------------------------
 
-    ExitCode::SUCCESS
+    let mut runner = Runner::new(state, transport, computation, initial_input, sink, timing);
+    runner.run();
+
+    // Wenn run() zurueckkehrt, ist der Node in Failsafe.
+    eprintln!("Node {} in Failsafe. Exiting.", own_id);
+    std::process::exit(1);
+}
+
+fn fresh_session_id() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_nanos() as u64
+}
+
+fn read_env_u8(key: &str) -> Result<u8, String> {
+    std::env::var(key)
+        .map_err(|_| format!("env var {key} not set"))?
+        .parse::<u8>()
+        .map_err(|e| format!("env var {key} invalid: {e}"))
 }

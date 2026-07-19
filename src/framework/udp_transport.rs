@@ -4,10 +4,10 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
 
-use crate::net::udp_frame::{FrameError, UdpFrame, MAX_PAYLOAD_WIRE_SIZE};
-use crate::sys_state::traits::CyclePayload;
-use crate::sys_state::state_machine::NodeState;
-use crate::sys_state::types::PeerMask;
+use crate::framework::udp_frame::{FrameError, UdpFrame, MAX_PAYLOAD_WIRE_SIZE};
+use crate::framework::traits::CyclePayload;
+use crate::framework::state_machine::NodeState;
+use crate::framework::types::PeerMask;
 
 /// Obere Grenze fuer die Puffergroesse beim Empfang.
 ///

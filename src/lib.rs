@@ -1,4 +1,2 @@
-pub mod input;
-pub mod net;
-pub mod sys_state;
+pub mod framework;
 pub mod brake;

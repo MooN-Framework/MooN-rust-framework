@@ -1,7 +1,7 @@
-use crate::sys_state::traits::CyclePayload;
-use crate::sys_state::wire::{PayloadError, WireReader, WireWriter};
-use crate::sys_state::state_machine::NodeState;
-use crate::sys_state::types::PeerMask;
+use crate::framework::traits::CyclePayload;
+use crate::framework::wire::{PayloadError, WireReader, WireWriter};
+use crate::framework::state_machine::NodeState;
+use crate::framework::types::PeerMask;
 use crc32fast::Hasher;
 
 // -------------------------------------------------------------

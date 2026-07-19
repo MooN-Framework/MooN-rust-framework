@@ -59,6 +59,12 @@ pub struct BrakeInput {
     pub available_distance: f64,
 }
 
+impl BrakeInput {
+    pub fn new(current_speed : f64, target_speed : f64, available_distance : f64) -> Self{
+        Self { current_speed, target_speed, available_distance }
+    }
+}
+
 /// Ergebnis einer Bremswegberechnung.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrakeResult {

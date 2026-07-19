@@ -1,7 +1,7 @@
 use heapless::Vec;
 
-use crate::sys_state::traits::{CyclePayload, Voter, VotingOutcome};
-use crate::sys_state::state_machine::{NodeState, SystemState};
+use crate::framework::traits::{CyclePayload, Voter, VotingOutcome};
+use crate::framework::state_machine::{NodeState, SystemState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerHealth {
