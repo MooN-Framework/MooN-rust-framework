@@ -1,8 +1,8 @@
-use heapless::Vec;
-
 use crate::brake::braking_curve::BrakeResult;
 use crate::framework::traits::{CyclePayload, Voter, VotingOutcome};
 use crate::framework::wire::{PayloadError, WireReader, WireWriter};
+use heapless::Vec;
+use tracing::{debug, error, info, warn};
 
 // -------------------------------------------------------------
 // CyclePayload-Impl fuer BrakeResult
@@ -36,7 +36,7 @@ impl CyclePayload for BrakeResult {
 // Voter
 // -------------------------------------------------------------
 
-const MAX_PARTICIPANTS: usize = 8;
+const MAX_PARTICIPANTS: usize = 2;
 
 /// K-oo-M Voter fuer BrakeResult.
 ///
@@ -57,7 +57,10 @@ impl BrakeVoter {
             distance_tolerance >= 0.0 && distance_tolerance.is_finite(),
             "distance_tolerance muss endlich und nicht-negativ sein"
         );
-        Self { required, distance_tolerance }
+        Self {
+            required,
+            distance_tolerance,
+        }
     }
 
     fn agree(&self, a: &BrakeResult, b: &BrakeResult) -> bool {
@@ -101,11 +104,17 @@ impl Voter for BrakeVoter {
     ) -> VotingOutcome<BrakeResult> {
         let mut all: Vec<BrakeResult, MAX_PARTICIPANTS> = Vec::new();
         let _ = all.push(*own);
+        let present = peers.iter().filter(|p| p.is_some()).count();
         for p in peers.iter().flatten() {
             let _ = all.push(*p);
         }
 
         if (all.len() as u8) < self.required {
+            error!(
+                "All.len was smaller than required req: {} all: {}",
+                self.required,
+                all.len()
+            );
             return VotingOutcome::InsufficientQuorum;
         }
 

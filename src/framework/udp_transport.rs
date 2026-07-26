@@ -1,13 +1,11 @@
+use crate::framework::state_machine::NodeState;
+use crate::framework::traits::CyclePayload;
+use crate::framework::types::PeerMask;
+use crate::framework::udp_frame::{FrameError, MAX_PAYLOAD_WIRE_SIZE, UdpFrame};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::time::{Duration, Instant};
-
-use crate::framework::udp_frame::{FrameError, UdpFrame, MAX_PAYLOAD_WIRE_SIZE};
-use crate::framework::traits::CyclePayload;
-use crate::framework::state_machine::NodeState;
-use crate::framework::types::PeerMask;
 
 /// Obere Grenze fuer die Puffergroesse beim Empfang.
 ///
@@ -19,9 +17,9 @@ const CRC_SIZE: usize = 4;
 pub const RECV_BUFFER_SIZE: usize = HEADER_SIZE + MAX_PAYLOAD_WIRE_SIZE + CRC_SIZE;
 
 pub struct TransportConfig {
-    pub interface_name: String,      // z.B. "eth0"
-    pub multicast_group: Ipv4Addr,   // z.B. Ipv4Addr::new(239, 10, 0, 1)
-    pub port: u16,                   // z.B. 5555
+    pub interface_name: String,    // z.B. "eth0"
+    pub multicast_group: Ipv4Addr, // z.B. Ipv4Addr::new(239, 10, 0, 1)
+    pub port: u16,                 // z.B. 5555
     pub self_node_id: u8,
     pub self_session_id: u64,
     pub initial_sequenz_num: u32,
@@ -46,11 +44,7 @@ pub enum RecvOutcome<P: CyclePayload> {
 
     /// Selbe oder aeltere seq_num vom selben Peer (in derselben Session).
     /// Klassischer Replay/Duplikat, verwerfen.
-    Duplicate {
-        peer_id: u8,
-        seen: u32,
-        last: u32,
-    },
+    Duplicate { peer_id: u8, seen: u32, last: u32 },
 
     /// Peer hat eine andere Session-ID als beim letzten Frame -> er hat rebootet
     /// oder ist neu gestartet. State-Machine entscheidet, ob Resync/Rejoin.
@@ -113,8 +107,8 @@ impl<P: CyclePayload> UdpTransport<P> {
         )))?;
 
         s.join_multicast_v4(&cfg.multicast_group, &iface_ip)?;
-        s.set_multicast_loop_v4(false)?; // eigene Frames nicht per Multicast zurueck
-        s.set_multicast_ttl_v4(1)?;      // nur lokales Segment
+        s.set_multicast_loop_v4(true)?; // eigene Frames nicht per Multicast zurueck
+        s.set_multicast_ttl_v4(1)?; // nur lokales Segment
 
         let socket: UdpSocket = s.into();
         let group_addr = SocketAddrV4::new(cfg.multicast_group, cfg.port);
@@ -133,22 +127,14 @@ impl<P: CyclePayload> UdpTransport<P> {
     /// Sendet einen State-Frame mit automatisch hochgezaehlter seq_num.
     pub fn send_state(&mut self, node_state: NodeState) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
-        let frame = UdpFrame::<P>::state_frame(
-            self.self_node_id,
-            self.self_session_id,
-            seq,
-            node_state,
-        );
+        let frame =
+            UdpFrame::<P>::state_frame(self.self_node_id, self.self_session_id, seq, node_state);
         self.socket.send_to(&frame.encode(), self.group_addr)?;
         self.next_seq_num = self.next_seq_num.wrapping_add(1);
         Ok(seq)
     }
 
-    pub fn send_result(
-        &mut self,
-        node_state: NodeState,
-        result: P,
-    ) -> Result<u32, TransportError> {
+    pub fn send_result(&mut self, node_state: NodeState, result: P) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
         let frame = UdpFrame::<P>::result_frame(
             self.self_node_id,
@@ -187,8 +173,7 @@ impl<P: CyclePayload> UdpTransport<P> {
         let (n, _src) = match self.socket.recv_from(&mut buf) {
             Ok(x) => x,
             Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
                 return RecvOutcome::Timeout;
             }
@@ -208,26 +193,16 @@ impl<P: CyclePayload> UdpTransport<P> {
         self.classify(frame)
     }
 
-    pub fn recv_before(&mut self, deadline: Instant) -> RecvOutcome<P> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or(Duration::ZERO);
-
-        if remaining.is_zero() {
-            return RecvOutcome::Timeout;
-        }
-
-        if self.socket.set_read_timeout(Some(remaining)).is_err() {
+    pub fn try_recv(&mut self) -> RecvOutcome<P> {
+        // Non-blocking Modus setzen; falls das fehlschlaegt, gibt's nichts zu tun.
+        if self.socket.set_nonblocking(true).is_err() {
             return RecvOutcome::Timeout;
         }
 
         let mut buf = [0u8; RECV_BUFFER_SIZE];
         let (n, _src) = match self.socket.recv_from(&mut buf) {
             Ok(x) => x,
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
-            {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 return RecvOutcome::Timeout;
             }
             Err(_) => return RecvOutcome::Timeout,

@@ -60,8 +60,12 @@ pub struct BrakeInput {
 }
 
 impl BrakeInput {
-    pub fn new(current_speed : f64, target_speed : f64, available_distance : f64) -> Self{
-        Self { current_speed, target_speed, available_distance }
+    pub fn new(current_speed: f64, target_speed: f64, available_distance: f64) -> Self {
+        Self {
+            current_speed,
+            target_speed,
+            available_distance,
+        }
     }
 }
 

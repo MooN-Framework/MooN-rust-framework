@@ -9,16 +9,15 @@ pub enum SystemState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NodeState {
-    Startup           = 0x01,
-    Sync              = 0x02,
-    ReadInputs        = 0x03,
-    CalculateCritical = 0x04,
-    ShareResult       = 0x05,
-    SendACK           = 0x06,
-    PublishResult     = 0x07,
-    StateManagement   = 0x08,
-    Probation         = 0x09,
-    Failsafe          = 0xFF,
+    Startup = 0x01,
+    Sync = 0x02,
+    ReadInputs = 0x03,
+    ShareResult = 0x04,
+    SendACK = 0x05,
+    PublishResult = 0x06,
+    StateManagement = 0x07,
+    Probation = 0x08,
+    Failsafe = 0xFF,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,9 +33,13 @@ pub enum StateEvent {
     CycleSyncTimeout,
     /* Operational cycle — Platzhalter, bitte final benennen */
     InputsRead,
-    CalculationDone,
+    /* Result Events */
     ResultShared,
+    ShareResultTimeout,
+    /* Ack Events */
     AckReceived,
+    AckTimeout,
+    /* Publish Events */
     ResultPublished,
     /* State management / probation */
     StateOk,
@@ -54,23 +57,23 @@ impl NodeState {
 
         match (self, event) {
             // --- Startup ---
-            (Startup, SelfTestOK)  => Sync,
+            (Startup, SelfTestOK) => Sync,
             (Startup, SelfTestErr) => Failsafe,
 
             // --- Sync ---
-            (Sync, InitialSyncOk) | (Sync, CycleSyncOk)              => ReadInputs,
+            (Sync, InitialSyncOk) | (Sync, CycleSyncOk) => ReadInputs,
             (Sync, InitialSyncPeerTimeout) | (Sync, CycleSyncTimeout) => Failsafe,
-            (Sync, SyncDetectedReentry)                              => Sync,
+            (Sync, SyncDetectedReentry) => Sync,
 
             // --- Operational cycle ---
-            (ReadInputs,        InputsRead)       => CalculateCritical,
-            (CalculateCritical, CalculationDone)  => ShareResult,
-            (ShareResult,       ResultShared)     => SendACK,
-            (SendACK,           AckReceived)      => PublishResult,
-            (PublishResult,     ResultPublished)  => StateManagement,
+            (ReadInputs, InputsRead) => ShareResult,
+            (ShareResult, ShareResultTimeout) => StateManagement,
+            (ShareResult, ResultShared) => SendACK,
+            (SendACK, AckReceived) => PublishResult,
+            (PublishResult, ResultPublished) => Sync,
 
             // --- State management ---
-            (StateManagement, StateOk)       => Sync,        // nächster Zyklus
+            (StateManagement, StateOk) => ReadInputs,
             (StateManagement, StateDiverged) => Probation,
 
             // --- Probation ---
@@ -82,7 +85,7 @@ impl NodeState {
 
             // --- Fail-stop: alles Unerwartete ---
             (_, Fault) => Failsafe,
-            _          => Failsafe,
+            _ => Failsafe,
         }
     }
 
@@ -98,18 +101,16 @@ impl NodeState {
             0x01 => Startup,
             0x02 => Sync,
             0x03 => ReadInputs,
-            0x04 => CalculateCritical,
-            0x05 => ShareResult,
-            0x06 => SendACK,
-            0x07 => PublishResult,
-            0x08 => StateManagement,
-            0x09 => Probation,
+            0x04 => ShareResult,
+            0x05 => SendACK,
+            0x06 => PublishResult,
+            0x07 => StateManagement,
+            0x08 => Probation,
             0xFF => Failsafe,
             other => return Err(InvalidNodeState(other)),
         })
     }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidNodeState(pub u8);

@@ -1,7 +1,7 @@
-use heapless::Vec;
-
-use crate::framework::traits::{CyclePayload, Voter, VotingOutcome};
 use crate::framework::state_machine::{NodeState, SystemState};
+use crate::framework::traits::{CyclePayload, Voter, VotingOutcome};
+use heapless::Vec;
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerHealth {
@@ -174,8 +174,21 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         peer_id: u8,
         payload: V::Payload,
     ) -> Result<(), DiscoveryError> {
-        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
         self.cycle.peer_results[idx] = Some(payload);
+        debug!(peer_id, seq = self.current_seq, "recorded peer result");
+        Ok(())
+    }
+
+    pub fn record_peer_ack(&mut self, peer_id: u8, ack: AckInfo) -> Result<(), DiscoveryError> {
+        let idx = self.peer_index(peer_id).ok_or_else(|| {
+            warn!(peer_id, "received ack from unknown peer");
+            DiscoveryError::UnknownPeer
+        })?;
+        self.cycle.peer_acks[idx] = Some(ack);
+        debug!(peer_id, seq = self.current_seq, "recorded peer ack");
         Ok(())
     }
 
@@ -197,15 +210,37 @@ impl<V: Voter, const N: usize> RunState<V, N> {
 
     // ---- Accessors ----
 
-    pub fn own_id(&self) -> u8 { self.own_id }
-    pub fn session_id(&self) -> u64 { self.session_id }
-    pub fn node_state(&self) -> NodeState { self.node_state }
-    pub fn set_node_state(&mut self, s: NodeState) { self.node_state = s; }
-    pub fn system_state(&self) -> SystemState { self.system_state }
-    pub fn set_system_state(&mut self, s: SystemState) { self.system_state = s; }
-    pub fn current_seq(&self) -> u32 { self.current_seq }
-    pub fn peers(&self) -> &[PeerInfo] { &self.peers }
-    pub fn cycle(&self) -> &CycleState<V::Payload, N> { &self.cycle }
-    pub fn last_decision(&self) -> Option<VotingOutcome<V::Decision>> { self.last_decision }
-    pub fn voter(&self) -> &V { &self.voter }
+    pub fn own_id(&self) -> u8 {
+        self.own_id
+    }
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+    pub fn node_state(&self) -> NodeState {
+        self.node_state
+    }
+    pub fn set_node_state(&mut self, s: NodeState) {
+        self.node_state = s;
+    }
+    pub fn system_state(&self) -> SystemState {
+        self.system_state
+    }
+    pub fn set_system_state(&mut self, s: SystemState) {
+        self.system_state = s;
+    }
+    pub fn current_seq(&self) -> u32 {
+        self.current_seq
+    }
+    pub fn peers(&self) -> &[PeerInfo] {
+        &self.peers
+    }
+    pub fn cycle(&self) -> &CycleState<V::Payload, N> {
+        &self.cycle
+    }
+    pub fn last_decision(&self) -> Option<VotingOutcome<V::Decision>> {
+        self.last_decision
+    }
+    pub fn voter(&self) -> &V {
+        &self.voter
+    }
 }

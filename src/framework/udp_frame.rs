@@ -1,7 +1,7 @@
-use crate::framework::traits::CyclePayload;
-use crate::framework::wire::{PayloadError, WireReader, WireWriter};
 use crate::framework::state_machine::NodeState;
+use crate::framework::traits::CyclePayload;
 use crate::framework::types::PeerMask;
+use crate::framework::wire::{PayloadError, WireReader, WireWriter};
 use crc32fast::Hasher;
 
 // -------------------------------------------------------------
@@ -88,7 +88,11 @@ impl<P: CyclePayload> UdpFrame<P> {
 
     /// Groesster moeglicher Frame fuer diesen Payload-Typ.
     pub const MAX_FRAME_SIZE: usize = {
-        let body = if P::WIRE_SIZE > ACK_BODY { P::WIRE_SIZE } else { ACK_BODY };
+        let body = if P::WIRE_SIZE > ACK_BODY {
+            P::WIRE_SIZE
+        } else {
+            ACK_BODY
+        };
         HEADER_SIZE + body + CRC_SIZE
     };
 
@@ -122,7 +126,13 @@ impl<P: CyclePayload> UdpFrame<P> {
         node_state: NodeState,
         result: P,
     ) -> Self {
-        Self::new(node_id, session_id, seq_num, node_state, Payload::Result(result))
+        Self::new(
+            node_id,
+            session_id,
+            seq_num,
+            node_state,
+            Payload::Result(result),
+        )
     }
 
     pub fn ack_frame(
@@ -145,11 +155,21 @@ impl<P: CyclePayload> UdpFrame<P> {
         )
     }
 
-    pub fn node_id(&self) -> u8 { self.node_id }
-    pub fn session_id(&self) -> u64 { self.session_id }
-    pub fn seq_num(&self) -> u32 { self.seq_num }
-    pub fn node_state_wire(&self) -> u8 { self.node_state_wire }
-    pub fn payload(&self) -> Payload<P> { self.payload }
+    pub fn node_id(&self) -> u8 {
+        self.node_id
+    }
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+    pub fn seq_num(&self) -> u32 {
+        self.seq_num
+    }
+    pub fn node_state_wire(&self) -> u8 {
+        self.node_state_wire
+    }
+    pub fn payload(&self) -> Payload<P> {
+        self.payload
+    }
 
     fn compute_crc(&self) -> u32 {
         // Erzwingt Auswertung der Compile-Time-Assertion.
@@ -230,12 +250,10 @@ impl<P: CyclePayload> UdpFrame<P> {
             return Err(FrameError::TooShort);
         }
         let node_id = bytes[0];
-        let session_id = u64::from_le_bytes(
-            bytes[1..9].try_into().expect("slice length checked above"),
-        );
-        let seq_num = u32::from_le_bytes(
-            bytes[9..13].try_into().expect("slice length checked above"),
-        );
+        let session_id =
+            u64::from_le_bytes(bytes[1..9].try_into().expect("slice length checked above"));
+        let seq_num =
+            u32::from_le_bytes(bytes[9..13].try_into().expect("slice length checked above"));
         let node_state_wire = bytes[13];
         let disc = bytes[14];
 

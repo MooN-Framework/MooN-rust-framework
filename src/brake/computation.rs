@@ -1,6 +1,4 @@
-use crate::brake::braking_curve::{
-    compute_braking_curve, BrakeError, BrakeInput, BrakeResult,
-};
+use crate::brake::braking_curve::{BrakeError, BrakeInput, BrakeResult, compute_braking_curve};
 use crate::framework::traits::Computation;
 
 /// Adapter: verpackt `compute_braking_curve` als Framework-`Computation`.

@@ -5,7 +5,7 @@ use crate::framework::wire::{PayloadError, WireReader, WireWriter};
 /// Nutzwert, den jeder Node pro Zyklus berechnet und mit den Peers teilt.
 /// Fixed-size Wire-Repraesentation ist Pflicht: deterministischer Speicher
 /// im sicherheitsrelevanten Pfad.
-pub trait CyclePayload: Copy + PartialEq {
+pub trait CyclePayload: Copy + PartialEq + core::fmt::Debug {
     const WIRE_SIZE: usize;
 
     fn to_wire(&self, w: &mut WireWriter<'_>);

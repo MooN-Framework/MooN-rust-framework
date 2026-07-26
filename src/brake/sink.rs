@@ -6,11 +6,15 @@ use crate::framework::traits::DecisionSink;
 pub struct BrakeSink;
 
 impl BrakeSink {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for BrakeSink {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DecisionSink for BrakeSink {
