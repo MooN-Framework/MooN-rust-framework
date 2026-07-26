@@ -10,13 +10,14 @@ pub enum SystemState {
 #[repr(u8)]
 pub enum NodeState {
     Startup = 0x01,
-    Sync = 0x02,
-    ReadInputs = 0x03,
-    ShareResult = 0x04,
-    SendACK = 0x05,
-    PublishResult = 0x06,
-    StateManagement = 0x07,
-    Probation = 0x08,
+    InitSync = 0x02,
+    CycleSync = 0x03,
+    ReadInputs = 0x04,
+    ShareResult = 0x05,
+    SendACK = 0x06,
+    PublishResult = 0x07,
+    StateManagement = 0x08,
+    Probation = 0x09,
     Failsafe = 0xFF,
 }
 
@@ -25,10 +26,10 @@ pub enum StateEvent {
     /* SelfTest */
     SelfTestOK,
     SelfTestErr,
-    /* Sync */
-    SyncDetectedReentry,
+    /* InitSync */
     InitialSyncOk,
-    InitialSyncPeerTimeout,
+    InitialSyncTimeout,
+    /* CycleSync */
     CycleSyncOk,
     CycleSyncTimeout,
     /* Operational cycle — Platzhalter, bitte final benennen */
@@ -57,13 +58,16 @@ impl NodeState {
 
         match (self, event) {
             // --- Startup ---
-            (Startup, SelfTestOK) => Sync,
+            (Startup, SelfTestOK) => InitSync,
             (Startup, SelfTestErr) => Failsafe,
 
-            // --- Sync ---
-            (Sync, InitialSyncOk) | (Sync, CycleSyncOk) => ReadInputs,
-            (Sync, InitialSyncPeerTimeout) | (Sync, CycleSyncTimeout) => Failsafe,
-            (Sync, SyncDetectedReentry) => Sync,
+            // --- InitSync ---
+            (InitSync, InitialSyncOk) => ReadInputs,
+            (InitSync, InitialSyncTimeout) => Failsafe,
+
+            // CycleSync
+            (CycleSync, CycleSyncOk) => ReadInputs,
+            (CycleSync, CycleSyncTimeout) => StateManagement,
 
             // --- Operational cycle ---
             (ReadInputs, InputsRead) => ShareResult,
@@ -71,14 +75,14 @@ impl NodeState {
             (ShareResult, ResultShared) => SendACK,
             (SendACK, AckTimeout) => StateManagement,
             (SendACK, AckReceived) => PublishResult,
-            (PublishResult, ResultPublished) => Sync,
+            (PublishResult, ResultPublished) => CycleSync,
 
             // --- State management ---
             (StateManagement, StateOk) => ReadInputs,
             (StateManagement, StateDiverged) => Probation,
 
             // --- Probation ---
-            (Probation, ProbationPassed) => Sync,
+            (Probation, ProbationPassed) => CycleSync,
             (Probation, ProbationFailed) => Failsafe,
 
             // --- Failsafe ist terminal ---
@@ -100,13 +104,14 @@ impl NodeState {
         use NodeState::*;
         Ok(match v {
             0x01 => Startup,
-            0x02 => Sync,
-            0x03 => ReadInputs,
-            0x04 => ShareResult,
-            0x05 => SendACK,
-            0x06 => PublishResult,
-            0x07 => StateManagement,
-            0x08 => Probation,
+            0x02 => InitSync,
+            0x03 => CycleSync,
+            0x04 => ReadInputs,
+            0x05 => ShareResult,
+            0x06 => SendACK,
+            0x07 => PublishResult,
+            0x08 => StateManagement,
+            0x09 => Probation,
             0xFF => Failsafe,
             other => return Err(InvalidNodeState(other)),
         })

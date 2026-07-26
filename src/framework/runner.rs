@@ -1,7 +1,7 @@
+use log::Level::Warn;
+use std::cell::Cell;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-
-use log::Level::Warn;
 use tracing::{debug, error, info, warn};
 
 use crate::framework::run_state::{AckInfo, RunState};
@@ -19,8 +19,8 @@ enum PhaseOutcome {
 
 pub struct CycleTiming {
     pub cycle_duration: Duration,
-    pub discovery_window: Duration, // z.B. 5s
-    pub beacon_interval: Duration,  // z.B. 100ms
+    pub init_sync_timeout: Duration,   // z.B. 5s
+    pub cycle_sync_timeout: Duration, // z.B. 20ms
     pub share_timeout: Duration,
     pub ack_timeout: Duration,
 }
@@ -78,7 +78,8 @@ where
 
             let event = match current {
                 NodeState::Startup => self.handle_startup(),
-                NodeState::Sync => self.handle_sync(),
+                NodeState::InitSync => self.handle_init_sync(),
+                NodeState::CycleSync => self.handle_cycle_sync(),
                 NodeState::ReadInputs => self.handle_read_inputs(),
                 NodeState::ShareResult => self.handle_share_result(),
                 NodeState::SendACK => self.handle_send_ack(),
@@ -92,7 +93,7 @@ where
             };
 
             let next = current.next(event);
-            debug!(from = ?current, event = ?event, to = ?next, "state transition");
+            info!(from = ?current, event = ?event, to = ?next, "state transition");
             self.state.set_node_state(next);
         }
     }
@@ -102,69 +103,101 @@ where
     // -------------------------------------------------------------
 
     fn handle_startup(&mut self) -> StateEvent {
-        info!("handle_startup entered");
-        match self.self_test() {
-            Ok(()) => {
-                info!("self_test returned Ok");
-                StateEvent::SelfTestOK
+        StateEvent::SelfTestOK
+    }
+
+    fn handle_cycle_sync(&mut self) -> StateEvent {
+        debug!("handle_cycle_sync entered");
+
+        let node_state = self.state.node_state();
+        let expected_mask = self.state.expected_sync_mask();
+        let peers_synced = Cell::new(0u8);
+        let deadline = Instant::now() + self.timing.cycle_sync_timeout;
+
+        let outcome = self.collect_phase(
+            "cycle_sync",
+            deadline,
+            self.timing.cycle_sync_timeout,
+            |this| {
+                if let Err(e) = this.transport.send_state(node_state) {
+                    error!(error = ?e, "send_state failed in cycle sync");
+                    return Err(());
+                }
+                Ok(())
+            },
+            |_this| peers_synced.get() == expected_mask,
+            |this, frame| {
+                let peer_id = frame.node_id();
+                match frame.payload() {
+                    Payload::State => {
+                        if let Some(idx) = this.state.peer_index(peer_id) {
+                            peers_synced.set(peers_synced.get() | (1 << idx));
+                            debug!(peer_id, "peer reached CycleSync");
+                        }
+                    }
+                    _ => {
+                        debug!(peer_id, "non-state frame during cycle sync, dropped");
+                    }
+                }
+            },
+        );
+
+        match outcome {
+            PhaseOutcome::Complete => {
+                self.state.start_new_cycle(self.next_cycle_tick());
+                StateEvent::CycleSyncOk
             }
-            Err(_) => {
-                error!("self_test returned Err");
-                StateEvent::SelfTestErr
+            PhaseOutcome::Timeout => {
+                warn!(
+                    got_mask = peers_synced.get(),
+                    expected_mask, "cycle sync deadline exceeded"
+                );
+                StateEvent::CycleSyncTimeout
             }
+            PhaseOutcome::Fault => StateEvent::Fault,
         }
     }
 
-    fn handle_sync(&mut self) -> StateEvent {
-        info!(
-            discovery_window_ms = self.timing.discovery_window.as_millis() as u64,
-            beacon_interval_ms = self.timing.beacon_interval.as_millis() as u64,
-            "handle_sync entered"
+    fn handle_init_sync(&mut self) -> StateEvent {
+        info!("Init entered");
+        let node_state = self.state.node_state();
+        let deadline = Instant::now() + self.timing.init_sync_timeout;
+
+        let outcome = self.collect_phase(
+            "init_sync",
+            deadline,
+            Duration::from_millis(10),
+            |this| {
+                if let Err(e) = this.transport.send_state(node_state) {
+                    error!(error = ?e, "send_state failed in init sync");
+                    return Err(());
+                }
+                Ok(())
+            },
+            |this| this.discovery_complete(),
+            |this, frame| {
+                info!(peer_id = frame.node_id(), "init sync frame received");
+                let _ = this.state.on_peer_discovered(frame.node_id());
+            },
         );
-        let overall_deadline = Instant::now() + self.timing.discovery_window;
-        let mut next_beacon = Instant::now();
 
-        loop {
-            // Beacon senden, wenn faellig.
-            if Instant::now() >= next_beacon {
-                match self.transport.send_state(NodeState::Sync) {
-                    Ok(seq) => debug!(seq, "sync beacon sent"),
-                    Err(e) => {
-                        error!(error = ?e, "send_state failed in sync");
-                        return StateEvent::Fault;
-                    }
+        match outcome {
+            PhaseOutcome::Complete => {
+                if self.state.finalize_discovery().is_err() {
+                    error!("finalize_discovery failed");
+                    return StateEvent::SelfTestErr;
                 }
-                next_beacon = Instant::now() + self.timing.beacon_interval;
+                self.state.start_new_cycle(self.next_cycle_tick());
+                StateEvent::InitialSyncOk
             }
-
-            match self.transport.try_recv() {
-                RecvOutcome::Valid(frame) => {
-                    info!(peer_id = frame.node_id(), "sync frame received");
-                    let _ = self.state.on_peer_discovered(frame.node_id());
-                    if self.discovery_complete() {
-                        info!("discovery threshold reached, finalizing");
-                        if self.state.finalize_discovery().is_err() {
-                            error!("finalize_discovery failed");
-                            return StateEvent::SelfTestErr;
-                        }
-                        self.state.start_new_cycle(self.next_cycle_tick());
-                        return StateEvent::CycleSyncOk;
-                    }
-                }
-                RecvOutcome::Timeout => {
-                    if Instant::now() >= overall_deadline {
-                        warn!(
-                            peers_found = self.state.peers().len(),
-                            "discovery window elapsed without enough peers"
-                        );
-                        return StateEvent::CycleSyncTimeout;
-                    }
-                    // sonst weiter — naechster Beacon oder Recv-Zyklus
-                }
-                other => {
-                    debug!(outcome = ?other, "ignored non-Valid outcome during sync");
-                }
+            PhaseOutcome::Timeout => {
+                warn!(
+                    peers_found = self.state.peers().len(),
+                    "discovery window elapsed without enough peers"
+                );
+                StateEvent::InitialSyncTimeout
             }
+            PhaseOutcome::Fault => StateEvent::Fault,
         }
     }
 
@@ -205,6 +238,7 @@ where
                 Ok(())
             },
             |this| this.all_peer_results_in(),
+            |this, frame| this.ingest_frame(frame),
         );
 
         match outcome {
@@ -233,6 +267,7 @@ where
                 Ok(())
             },
             |this| this.all_peer_acks_in(),
+            |this, frame| this.ingest_frame(frame),
         );
 
         match outcome {
@@ -265,7 +300,6 @@ where
     }
 
     fn handle_state_management(&mut self) -> StateEvent {
-        sleep(Duration::from_hours(1));
         let next_deadline = self.next_cycle_tick();
         debug!(next_deadline, "starting next cycle");
         self.state.start_new_cycle(next_deadline);
@@ -371,58 +405,46 @@ where
     ///           liefern `Err(())` zurueck.
     /// - `done`: Abbruchbedingung, wird nach jedem ingest geprueft.
     /// - `phase`: Name fuer Logging.
-    fn collect_phase<Snd, Done>(
+    fn collect_phase<Snd, Done, Ing>(
         &mut self,
         phase: &'static str,
         deadline: Instant,
         resend_interval: Duration,
         mut send: Snd,
         mut done: Done,
+        mut ingest: Ing,
     ) -> PhaseOutcome
     where
         Snd: FnMut(&mut Self) -> Result<(), ()>,
         Done: FnMut(&Self) -> bool,
+        Ing: FnMut(&mut Self, UdpFrame<V::Payload>),
     {
         let mut next_send = Instant::now();
 
         loop {
-            // 1. Sende-Tick faellig?
             if Instant::now() >= next_send {
-                warn!("Send message...");
                 if send(self).is_err() {
-                    // send() hat selbst geloggt; harter Fehler
                     error!(phase, "send failed hard, aborting phase");
+                    return PhaseOutcome::Fault;
                 }
                 next_send = Instant::now() + resend_interval;
             }
 
-            // 2. Abbruchbedingung?
             if done(self) {
-                warn!(phase, "phase complete");
-                if send(self).is_err() {
-                    // send() hat selbst geloggt; harter Fehler
-                    error!(phase, "send failed hard, aborting phase");
-                }
+                let _ = send(self); // finaler Beacon für Nachzügler
+                debug!(phase, "phase complete");
                 return PhaseOutcome::Complete;
             }
 
-            // 3. Deadline?
             if Instant::now() > deadline {
                 warn!(phase, "phase deadline exceeded");
                 return PhaseOutcome::Timeout;
             }
 
-            // 4. Alles draining, was da ist (kein Sleep — Frames nicht liegenlassen)
             match self.transport.try_recv() {
-                    RecvOutcome::Valid(frame) => {
-                        warn!("Received message...");
-                        debug!(phase, peer_id = frame.node_id(), "frame received");
-                        self.ingest_frame(frame);
-                    }
-                    other => {
-                    }
-                }
-            
+                RecvOutcome::Valid(frame) => ingest(self, frame),
+                _ => {}
+            }
         }
     }
 }

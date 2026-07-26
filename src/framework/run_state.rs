@@ -208,6 +208,16 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         self.last_decision = None;
     }
 
+    pub fn expected_sync_mask(&self) -> u8 {
+        let mut mask = 0u8;
+        for (idx, peer) in self.peers.iter().enumerate() {
+            if peer.health != PeerHealth::Lost {
+                mask |= 1 << idx;
+            }
+        }
+        mask
+    }
+
     // ---- Accessors ----
 
     pub fn own_id(&self) -> u8 {

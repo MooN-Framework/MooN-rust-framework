@@ -14,7 +14,7 @@ fn main() {
     // Konfiguration (spaeter aus Datei/CLI laden)
     // -------------------------------------------------------------
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
+        .with_max_level(tracing::Level::INFO)
         .init();
     // Kapazitaet des Peer-Arrays (compile-time Obergrenze).
     // Bei 2-oo-3 sind 2 Peers aktiv; N=7 laesst bis zu 8 Nodes zu.
@@ -46,8 +46,8 @@ fn main() {
 
     let timing = CycleTiming {
         cycle_duration: Duration::from_millis(10000),
-        discovery_window: Duration::from_millis(10000),
-        beacon_interval: Duration::from_millis(1000),
+        init_sync_timeout: Duration::from_millis(10000),
+        cycle_sync_timeout: Duration::from_millis(10000),
         share_timeout: Duration::from_millis(10000),
         ack_timeout: Duration::from_millis(10000),
     };
