@@ -11,6 +11,12 @@ use crate::framework::types::PeerMask;
 use crate::framework::udp_frame::{Payload, UdpFrame};
 use crate::framework::udp_transport::{RecvOutcome, UdpTransport};
 
+enum PhaseOutcome {
+    Complete,
+    Timeout,
+    Fault,
+}
+
 pub struct CycleTiming {
     pub cycle_duration: Duration,
     pub discovery_window: Duration, // z.B. 5s
@@ -186,80 +192,53 @@ where
         };
 
         let deadline = Instant::now() + self.timing.share_timeout;
+        let node_state = self.state.node_state();
 
-        loop {
-            if let Err(e) = self.transport.send_result(self.state.node_state(), own) {
-                error!(error = ?e, "Failed to sent result msg failed");
-            }
-
-            if self.all_peer_results_in() {
-                warn!("All peer results in.");
-                return StateEvent::ResultShared;
-            } else {
-                warn!("Still not all in.");
-            }
-
-            if Instant::now() > deadline {
-                warn!("Share result timeout.");
-                return StateEvent::ShareResultTimeout;
-            }
-
-            match self.transport.try_recv() {
-                RecvOutcome::Valid(frame) => {
-                    warn!(
-                        peer_id = frame.node_id(),
-                        "frame received during share_result"
-                    );
-                    self.ingest_frame(frame);
+        let outcome = self.collect_phase(
+            "share_result",
+            deadline,
+            Duration::from_millis(10),
+            |this| {
+                if let Err(e) = this.transport.send_result(node_state, own) {
+                    error!(error = ?e, "send_result failed");
                 }
-                RecvOutcome::Timeout => {
-                    std::thread::sleep(Duration::from_micros(200));
-                }
-                other => {
-                    warn!(outcome = ?other, "ignored during share_result");
-                }
-            }
-            sleep(Duration::from_secs(1));
+                Ok(())
+            },
+            |this| this.all_peer_results_in(),
+        );
+
+        match outcome {
+            PhaseOutcome::Complete => StateEvent::ResultShared,
+            PhaseOutcome::Timeout => StateEvent::ShareResultTimeout,
+            PhaseOutcome::Fault => StateEvent::Fault,
         }
     }
 
     fn handle_send_ack(&mut self) -> StateEvent {
         let mask = self.received_mask();
         let candidate = self.pick_publisher_candidate();
+        let node_state = self.state.node_state();
         debug!(mask = mask.as_u8(), candidate, "sending ack");
 
         let deadline = Instant::now() + self.timing.ack_timeout;
 
-        loop {
-            if let Err(e) = self
-                .transport
-                .send_ack(self.state.node_state(), mask, candidate)
-            {
-                error!(error = ?e, "send_ack failed");
-            }
-
-            if self.all_peer_acks_in() {
-                warn!("All peer acks in.");
-                return StateEvent::AckReceived;
-            }
-
-            if Instant::now() > deadline {
-                return StateEvent::AckTimeout;
-            }
-
-            match self.transport.try_recv() {
-                RecvOutcome::Valid(frame) => {
-                    debug!(peer_id = frame.node_id(), "ack frame received");
-                    self.ingest_frame(frame);
+        let outcome = self.collect_phase(
+            "send_ack",
+            deadline,
+            Duration::from_millis(10),
+            |this| {
+                if let Err(e) = this.transport.send_ack(node_state, mask, candidate) {
+                    error!(error = ?e, "send_ack failed");
                 }
-                RecvOutcome::Timeout => {
-                    std::thread::sleep(Duration::from_micros(200));
-                }
-                other => {
-                    debug!(outcome = ?other, "ignored during send_ack");
-                }
-            }
-            sleep(Duration::from_secs(1));
+                Ok(())
+            },
+            |this| this.all_peer_acks_in(),
+        );
+
+        match outcome {
+            PhaseOutcome::Complete => StateEvent::AckReceived,
+            PhaseOutcome::Timeout => StateEvent::AckTimeout,
+            PhaseOutcome::Fault => StateEvent::Fault,
         }
     }
 
@@ -382,5 +361,68 @@ where
 
     fn probation_passed(&self) -> bool {
         true
+    }
+
+    /// Generischer „periodisch senden + empfangen bis Bedingung erfuellt" Loop.
+    ///
+    /// - `send`: wird sofort und dann alle `resend_interval` erneut aufgerufen.
+    ///           Sende-Fehler werden geloggt, brechen aber nicht ab (UDP —
+    ///           naechster Resend versucht es wieder). Nur harte Fehler
+    ///           liefern `Err(())` zurueck.
+    /// - `done`: Abbruchbedingung, wird nach jedem ingest geprueft.
+    /// - `phase`: Name fuer Logging.
+    fn collect_phase<Snd, Done>(
+        &mut self,
+        phase: &'static str,
+        deadline: Instant,
+        resend_interval: Duration,
+        mut send: Snd,
+        mut done: Done,
+    ) -> PhaseOutcome
+    where
+        Snd: FnMut(&mut Self) -> Result<(), ()>,
+        Done: FnMut(&Self) -> bool,
+    {
+        let mut next_send = Instant::now();
+
+        loop {
+            // 1. Sende-Tick faellig?
+            if Instant::now() >= next_send {
+                warn!("Send message...");
+                if send(self).is_err() {
+                    // send() hat selbst geloggt; harter Fehler
+                    error!(phase, "send failed hard, aborting phase");
+                }
+                next_send = Instant::now() + resend_interval;
+            }
+
+            // 2. Abbruchbedingung?
+            if done(self) {
+                warn!(phase, "phase complete");
+                if send(self).is_err() {
+                    // send() hat selbst geloggt; harter Fehler
+                    error!(phase, "send failed hard, aborting phase");
+                }
+                return PhaseOutcome::Complete;
+            }
+
+            // 3. Deadline?
+            if Instant::now() > deadline {
+                warn!(phase, "phase deadline exceeded");
+                return PhaseOutcome::Timeout;
+            }
+
+            // 4. Alles draining, was da ist (kein Sleep — Frames nicht liegenlassen)
+            match self.transport.try_recv() {
+                    RecvOutcome::Valid(frame) => {
+                        warn!("Received message...");
+                        debug!(phase, peer_id = frame.node_id(), "frame received");
+                        self.ingest_frame(frame);
+                    }
+                    other => {
+                    }
+                }
+            
+        }
     }
 }

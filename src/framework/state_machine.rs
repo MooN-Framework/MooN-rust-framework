@@ -69,6 +69,7 @@ impl NodeState {
             (ReadInputs, InputsRead) => ShareResult,
             (ShareResult, ShareResultTimeout) => StateManagement,
             (ShareResult, ResultShared) => SendACK,
+            (SendACK, AckTimeout) => StateManagement,
             (SendACK, AckReceived) => PublishResult,
             (PublishResult, ResultPublished) => Sync,
 
