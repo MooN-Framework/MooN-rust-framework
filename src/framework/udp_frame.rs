@@ -11,16 +11,20 @@ use crc32fast::Hasher;
 //   9..13    seq_num           (4)
 //   13       node_state_wire   (1)
 //   14       payload_disc      (1)
-//   15..X    payload_body      (0 | P::WIRE_SIZE | 2)
+//   15..X    payload_body      (0 | P::WIRE_SIZE | 2 | 8 | 24)
 //   X..X+4   crc32             (4)
 // -------------------------------------------------------------
 const HEADER_SIZE: usize = 15;
 const CRC_SIZE: usize = 4;
 const ACK_BODY: usize = 2;
+const TIME_SYNC_REQ_BODY: usize = 8; // t1
+const TIME_SYNC_RESP_BODY: usize = 24; // t1, t2, t3
 
 const DISC_STATE: u8 = 0x00;
 const DISC_RESULT: u8 = 0x01;
 const DISC_ACK: u8 = 0x02;
+const DISC_TIMESYNC_REQ: u8 = 0x03;
+const DISC_TIMESYNC_RESP: u8 = 0x04;
 
 /// Obere Grenze fuer `CyclePayload::WIRE_SIZE`.
 ///
@@ -32,6 +36,10 @@ const DISC_ACK: u8 = 0x02;
 /// 64 Byte deckt typische Voter-Payloads ab (mehrere `f64` + Flags + Reserve),
 /// bleibt aber klein genug fuer allokationsfreien Betrieb auf Embedded-Targets.
 pub const MAX_PAYLOAD_WIRE_SIZE: usize = 64;
+
+const fn max_usize(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameError {
@@ -61,6 +69,19 @@ pub enum Payload<P: CyclePayload> {
         received_from: PeerMask,
         publisher_candidate: u8,
     },
+    /// Cristian-Request. `t1` = Sendezeit auf der Uhr des Anfragers (ns).
+    TimeSyncReq {
+        t1: u64,
+    },
+    /// Cristian-Response. `t1` = Echo aus Request, `t2` = Empfangszeit beim
+    /// Responder, `t3` = Sendezeit der Antwort (beide auf der Responder-Uhr).
+    /// Der Requester misst `t4` lokal beim Empfang und bildet daraus RTT +
+    /// Fehlerband.
+    TimeSyncResp {
+        t1: u64,
+        t2: u64,
+        t3: u64,
+    },
 }
 
 // -------------------------------------------------------------
@@ -88,11 +109,9 @@ impl<P: CyclePayload> UdpFrame<P> {
 
     /// Groesster moeglicher Frame fuer diesen Payload-Typ.
     pub const MAX_FRAME_SIZE: usize = {
-        let body = if P::WIRE_SIZE > ACK_BODY {
-            P::WIRE_SIZE
-        } else {
-            ACK_BODY
-        };
+        let body = max_usize(P::WIRE_SIZE, ACK_BODY);
+        let body = max_usize(body, TIME_SYNC_REQ_BODY);
+        let body = max_usize(body, TIME_SYNC_RESP_BODY);
         HEADER_SIZE + body + CRC_SIZE
     };
 
@@ -155,6 +174,40 @@ impl<P: CyclePayload> UdpFrame<P> {
         )
     }
 
+    pub fn time_sync_req_frame(
+        node_id: u8,
+        session_id: u64,
+        seq_num: u32,
+        node_state: NodeState,
+        t1: u64,
+    ) -> Self {
+        Self::new(
+            node_id,
+            session_id,
+            seq_num,
+            node_state,
+            Payload::TimeSyncReq { t1 },
+        )
+    }
+
+    pub fn time_sync_resp_frame(
+        node_id: u8,
+        session_id: u64,
+        seq_num: u32,
+        node_state: NodeState,
+        t1: u64,
+        t2: u64,
+        t3: u64,
+    ) -> Self {
+        Self::new(
+            node_id,
+            session_id,
+            seq_num,
+            node_state,
+            Payload::TimeSyncResp { t1, t2, t3 },
+        )
+    }
+
     pub fn node_id(&self) -> u8 {
         self.node_id
     }
@@ -202,6 +255,16 @@ impl<P: CyclePayload> UdpFrame<P> {
                 h.update(&[received_from.as_u8()]);
                 h.update(&[*publisher_candidate]);
             }
+            Payload::TimeSyncReq { t1 } => {
+                h.update(&[DISC_TIMESYNC_REQ]);
+                h.update(&t1.to_le_bytes());
+            }
+            Payload::TimeSyncResp { t1, t2, t3 } => {
+                h.update(&[DISC_TIMESYNC_RESP]);
+                h.update(&t1.to_le_bytes());
+                h.update(&t2.to_le_bytes());
+                h.update(&t3.to_le_bytes());
+            }
         }
         h.finalize()
     }
@@ -237,6 +300,16 @@ impl<P: CyclePayload> UdpFrame<P> {
                 buf.push(DISC_ACK);
                 buf.push(received_from.as_u8());
                 buf.push(publisher_candidate);
+            }
+            Payload::TimeSyncReq { t1 } => {
+                buf.push(DISC_TIMESYNC_REQ);
+                buf.extend_from_slice(&t1.to_le_bytes());
+            }
+            Payload::TimeSyncResp { t1, t2, t3 } => {
+                buf.push(DISC_TIMESYNC_RESP);
+                buf.extend_from_slice(&t1.to_le_bytes());
+                buf.extend_from_slice(&t2.to_le_bytes());
+                buf.extend_from_slice(&t3.to_le_bytes());
             }
         }
         buf.extend_from_slice(&self.crc32.to_le_bytes());
@@ -281,6 +354,40 @@ impl<P: CyclePayload> UdpFrame<P> {
                     },
                     ACK_BODY,
                 )
+            }
+            DISC_TIMESYNC_REQ => {
+                let end = HEADER_SIZE + TIME_SYNC_REQ_BODY;
+                if bytes.len() < end + CRC_SIZE {
+                    return Err(FrameError::TooShort);
+                }
+                let t1 = u64::from_le_bytes(
+                    bytes[HEADER_SIZE..HEADER_SIZE + 8]
+                        .try_into()
+                        .expect("slice length checked above"),
+                );
+                (Payload::TimeSyncReq { t1 }, TIME_SYNC_REQ_BODY)
+            }
+            DISC_TIMESYNC_RESP => {
+                let end = HEADER_SIZE + TIME_SYNC_RESP_BODY;
+                if bytes.len() < end + CRC_SIZE {
+                    return Err(FrameError::TooShort);
+                }
+                let t1 = u64::from_le_bytes(
+                    bytes[HEADER_SIZE..HEADER_SIZE + 8]
+                        .try_into()
+                        .expect("slice length checked above"),
+                );
+                let t2 = u64::from_le_bytes(
+                    bytes[HEADER_SIZE + 8..HEADER_SIZE + 16]
+                        .try_into()
+                        .expect("slice length checked above"),
+                );
+                let t3 = u64::from_le_bytes(
+                    bytes[HEADER_SIZE + 16..HEADER_SIZE + 24]
+                        .try_into()
+                        .expect("slice length checked above"),
+                );
+                (Payload::TimeSyncResp { t1, t2, t3 }, TIME_SYNC_RESP_BODY)
             }
             _ => return Err(FrameError::UnknownDiscriminator),
         };

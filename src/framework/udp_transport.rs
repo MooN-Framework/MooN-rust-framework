@@ -1,11 +1,13 @@
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::CyclePayload;
 use crate::framework::types::PeerMask;
-use crate::framework::udp_frame::{FrameError, MAX_PAYLOAD_WIRE_SIZE, UdpFrame};
+use crate::framework::udp_frame::{FrameError, MAX_PAYLOAD_WIRE_SIZE, Payload, UdpFrame};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 /// Obere Grenze fuer die Puffergroesse beim Empfang.
 ///
@@ -61,6 +63,19 @@ pub enum RecvOutcome<P: CyclePayload> {
         peer_id: u8,
         gap: u32,
         frame: UdpFrame<P>,
+    },
+
+    /// Zeitsync-Frame (Request oder Response). Umgeht die seq_num-
+    /// Klassifikation, da Sync-Frames einen eigenen, asynchronen
+    /// Nachrichtenfluss darstellen.
+    ///
+    /// `local_recv_ns` ist der Zeitstempel, der unmittelbar nach `recv_from`
+    /// genommen wurde. Er entspricht T2 (bei Request) bzw. T4 (bei Response)
+    /// aus der Cristian-Nomenklatur.
+    TimeSync {
+        peer_id: u8,
+        frame: UdpFrame<P>,
+        local_recv_ns: u64,
     },
 }
 
@@ -168,6 +183,53 @@ impl<P: CyclePayload> UdpTransport<P> {
         Ok(seq)
     }
 
+    /// Sendet einen TimeSyncReq. Der zurueckgegebene `t1` ist der
+    /// Sendezeitstempel, den die PeerSync-Logik als pending_t1 vermerken muss,
+    /// um die passende Response zuordnen zu koennen.
+    pub fn send_time_sync_req(
+        &mut self,
+        node_state: NodeState,
+    ) -> Result<(u32, u64), TransportError> {
+        let seq = self.next_seq_num;
+        let t1 = now_monotonic_ns();
+        let frame = UdpFrame::<P>::time_sync_req_frame(
+            self.self_node_id,
+            self.self_session_id,
+            seq,
+            node_state,
+            t1,
+        );
+        self.socket.send_to(&frame.encode(), self.group_addr)?;
+        self.next_seq_num = self.next_seq_num.wrapping_add(1);
+        Ok((seq, t1))
+    }
+
+    /// Sendet einen TimeSyncResp. `t1_echo` und `t2_local` stammen aus dem
+    /// verarbeiteten Request. `t3` wird intern erzeugt, moeglichst kurz vor
+    /// dem eigentlichen `send_to`, damit die Responder-Verarbeitungszeit
+    /// (t3 - t2) klein bleibt.
+    pub fn send_time_sync_resp(
+        &mut self,
+        node_state: NodeState,
+        t1_echo: u64,
+        t2_local: u64,
+    ) -> Result<u32, TransportError> {
+        let seq = self.next_seq_num;
+        let t3 = now_monotonic_ns();
+        let frame = UdpFrame::<P>::time_sync_resp_frame(
+            self.self_node_id,
+            self.self_session_id,
+            seq,
+            node_state,
+            t1_echo,
+            t2_local,
+            t3,
+        );
+        self.socket.send_to(&frame.encode(), self.group_addr)?;
+        self.next_seq_num = self.next_seq_num.wrapping_add(1);
+        Ok(seq)
+    }
+
     pub fn recv(&mut self) -> RecvOutcome<P> {
         let mut buf = [0u8; RECV_BUFFER_SIZE];
         let (n, _src) = match self.socket.recv_from(&mut buf) {
@@ -180,6 +242,11 @@ impl<P: CyclePayload> UdpTransport<P> {
             Err(_) => return RecvOutcome::Timeout,
         };
 
+        // Zeitstempel unmittelbar nach recv_from — Software-Aequivalent zu
+        // Hardware-Timestamping. Wird ausschliesslich fuer Sync-Frames genutzt,
+        // aber unbedingt VOR jeglicher Verarbeitung genommen.
+        let local_recv_ns = now_monotonic_ns();
+
         let frame = match UdpFrame::<P>::decode(&buf[..n]) {
             Ok(f) => f,
             Err(FrameError::CrcMismatch) => return RecvOutcome::CrcError,
@@ -188,6 +255,18 @@ impl<P: CyclePayload> UdpTransport<P> {
 
         if frame.node_id() == self.self_node_id {
             return RecvOutcome::SelfLoopback;
+        }
+
+        // Sync-Frames umgehen die seq_num-Klassifikation.
+        if matches!(
+            frame.payload(),
+            Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. }
+        ) {
+            return RecvOutcome::TimeSync {
+                peer_id: frame.node_id(),
+                frame,
+                local_recv_ns,
+            };
         }
 
         self.classify(frame)
@@ -208,6 +287,8 @@ impl<P: CyclePayload> UdpTransport<P> {
             Err(_) => return RecvOutcome::Timeout,
         };
 
+        let local_recv_ns = now_monotonic_ns();
+
         let frame = match UdpFrame::<P>::decode(&buf[..n]) {
             Ok(f) => f,
             Err(FrameError::CrcMismatch) => return RecvOutcome::CrcError,
@@ -216,6 +297,17 @@ impl<P: CyclePayload> UdpTransport<P> {
 
         if frame.node_id() == self.self_node_id {
             return RecvOutcome::SelfLoopback;
+        }
+
+        if matches!(
+            frame.payload(),
+            Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. }
+        ) {
+            return RecvOutcome::TimeSync {
+                peer_id: frame.node_id(),
+                frame,
+                local_recv_ns,
+            };
         }
 
         self.classify(frame)
@@ -306,4 +398,20 @@ fn interface_ipv4(name: &str) -> Result<Ipv4Addr, TransportError> {
         }
     }
     Err(TransportError::InterfaceNotFound(name.to_string()))
+}
+
+/// Knoten-lokale monotone Uhr in Nanosekunden.
+///
+/// Jeder Knoten hat seine eigene Referenz-Epoche (erster Aufruf). Fuer die
+/// Zeitsynchronisation werden nur Differenzen und Offsets zwischen Knoten
+/// benoetigt, keine gemeinsame Wall-Clock.
+///
+/// Hinweis: `Instant` nutzt auf Linux `CLOCK_MONOTONIC`, das durch NTP
+/// geslewt wird. Fuer engere Fehlerbaender waere ein direkter Aufruf von
+/// `clock_gettime(CLOCK_MONOTONIC_RAW)` via `libc` sauberer, weil er
+/// unabhaengig von jeglicher Wall-Clock-Korrektur laeuft.
+pub fn now_monotonic_ns() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(Instant::now);
+    epoch.elapsed().as_nanos() as u64
 }

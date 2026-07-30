@@ -51,6 +51,8 @@ fn main() {
         cycle_sync_timeout: Duration::from_millis(10000),
         share_timeout: Duration::from_millis(10000),
         ack_timeout: Duration::from_millis(10000),
+        peer_sync_request_interval: Duration::from_millis(2),
+        peer_sync_timeout: Duration::from_millis(500),
     };
 
     // -------------------------------------------------------------

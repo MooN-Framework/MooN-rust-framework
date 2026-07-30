@@ -16,8 +16,9 @@ pub enum NodeState {
     ShareResult = 0x05,
     SendACK = 0x06,
     PublishResult = 0x07,
-    StateManagement = 0x08,
-    Probation = 0x09,
+    ErrorManagement = 0x08,
+    Isolation = 0x09,
+    PeerSync = 0x0A,
     Failsafe = 0xFF,
 }
 
@@ -29,6 +30,9 @@ pub enum StateEvent {
     /* InitSync */
     InitialSyncOk,
     InitialSyncTimeout,
+    /* PeerSync */
+    PeerSyncOk,
+    PeerSyncTimeout,
     /* CycleSync */
     CycleSyncOk,
     CycleSyncTimeout,
@@ -42,11 +46,10 @@ pub enum StateEvent {
     AckTimeout,
     /* Publish Events */
     ResultPublished,
-    /* State management / probation */
+    /* Error Management */
     StateOk,
     StateDiverged,
-    ProbationPassed,
-    ProbationFailed,
+    StateTimeout,
     /* Generisch */
     Fault,
 }
@@ -61,29 +64,33 @@ impl NodeState {
             (Startup, SelfTestOK) => InitSync,
             (Startup, SelfTestErr) => Failsafe,
 
-            // --- InitSync ---
-            (InitSync, InitialSyncOk) => ReadInputs,
+            // --- InitSync -> PeerSync ---
+            // Nach erfolgreicher Discovery folgt die Zeitsynchronisation,
+            // bevor der Zyklusbetrieb beginnt.
+            (InitSync, InitialSyncOk) => PeerSync,
             (InitSync, InitialSyncTimeout) => Failsafe,
 
-            // CycleSync
+            // --- PeerSync -> ReadInputs ---
+            // Timeout ist terminal: ohne synchronisierte Uhren keine
+            // deterministische Zyklus-Auslegung moeglich.
+            (PeerSync, PeerSyncOk) => ReadInputs,
+            (PeerSync, PeerSyncTimeout) => Failsafe,
+
+            // --- CycleSync ---
             (CycleSync, CycleSyncOk) => ReadInputs,
-            (CycleSync, CycleSyncTimeout) => StateManagement,
+            (CycleSync, CycleSyncTimeout) => ErrorManagement,
 
             // --- Operational cycle ---
             (ReadInputs, InputsRead) => ShareResult,
-            (ShareResult, ShareResultTimeout) => StateManagement,
+            (ShareResult, ShareResultTimeout) => ErrorManagement,
             (ShareResult, ResultShared) => SendACK,
-            (SendACK, AckTimeout) => StateManagement,
+            (SendACK, AckTimeout) => ErrorManagement,
             (SendACK, AckReceived) => PublishResult,
             (PublishResult, ResultPublished) => CycleSync,
 
-            // --- State management ---
-            (StateManagement, StateOk) => ReadInputs,
-            (StateManagement, StateDiverged) => Probation,
-
-            // --- Probation ---
-            (Probation, ProbationPassed) => CycleSync,
-            (Probation, ProbationFailed) => Failsafe,
+            // --- Error management ---
+            (ErrorManagement, StateOk) => ReadInputs,
+            (ErrorManagement, StateDiverged) => Isolation,
 
             // --- Failsafe ist terminal ---
             (Failsafe, _) => Failsafe,
@@ -110,8 +117,9 @@ impl NodeState {
             0x05 => ShareResult,
             0x06 => SendACK,
             0x07 => PublishResult,
-            0x08 => StateManagement,
-            0x09 => Probation,
+            0x08 => ErrorManagement,
+            0x09 => Isolation,
+            0x0A => PeerSync,
             0xFF => Failsafe,
             other => return Err(InvalidNodeState(other)),
         })

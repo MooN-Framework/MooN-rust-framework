@@ -4,6 +4,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+use crate::framework::peer_sync::{PeerSync, SyncFields, extract_sync_fields};
 use crate::framework::run_state::{AckInfo, RunState};
 use crate::framework::state_machine::{NodeState, StateEvent};
 use crate::framework::traits::{Computation, DecisionSink, Voter, VotingOutcome};
@@ -19,8 +20,10 @@ enum PhaseOutcome {
 
 pub struct CycleTiming {
     pub cycle_duration: Duration,
-    pub init_sync_timeout: Duration,   // z.B. 5s
-    pub cycle_sync_timeout: Duration, // z.B. 20ms
+    pub init_sync_timeout: Duration,          // z.B. 5s
+    pub peer_sync_timeout: Duration,          // z.B. 500ms, deckt SAMPLES_PER_PEER Runden ab
+    pub peer_sync_request_interval: Duration, // z.B. 2ms zwischen Sync-Requests
+    pub cycle_sync_timeout: Duration,         // z.B. 20ms
     pub share_timeout: Duration,
     pub ack_timeout: Duration,
 }
@@ -79,13 +82,14 @@ where
             let event = match current {
                 NodeState::Startup => self.handle_startup(),
                 NodeState::InitSync => self.handle_init_sync(),
+                NodeState::PeerSync => self.handle_peer_sync(),
                 NodeState::CycleSync => self.handle_cycle_sync(),
                 NodeState::ReadInputs => self.handle_read_inputs(),
                 NodeState::ShareResult => self.handle_share_result(),
                 NodeState::SendACK => self.handle_send_ack(),
                 NodeState::PublishResult => self.handle_publish(),
-                NodeState::StateManagement => self.handle_state_management(),
-                NodeState::Probation => self.handle_probation(),
+                NodeState::ErrorManagement => self.handle_error_management(),
+                NodeState::Isolation => self.handle_isolation(),
                 NodeState::Failsafe => {
                     self.enter_failsafe();
                     return;
@@ -104,6 +108,156 @@ where
 
     fn handle_startup(&mut self) -> StateEvent {
         StateEvent::SelfTestOK
+    }
+
+    fn handle_isolation(&mut self) -> StateEvent {
+        loop {
+            warn!("isolation state entered, waiting for manual intervention");
+            sleep(Duration::from_secs(1));
+        }
+    }
+
+    fn handle_init_sync(&mut self) -> StateEvent {
+        info!("Init entered");
+        let node_state = self.state.node_state();
+        let deadline = Instant::now() + self.timing.init_sync_timeout;
+
+        let outcome = self.collect_phase(
+            "init_sync",
+            deadline,
+            Duration::from_millis(10),
+            |this| {
+                if let Err(e) = this.transport.send_state(node_state) {
+                    error!(error = ?e, "send_state failed in init sync");
+                    return Err(());
+                }
+                Ok(())
+            },
+            |this| this.discovery_complete(),
+            |this, frame| {
+                info!(peer_id = frame.node_id(), "init sync frame received");
+                let _ = this.state.on_peer_discovered(frame.node_id());
+            },
+        );
+
+        match outcome {
+            PhaseOutcome::Complete => {
+                if self.state.finalize_discovery().is_err() {
+                    error!("finalize_discovery failed");
+                    return StateEvent::SelfTestErr;
+                }
+                self.state.start_new_cycle(self.next_cycle_tick());
+                StateEvent::InitialSyncOk
+            }
+            PhaseOutcome::Timeout => {
+                warn!(
+                    peers_found = self.state.peers().len(),
+                    "discovery window elapsed without enough peers"
+                );
+                StateEvent::InitialSyncTimeout
+            }
+            PhaseOutcome::Fault => StateEvent::Fault,
+        }
+    }
+
+    /// Zeitsynchronisation zu allen entdeckten Peers nach Cristian.
+    ///
+    /// Sendet iterativ TimeSyncRequests, sammelt Responses und akzeptiert
+    /// eingehende Requests von anderen Peers. Nach `SAMPLES_PER_PEER`
+    /// Proben pro Peer wird die beste (kleinster Delay) fuer Offset- und
+    /// Fehlerband-Berechnung verwendet.
+    fn handle_peer_sync(&mut self) -> StateEvent {
+        debug!("handle_peer_sync entered");
+
+        // Peer-IDs aus dem Discovery-Ergebnis holen.
+        // Hinweis: Feldzugriff (`.id`) an das tatsaechliche Peer-Struct
+        // in run_state anpassen, falls anders benannt.
+        let peer_ids: Vec<u8> = self.state.peers().iter().map(|p| p.id).collect();
+        if peer_ids.is_empty() {
+            error!("peer_sync entered without discovered peers");
+            return StateEvent::Fault;
+        }
+
+        let mut peer_sync = PeerSync::new(&peer_ids);
+        let node_state = self.state.node_state();
+        let deadline = Instant::now() + self.timing.peer_sync_timeout;
+        let mut next_request = Instant::now();
+
+        loop {
+            // 1. Abbruchbedingungen zuerst.
+            if peer_sync.is_complete() {
+                let clocks = peer_sync.finalize();
+                let epsilon = peer_sync.max_error_bound().unwrap_or(0);
+                info!(
+                    epsilon_ns = epsilon,
+                    clock_count = clocks.len(),
+                    "peer sync complete"
+                );
+                self.state.set_peer_clocks(&clocks);
+                self.state.set_sync_epsilon(epsilon);
+                self.state.start_new_cycle(self.next_cycle_tick());
+                return StateEvent::PeerSyncOk;
+            }
+
+            if Instant::now() > deadline {
+                warn!(
+                    completed_peers = peer_sync.finalize().len(),
+                    "peer sync deadline exceeded"
+                );
+                return StateEvent::PeerSyncTimeout;
+            }
+
+            // 2. Naechsten Request senden, wenn faellig und ein Peer noch
+            //    kein pending hat. Pro Runde nur einer, damit die Bursts
+            //    nicht klumpen und die Delay-Messungen sauber bleiben.
+            if Instant::now() >= next_request {
+                for &peer_id in &peer_ids {
+                    if !peer_sync.has_pending(peer_id) {
+                        match self.transport.send_time_sync_req(node_state) {
+                            Ok((_seq, t1)) => {
+                                peer_sync.record_outgoing_request(peer_id, t1);
+                                next_request =
+                                    Instant::now() + self.timing.peer_sync_request_interval;
+                                break;
+                            }
+                            Err(e) => {
+                                error!(error = ?e, "send_time_sync_req failed");
+                                return StateEvent::Fault;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Eingehende Frames verarbeiten.
+            match self.transport.try_recv() {
+                RecvOutcome::TimeSync {
+                    frame,
+                    local_recv_ns,
+                    ..
+                } => match extract_sync_fields(&frame, local_recv_ns) {
+                    Some(SyncFields::Request { t1, t2_local, .. }) => {
+                        if let Err(e) = self.transport.send_time_sync_resp(node_state, t1, t2_local)
+                        {
+                            warn!(error = ?e, "send_time_sync_resp failed");
+                        }
+                    }
+                    Some(SyncFields::Response {
+                        peer_id,
+                        t1,
+                        t2,
+                        t3,
+                        t4_local,
+                    }) => {
+                        peer_sync.on_response(peer_id, t1, t2, t3, t4_local);
+                    }
+                    None => {}
+                },
+                // Voting-Frames waehrend PeerSync ignorieren.
+                // Alternative: puffern und im ersten Zyklus einspielen.
+                _ => {}
+            }
+        }
     }
 
     fn handle_cycle_sync(&mut self) -> StateEvent {
@@ -153,49 +307,6 @@ where
                     expected_mask, "cycle sync deadline exceeded"
                 );
                 StateEvent::CycleSyncTimeout
-            }
-            PhaseOutcome::Fault => StateEvent::Fault,
-        }
-    }
-
-    fn handle_init_sync(&mut self) -> StateEvent {
-        info!("Init entered");
-        let node_state = self.state.node_state();
-        let deadline = Instant::now() + self.timing.init_sync_timeout;
-
-        let outcome = self.collect_phase(
-            "init_sync",
-            deadline,
-            Duration::from_millis(10),
-            |this| {
-                if let Err(e) = this.transport.send_state(node_state) {
-                    error!(error = ?e, "send_state failed in init sync");
-                    return Err(());
-                }
-                Ok(())
-            },
-            |this| this.discovery_complete(),
-            |this, frame| {
-                info!(peer_id = frame.node_id(), "init sync frame received");
-                let _ = this.state.on_peer_discovered(frame.node_id());
-            },
-        );
-
-        match outcome {
-            PhaseOutcome::Complete => {
-                if self.state.finalize_discovery().is_err() {
-                    error!("finalize_discovery failed");
-                    return StateEvent::SelfTestErr;
-                }
-                self.state.start_new_cycle(self.next_cycle_tick());
-                StateEvent::InitialSyncOk
-            }
-            PhaseOutcome::Timeout => {
-                warn!(
-                    peers_found = self.state.peers().len(),
-                    "discovery window elapsed without enough peers"
-                );
-                StateEvent::InitialSyncTimeout
             }
             PhaseOutcome::Fault => StateEvent::Fault,
         }
@@ -299,7 +410,9 @@ where
         }
     }
 
-    fn handle_state_management(&mut self) -> StateEvent {
+    fn handle_error_management(&mut self) -> StateEvent {
+        return StateEvent::Fault;
+        // ERSTMAL BIS LOGIK IMMER FAILSAFE
         let next_deadline = self.next_cycle_tick();
         debug!(next_deadline, "starting next cycle");
         self.state.start_new_cycle(next_deadline);
@@ -309,16 +422,6 @@ where
             StateEvent::StateDiverged
         } else {
             StateEvent::StateOk
-        }
-    }
-
-    fn handle_probation(&mut self) -> StateEvent {
-        if self.probation_passed() {
-            info!("probation passed");
-            StateEvent::ProbationPassed
-        } else {
-            warn!("probation failed");
-            StateEvent::ProbationFailed
         }
     }
 
@@ -366,6 +469,13 @@ where
             }
             Payload::State => {
                 debug!(peer_id, "matched State arm");
+            }
+            // Sync-Frames sind hier out-of-band und werden im normalen
+            // Zyklusbetrieb ignoriert. Werden bereits vom Transport in
+            // die eigene RecvOutcome::TimeSync-Variante gehoben und
+            // sollten hier gar nicht landen.
+            Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. } => {
+                debug!(peer_id, "unexpected sync frame outside PeerSync, dropped");
             }
         }
     }
@@ -431,7 +541,7 @@ where
             }
 
             if done(self) {
-                let _ = send(self); // finaler Beacon für Nachzügler
+                let _ = send(self); // finaler Beacon fuer Nachzuegler
                 debug!(phase, "phase complete");
                 return PhaseOutcome::Complete;
             }
@@ -442,7 +552,39 @@ where
             }
 
             match self.transport.try_recv() {
-                RecvOutcome::Valid(frame) => ingest(self, frame),
+              RecvOutcome::Valid(frame) => ingest(self, frame),
+              RecvOutcome::SeqGap {
+                    peer_id,
+                    gap,
+                    frame,
+                } => {
+                    ingest(self, frame);
+                },
+                RecvOutcome::Duplicate {
+                peer_id,
+                seen,
+                last,
+                } => {
+                    warn!("peer {} duplicate frame, seen {} last {}", peer_id, seen, last);
+                },
+                RecvOutcome::TimeSync {
+                    frame,
+                    local_recv_ns,
+                    ..
+                } => {
+                    // Auf Sync-Requests immer antworten, auch ausserhalb von
+                    // PeerSync. Sonst koennen langsamere Peers ihre Synchronisation
+                    // nicht abschliessen, wenn ein anderer Node schon weiter ist.
+                    // Late-arriving Responses ignorieren wir.
+                    if let Some(SyncFields::Request { t1, t2_local, .. }) =
+                        extract_sync_fields(&frame, local_recv_ns)
+                    {
+                        let ns = self.state.node_state();
+                        if let Err(e) = self.transport.send_time_sync_resp(ns, t1, t2_local) {
+                            warn!(error = ?e, "send_time_sync_resp failed in phase");
+                        }
+                    }
+                }
                 _ => {}
             }
         }

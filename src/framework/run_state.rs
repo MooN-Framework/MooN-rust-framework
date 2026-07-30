@@ -1,3 +1,4 @@
+use crate::framework::peer_sync::PeerClock;
 use crate::framework::state_machine::{NodeState, SystemState};
 use crate::framework::traits::{CyclePayload, Voter, VotingOutcome};
 use heapless::Vec;
@@ -96,6 +97,15 @@ pub struct RunState<V: Voter, const N: usize> {
     // peers: nach Discovery befuellt, Laenge <= N
     peers: Vec<PeerInfo, N>,
 
+    // Ergebnis der PeerSync-Phase: Uhrenoffsets zu jedem Peer, jeweils mit
+    // bewiesener Fehlerschranke. Wird nach `handle_peer_sync` befuellt und
+    // im weiteren Betrieb nur gelesen.
+    peer_clocks: Vec<PeerClock, N>,
+
+    // Maximale Fehlerschranke ueber alle Peers in ns.
+    // Geht als epsilon in die Voter-Timeout-Auslegung ein.
+    sync_epsilon_ns: i64,
+
     // zyklus-lokal
     cycle: CycleState<V::Payload, N>,
 
@@ -114,6 +124,8 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             current_seq: 0,
             probation: None,
             peers: Vec::new(),
+            peer_clocks: Vec::new(),
+            sync_epsilon_ns: 0,
             cycle: CycleState::empty(),
             last_decision: None,
         }
@@ -216,6 +228,46 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             }
         }
         mask
+    }
+
+    // ---- PeerSync-Ergebnis ----
+
+    /// Uebernimmt die vom PeerSync-Modul ermittelten Uhrenoffsets.
+    /// Uebersteigende Eintraege (theoretisch nicht moeglich, da |peer_clocks|
+    /// <= |peers| <= N) werden verworfen und geloggt.
+    pub fn set_peer_clocks(&mut self, clocks: &[PeerClock]) {
+        self.peer_clocks.clear();
+        for c in clocks {
+            if self.peer_clocks.push(*c).is_err() {
+                warn!("peer_clocks capacity exceeded, dropping clock entry");
+                break;
+            }
+        }
+    }
+
+    pub fn set_sync_epsilon(&mut self, epsilon_ns: i64) {
+        self.sync_epsilon_ns = epsilon_ns;
+    }
+
+    pub fn peer_clocks(&self) -> &[PeerClock] {
+        &self.peer_clocks
+    }
+
+    pub fn sync_epsilon_ns(&self) -> i64 {
+        self.sync_epsilon_ns
+    }
+
+    /// Rechnet einen Zeitstempel des angegebenen Peers auf die eigene Uhr um.
+    /// Liefert None, wenn fuer diesen Peer kein Offset bekannt ist.
+    pub fn peer_ts_to_local(&self, peer_id: u8, peer_ts: u64) -> Option<u64> {
+        let offset = self
+            .peer_clocks
+            .iter()
+            .find(|c| c.peer_id == peer_id)?
+            .offset_ns;
+        // local = peer_ts - offset, defensiv gegen Underflow.
+        let local = (peer_ts as i128) - (offset as i128);
+        if local < 0 { None } else { Some(local as u64) }
     }
 
     // ---- Accessors ----
