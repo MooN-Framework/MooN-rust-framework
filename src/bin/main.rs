@@ -53,6 +53,7 @@ fn main() {
         ack_timeout: Duration::from_millis(10000),
         peer_sync_request_interval: Duration::from_millis(2),
         peer_sync_timeout: Duration::from_millis(500),
+        stale_threshold : Duration::from_millis(50),
     };
 
     // -------------------------------------------------------------
@@ -86,4 +87,11 @@ fn fresh_session_id() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before epoch")
         .as_nanos() as u64
+}
+
+
+fn derive_stale_threshold(cycle_duration: Duration, sync_epsilon_ns: i64) -> Duration {
+    let sync_based = Duration::from_nanos((2 * sync_epsilon_ns.max(0)) as u64);
+    let cycle_based = cycle_duration / 2;
+    sync_based.max(cycle_based)
 }

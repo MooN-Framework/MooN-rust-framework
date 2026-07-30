@@ -10,7 +10,7 @@ use crate::framework::state_machine::{NodeState, StateEvent};
 use crate::framework::traits::{Computation, DecisionSink, Voter, VotingOutcome};
 use crate::framework::types::PeerMask;
 use crate::framework::udp_frame::{Payload, UdpFrame};
-use crate::framework::udp_transport::{RecvOutcome, UdpTransport};
+use crate::framework::udp_transport::{RecvOutcome, UdpTransport, now_monotonic_ns};
 
 enum PhaseOutcome {
     Complete,
@@ -21,11 +21,19 @@ enum PhaseOutcome {
 pub struct CycleTiming {
     pub cycle_duration: Duration,
     pub init_sync_timeout: Duration,          // z.B. 5s
-    pub peer_sync_timeout: Duration,          // z.B. 500ms, deckt SAMPLES_PER_PEER Runden ab
+    pub peer_sync_timeout: Duration,          // z.B. 500ms
     pub peer_sync_request_interval: Duration, // z.B. 2ms zwischen Sync-Requests
     pub cycle_sync_timeout: Duration,         // z.B. 20ms
     pub share_timeout: Duration,
     pub ack_timeout: Duration,
+
+    /// Maximal zulaessiges Alter eines empfangenen Frames, bevor er als
+    /// stale verworfen wird. Wird erst nach abgeschlossener Zeitsynchronisation
+    /// ausgewertet — vorher sind Timestamps nur Rohdaten.
+    ///
+    /// Faustregel: `max(2 * sync_epsilon_ns, cycle_duration / 2)`.
+    /// Bei 10ms Zyklus und sub-ms epsilon also z.B. 5ms.
+    pub stale_threshold: Duration,
 }
 
 pub struct Runner<C, V, S, const N: usize>
@@ -161,17 +169,9 @@ where
     }
 
     /// Zeitsynchronisation zu allen entdeckten Peers nach Cristian.
-    ///
-    /// Sendet iterativ TimeSyncRequests, sammelt Responses und akzeptiert
-    /// eingehende Requests von anderen Peers. Nach `SAMPLES_PER_PEER`
-    /// Proben pro Peer wird die beste (kleinster Delay) fuer Offset- und
-    /// Fehlerband-Berechnung verwendet.
     fn handle_peer_sync(&mut self) -> StateEvent {
         debug!("handle_peer_sync entered");
 
-        // Peer-IDs aus dem Discovery-Ergebnis holen.
-        // Hinweis: Feldzugriff (`.id`) an das tatsaechliche Peer-Struct
-        // in run_state anpassen, falls anders benannt.
         let peer_ids: Vec<u8> = self.state.peers().iter().map(|p| p.id).collect();
         if peer_ids.is_empty() {
             error!("peer_sync entered without discovered peers");
@@ -184,7 +184,6 @@ where
         let mut next_request = Instant::now();
 
         loop {
-            // 1. Abbruchbedingungen zuerst.
             if peer_sync.is_complete() {
                 let clocks = peer_sync.finalize();
                 let epsilon = peer_sync.max_error_bound().unwrap_or(0);
@@ -195,21 +194,23 @@ where
                 );
                 self.state.set_peer_clocks(&clocks);
                 self.state.set_sync_epsilon(epsilon);
+                self.state.mark_sync_valid();
                 self.state.start_new_cycle(self.next_cycle_tick());
                 return StateEvent::PeerSyncOk;
             }
 
             if Instant::now() > deadline {
+                let with_samples = peer_sync.finalize().len();
                 warn!(
-                    completed_peers = peer_sync.finalize().len(),
+                    peers_with_samples = with_samples,
+                    peers_total = peer_ids.len(),
+                    target_samples_per_peer =
+                        crate::framework::peer_sync::SAMPLES_PER_PEER,
                     "peer sync deadline exceeded"
                 );
                 return StateEvent::PeerSyncTimeout;
             }
 
-            // 2. Naechsten Request senden, wenn faellig und ein Peer noch
-            //    kein pending hat. Pro Runde nur einer, damit die Bursts
-            //    nicht klumpen und die Delay-Messungen sauber bleiben.
             if Instant::now() >= next_request {
                 for &peer_id in &peer_ids {
                     if !peer_sync.has_pending(peer_id) {
@@ -229,7 +230,6 @@ where
                 }
             }
 
-            // 3. Eingehende Frames verarbeiten.
             match self.transport.try_recv() {
                 RecvOutcome::TimeSync {
                     frame,
@@ -237,7 +237,8 @@ where
                     ..
                 } => match extract_sync_fields(&frame, local_recv_ns) {
                     Some(SyncFields::Request { t1, t2_local, .. }) => {
-                        if let Err(e) = self.transport.send_time_sync_resp(node_state, t1, t2_local)
+                        if let Err(e) =
+                            self.transport.send_time_sync_resp(node_state, t1, t2_local)
                         {
                             warn!(error = ?e, "send_time_sync_resp failed");
                         }
@@ -253,8 +254,6 @@ where
                     }
                     None => {}
                 },
-                // Voting-Frames waehrend PeerSync ignorieren.
-                // Alternative: puffern und im ersten Zyklus einspielen.
                 _ => {}
             }
         }
@@ -411,8 +410,6 @@ where
     }
 
     fn handle_error_management(&mut self) -> StateEvent {
-        return StateEvent::Fault;
-        // ERSTMAL BIS LOGIK IMMER FAILSAFE
         let next_deadline = self.next_cycle_tick();
         debug!(next_deadline, "starting next cycle");
         self.state.start_new_cycle(next_deadline);
@@ -444,8 +441,48 @@ where
         (self.state.peers().len() as u8 + 1) >= self.state.voter().required_participants()
     }
 
+    /// Prueft, ob ein Frame als stale zu verwerfen ist.
+    ///
+    /// Ausgewertet wird nur, wenn `sync_valid` ist — vorher sind Timestamps
+    /// nur Rohdaten. Solange die Sync nicht gueltig ist oder der Offset zum
+    /// Peer nicht bekannt ist, wird der Frame durchgelassen (defensiv:
+    /// lieber einen fragwuerdigen Frame verarbeiten als einen echten
+    /// falsch verwerfen).
+    ///
+    /// Rueckgabe: `Some(age_ns)` wenn stale, `None` wenn frisch oder nicht
+    /// pruefbar.
+    fn frame_age_if_stale(&self, frame: &UdpFrame<V::Payload>) -> Option<u64> {
+        if !self.state.sync_valid() {
+            return None;
+        }
+        let peer_id = frame.node_id();
+        let local_send = self.state.peer_ts_to_local(peer_id, frame.timestamp())?;
+        let now = now_monotonic_ns();
+        let age = now.saturating_sub(local_send);
+        let threshold_ns = self.timing.stale_threshold.as_nanos() as u64;
+        if age > threshold_ns {
+            Some(age)
+        } else {
+            None
+        }
+    }
+
     fn ingest_frame(&mut self, frame: UdpFrame<V::Payload>) {
         let peer_id = frame.node_id();
+
+        // Stale-Check zuerst — verworfene Frames werden gar nicht erst
+        // klassifiziert oder verarbeitet.
+        if let Some(age) = self.frame_age_if_stale(&frame) {
+            let threshold = self.timing.stale_threshold.as_nanos() as u64;
+            warn!(
+                peer_id,
+                age_ns = age,
+                threshold_ns = threshold,
+                "stale frame dropped"
+            );
+            return;
+        }
+
         let payload = frame.payload();
         match payload {
             Payload::Result(value) => {
@@ -470,15 +507,12 @@ where
             Payload::State => {
                 debug!(peer_id, "matched State arm");
             }
-            // Sync-Frames sind hier out-of-band und werden im normalen
-            // Zyklusbetrieb ignoriert. Werden bereits vom Transport in
-            // die eigene RecvOutcome::TimeSync-Variante gehoben und
-            // sollten hier gar nicht landen.
             Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. } => {
                 debug!(peer_id, "unexpected sync frame outside PeerSync, dropped");
             }
         }
     }
+
     fn all_peer_results_in(&self) -> bool {
         self.state.cycle().peer_results.iter().all(|r| r.is_some())
     }
@@ -508,13 +542,6 @@ where
     }
 
     /// Generischer „periodisch senden + empfangen bis Bedingung erfuellt" Loop.
-    ///
-    /// - `send`: wird sofort und dann alle `resend_interval` erneut aufgerufen.
-    ///           Sende-Fehler werden geloggt, brechen aber nicht ab (UDP —
-    ///           naechster Resend versucht es wieder). Nur harte Fehler
-    ///           liefern `Err(())` zurueck.
-    /// - `done`: Abbruchbedingung, wird nach jedem ingest geprueft.
-    /// - `phase`: Name fuer Logging.
     fn collect_phase<Snd, Done, Ing>(
         &mut self,
         phase: &'static str,
@@ -541,7 +568,7 @@ where
             }
 
             if done(self) {
-                let _ = send(self); // finaler Beacon fuer Nachzuegler
+                let _ = send(self);
                 debug!(phase, "phase complete");
                 return PhaseOutcome::Complete;
             }
@@ -552,30 +579,34 @@ where
             }
 
             match self.transport.try_recv() {
-              RecvOutcome::Valid(frame) => ingest(self, frame),
-              RecvOutcome::SeqGap {
+                RecvOutcome::Valid(frame) => ingest(self, frame),
+                RecvOutcome::SeqGap {
                     peer_id,
                     gap,
                     frame,
                 } => {
+                    warn!(peer_id, gap, "seq gap detected, advancing cursor");
+                    self.transport.accept(&frame);
                     ingest(self, frame);
-                },
-                RecvOutcome::Duplicate {
-                peer_id,
-                seen,
-                last,
+                }
+                RecvOutcome::NewSession {
+                    peer_id,
+                    previous_session,
+                    new_session,
+                    frame,
                 } => {
-                    warn!("peer {} duplicate frame, seen {} last {}", peer_id, seen, last);
-                },
+                    warn!(
+                        peer_id,
+                        previous_session, new_session, "peer rebooted mid-phase"
+                    );
+                    self.transport.accept(&frame);
+                    ingest(self, frame);
+                }
                 RecvOutcome::TimeSync {
                     frame,
                     local_recv_ns,
                     ..
                 } => {
-                    // Auf Sync-Requests immer antworten, auch ausserhalb von
-                    // PeerSync. Sonst koennen langsamere Peers ihre Synchronisation
-                    // nicht abschliessen, wenn ein anderer Node schon weiter ist.
-                    // Late-arriving Responses ignorieren wir.
                     if let Some(SyncFields::Request { t1, t2_local, .. }) =
                         extract_sync_fields(&frame, local_recv_ns)
                     {

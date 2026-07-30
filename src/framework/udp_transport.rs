@@ -14,7 +14,7 @@ use std::time::Instant;
 /// Deckt jeden `UdpFrame<P>` mit `P::WIRE_SIZE <= MAX_PAYLOAD_WIRE_SIZE` ab,
 /// unabhaengig vom konkreten Payload-Typ. Damit bleibt der Empfangspuffer
 /// stack-allokiert und typ-agnostisch.
-const HEADER_SIZE: usize = 15;
+const HEADER_SIZE: usize = 23;
 const CRC_SIZE: usize = 4;
 pub const RECV_BUFFER_SIZE: usize = HEADER_SIZE + MAX_PAYLOAD_WIRE_SIZE + CRC_SIZE;
 
@@ -66,7 +66,7 @@ pub enum RecvOutcome<P: CyclePayload> {
     },
 
     /// Zeitsync-Frame (Request oder Response). Umgeht die seq_num-
-    /// Klassifikation, da Sync-Frames einen eigenen, asynchronen
+    /// Klassifikation, da Sync-Frames einen eigenen asynchronen
     /// Nachrichtenfluss darstellen.
     ///
     /// `local_recv_ns` ist der Zeitstempel, der unmittelbar nach `recv_from`
@@ -142,8 +142,14 @@ impl<P: CyclePayload> UdpTransport<P> {
     /// Sendet einen State-Frame mit automatisch hochgezaehlter seq_num.
     pub fn send_state(&mut self, node_state: NodeState) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
-        let frame =
-            UdpFrame::<P>::state_frame(self.self_node_id, self.self_session_id, seq, node_state);
+        let timestamp = now_monotonic_ns();
+        let frame = UdpFrame::<P>::state_frame(
+            self.self_node_id,
+            self.self_session_id,
+            seq,
+            node_state,
+            timestamp,
+        );
         self.socket.send_to(&frame.encode(), self.group_addr)?;
         self.next_seq_num = self.next_seq_num.wrapping_add(1);
         Ok(seq)
@@ -151,11 +157,13 @@ impl<P: CyclePayload> UdpTransport<P> {
 
     pub fn send_result(&mut self, node_state: NodeState, result: P) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
+        let timestamp = now_monotonic_ns();
         let frame = UdpFrame::<P>::result_frame(
             self.self_node_id,
             self.self_session_id,
             seq,
             node_state,
+            timestamp,
             result,
         );
         self.socket.send_to(&frame.encode(), self.group_addr)?;
@@ -170,11 +178,13 @@ impl<P: CyclePayload> UdpTransport<P> {
         publisher_candidate: u8,
     ) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
+        let timestamp = now_monotonic_ns();
         let frame = UdpFrame::<P>::ack_frame(
             self.self_node_id,
             self.self_session_id,
             seq,
             node_state,
+            timestamp,
             received_from,
             publisher_candidate,
         );
@@ -186,48 +196,60 @@ impl<P: CyclePayload> UdpTransport<P> {
     /// Sendet einen TimeSyncReq. Der zurueckgegebene `t1` ist der
     /// Sendezeitstempel, den die PeerSync-Logik als pending_t1 vermerken muss,
     /// um die passende Response zuordnen zu koennen.
+    ///
+    /// Sync-Frames tragen die aktuelle Position im Voting-seq_num-Strom
+    /// als Marker mit, INKREMENTIEREN diese aber nicht: aus Sicht des
+    /// Voting-Protokolls sind Sync-Frames unsichtbar (Read ohne Write auf
+    /// den Strom). Die Deduplizierung von Sync-Traffic passiert nicht ueber
+    /// seq_num, sondern ueber pending_t1 im PeerSync-Modul.
+    ///
+    /// Der Header-`timestamp` ist identisch mit `t1` — beide werden aus
+    /// demselben `now_monotonic_ns()`-Aufruf befuellt.
     pub fn send_time_sync_req(
         &mut self,
         node_state: NodeState,
     ) -> Result<(u32, u64), TransportError> {
-        let seq = self.next_seq_num;
+        let seq_marker = self.next_seq_num;
         let t1 = now_monotonic_ns();
         let frame = UdpFrame::<P>::time_sync_req_frame(
             self.self_node_id,
             self.self_session_id,
-            seq,
+            seq_marker,
             node_state,
+            t1,
             t1,
         );
         self.socket.send_to(&frame.encode(), self.group_addr)?;
-        self.next_seq_num = self.next_seq_num.wrapping_add(1);
-        Ok((seq, t1))
+        Ok((seq_marker, t1))
     }
 
     /// Sendet einen TimeSyncResp. `t1_echo` und `t2_local` stammen aus dem
     /// verarbeiteten Request. `t3` wird intern erzeugt, moeglichst kurz vor
     /// dem eigentlichen `send_to`, damit die Responder-Verarbeitungszeit
     /// (t3 - t2) klein bleibt.
+    ///
+    /// Wie `send_time_sync_req`: seq_num wird als Marker mitgetragen, aber
+    /// nicht inkrementiert. Header-`timestamp` ist identisch mit `t3`.
     pub fn send_time_sync_resp(
         &mut self,
         node_state: NodeState,
         t1_echo: u64,
         t2_local: u64,
     ) -> Result<u32, TransportError> {
-        let seq = self.next_seq_num;
+        let seq_marker = self.next_seq_num;
         let t3 = now_monotonic_ns();
         let frame = UdpFrame::<P>::time_sync_resp_frame(
             self.self_node_id,
             self.self_session_id,
-            seq,
+            seq_marker,
             node_state,
+            t3,
             t1_echo,
             t2_local,
             t3,
         );
         self.socket.send_to(&frame.encode(), self.group_addr)?;
-        self.next_seq_num = self.next_seq_num.wrapping_add(1);
-        Ok(seq)
+        Ok(seq_marker)
     }
 
     pub fn recv(&mut self) -> RecvOutcome<P> {

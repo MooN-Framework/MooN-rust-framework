@@ -106,6 +106,14 @@ pub struct RunState<V: Voter, const N: usize> {
     // Geht als epsilon in die Voter-Timeout-Auslegung ein.
     sync_epsilon_ns: i64,
 
+    // Ist die Zeitsynchronisation erfolgreich abgeschlossen? Vor dem
+    // ersten erfolgreichen PeerSync sind Timestamps in eingehenden Frames
+    // nur Rohdaten und duerfen NICHT fuer Stale-Frame-Erkennung, Cycle-
+    // Alignment oder aehnliches ausgewertet werden. Nach dem Setzen sind
+    // die Offsets in `peer_clocks` gueltig und Timestamps koennen ueber
+    // `peer_ts_to_local` in die eigene Uhr umgerechnet werden.
+    sync_valid: bool,
+
     // zyklus-lokal
     cycle: CycleState<V::Payload, N>,
 
@@ -126,6 +134,7 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             peers: Vec::new(),
             peer_clocks: Vec::new(),
             sync_epsilon_ns: 0,
+            sync_valid: false,
             cycle: CycleState::empty(),
             last_decision: None,
         }
@@ -257,9 +266,32 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         self.sync_epsilon_ns
     }
 
+    /// Als gueltig markieren nach erfolgreichem PeerSync.
+    pub fn mark_sync_valid(&mut self) {
+        self.sync_valid = true;
+        info!("time sync marked valid");
+    }
+
+    /// Als ungueltig markieren, z.B. bei Peer-Rejoin oder erkannter
+    /// Uhrendrift, die eine erneute Synchronisation erfordert.
+    pub fn invalidate_sync(&mut self) {
+        self.sync_valid = false;
+        warn!("time sync invalidated");
+    }
+
+    pub fn sync_valid(&self) -> bool {
+        self.sync_valid
+    }
+
     /// Rechnet einen Zeitstempel des angegebenen Peers auf die eigene Uhr um.
-    /// Liefert None, wenn fuer diesen Peer kein Offset bekannt ist.
+    /// Liefert None, wenn fuer diesen Peer kein Offset bekannt ist ODER
+    /// die Zeitsynchronisation noch nicht gueltig ist. Der zweite Check
+    /// verhindert, dass Aufrufer versehentlich mit Rohdaten arbeiten, die
+    /// vor PeerSync auf der Leitung waren.
     pub fn peer_ts_to_local(&self, peer_id: u8, peer_ts: u64) -> Option<u64> {
+        if !self.sync_valid {
+            return None;
+        }
         let offset = self
             .peer_clocks
             .iter()
@@ -267,7 +299,11 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             .offset_ns;
         // local = peer_ts - offset, defensiv gegen Underflow.
         let local = (peer_ts as i128) - (offset as i128);
-        if local < 0 { None } else { Some(local as u64) }
+        if local < 0 {
+            None
+        } else {
+            Some(local as u64)
+        }
     }
 
     // ---- Accessors ----

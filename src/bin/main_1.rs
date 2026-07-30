@@ -52,6 +52,7 @@ fn main() {
         ack_timeout: Duration::from_millis(10000),
         peer_sync_request_interval: Duration::from_millis(2),
         peer_sync_timeout: Duration::from_millis(500),
+        stale_threshold : Duration::from_millis(50),
     };
 
     // -------------------------------------------------------------

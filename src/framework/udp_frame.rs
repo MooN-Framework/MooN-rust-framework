@@ -10,11 +10,18 @@ use crc32fast::Hasher;
 //   1..9     session_id        (8)
 //   9..13    seq_num           (4)
 //   13       node_state_wire   (1)
-//   14       payload_disc      (1)
-//   15..X    payload_body      (0 | P::WIRE_SIZE | 2 | 8 | 24)
+//   14..22   timestamp         (8)   <-- Sende-Zeitstempel des Absenders (ns)
+//   22       payload_disc      (1)
+//   23..X    payload_body      (0 | P::WIRE_SIZE | 2 | 8 | 24)
 //   X..X+4   crc32             (4)
 // -------------------------------------------------------------
-const HEADER_SIZE: usize = 15;
+// `timestamp` ist der lokale monotone Zeitstempel des Senders zum Zeitpunkt
+// des Absendens. VOR abgeschlossener Zeitsynchronisation ist der Wert nur
+// Rohdaten (jeder Node hat seine eigene Epoche). NACH der Synchronisation
+// kann der Empfaenger ihn ueber die bekannten Offsets in seine lokale Uhr
+// umrechnen und damit Stale-Frame-Erkennung und Cycle-Alignment machen.
+// -------------------------------------------------------------
+const HEADER_SIZE: usize = 23;
 const CRC_SIZE: usize = 4;
 const ACK_BODY: usize = 2;
 const TIME_SYNC_REQ_BODY: usize = 8; // t1
@@ -70,18 +77,14 @@ pub enum Payload<P: CyclePayload> {
         publisher_candidate: u8,
     },
     /// Cristian-Request. `t1` = Sendezeit auf der Uhr des Anfragers (ns).
-    TimeSyncReq {
-        t1: u64,
-    },
+    /// Identisch mit dem Header-`timestamp`, wird zusaetzlich hier gefuehrt,
+    /// damit die Sync-Logik unabhaengig vom Header-Layout bleibt.
+    TimeSyncReq { t1: u64 },
     /// Cristian-Response. `t1` = Echo aus Request, `t2` = Empfangszeit beim
     /// Responder, `t3` = Sendezeit der Antwort (beide auf der Responder-Uhr).
     /// Der Requester misst `t4` lokal beim Empfang und bildet daraus RTT +
-    /// Fehlerband.
-    TimeSyncResp {
-        t1: u64,
-        t2: u64,
-        t3: u64,
-    },
+    /// Fehlerband. `t3` ist identisch mit dem Header-`timestamp`.
+    TimeSyncResp { t1: u64, t2: u64, t3: u64 },
 }
 
 // -------------------------------------------------------------
@@ -93,6 +96,7 @@ pub struct UdpFrame<P: CyclePayload> {
     session_id: u64,
     seq_num: u32,
     node_state_wire: u8,
+    timestamp: u64,
     payload: Payload<P>,
     crc32: u32,
 }
@@ -120,6 +124,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         session_id: u64,
         seq_num: u32,
         node_state: NodeState,
+        timestamp: u64,
         payload: Payload<P>,
     ) -> Self {
         let mut f = Self {
@@ -127,6 +132,7 @@ impl<P: CyclePayload> UdpFrame<P> {
             session_id,
             seq_num,
             node_state_wire: node_state.to_wire(),
+            timestamp,
             payload,
             crc32: 0,
         };
@@ -134,8 +140,21 @@ impl<P: CyclePayload> UdpFrame<P> {
         f
     }
 
-    pub fn state_frame(node_id: u8, session_id: u64, seq_num: u32, node_state: NodeState) -> Self {
-        Self::new(node_id, session_id, seq_num, node_state, Payload::State)
+    pub fn state_frame(
+        node_id: u8,
+        session_id: u64,
+        seq_num: u32,
+        node_state: NodeState,
+        timestamp: u64,
+    ) -> Self {
+        Self::new(
+            node_id,
+            session_id,
+            seq_num,
+            node_state,
+            timestamp,
+            Payload::State,
+        )
     }
 
     pub fn result_frame(
@@ -143,6 +162,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         session_id: u64,
         seq_num: u32,
         node_state: NodeState,
+        timestamp: u64,
         result: P,
     ) -> Self {
         Self::new(
@@ -150,6 +170,7 @@ impl<P: CyclePayload> UdpFrame<P> {
             session_id,
             seq_num,
             node_state,
+            timestamp,
             Payload::Result(result),
         )
     }
@@ -159,6 +180,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         session_id: u64,
         seq_num: u32,
         node_state: NodeState,
+        timestamp: u64,
         received_from: PeerMask,
         publisher_candidate: u8,
     ) -> Self {
@@ -167,6 +189,7 @@ impl<P: CyclePayload> UdpFrame<P> {
             session_id,
             seq_num,
             node_state,
+            timestamp,
             Payload::Ack {
                 received_from,
                 publisher_candidate,
@@ -179,6 +202,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         session_id: u64,
         seq_num: u32,
         node_state: NodeState,
+        timestamp: u64,
         t1: u64,
     ) -> Self {
         Self::new(
@@ -186,6 +210,7 @@ impl<P: CyclePayload> UdpFrame<P> {
             session_id,
             seq_num,
             node_state,
+            timestamp,
             Payload::TimeSyncReq { t1 },
         )
     }
@@ -195,6 +220,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         session_id: u64,
         seq_num: u32,
         node_state: NodeState,
+        timestamp: u64,
         t1: u64,
         t2: u64,
         t3: u64,
@@ -204,6 +230,7 @@ impl<P: CyclePayload> UdpFrame<P> {
             session_id,
             seq_num,
             node_state,
+            timestamp,
             Payload::TimeSyncResp { t1, t2, t3 },
         )
     }
@@ -220,6 +247,9 @@ impl<P: CyclePayload> UdpFrame<P> {
     pub fn node_state_wire(&self) -> u8 {
         self.node_state_wire
     }
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
     pub fn payload(&self) -> Payload<P> {
         self.payload
     }
@@ -233,6 +263,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         h.update(&self.session_id.to_le_bytes());
         h.update(&self.seq_num.to_le_bytes());
         h.update(&[self.node_state_wire]);
+        h.update(&self.timestamp.to_le_bytes());
 
         match &self.payload {
             Payload::State => {
@@ -282,6 +313,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         buf.extend_from_slice(&self.session_id.to_le_bytes());
         buf.extend_from_slice(&self.seq_num.to_le_bytes());
         buf.push(self.node_state_wire);
+        buf.extend_from_slice(&self.timestamp.to_le_bytes());
         match self.payload {
             Payload::State => buf.push(DISC_STATE),
             Payload::Result(r) => {
@@ -328,7 +360,12 @@ impl<P: CyclePayload> UdpFrame<P> {
         let seq_num =
             u32::from_le_bytes(bytes[9..13].try_into().expect("slice length checked above"));
         let node_state_wire = bytes[13];
-        let disc = bytes[14];
+        let timestamp = u64::from_le_bytes(
+            bytes[14..22]
+                .try_into()
+                .expect("slice length checked above"),
+        );
+        let disc = bytes[22];
 
         let (payload, body_size) = match disc {
             DISC_STATE => (Payload::State, 0usize),
@@ -407,6 +444,7 @@ impl<P: CyclePayload> UdpFrame<P> {
             session_id,
             seq_num,
             node_state_wire,
+            timestamp,
             payload,
             crc32,
         };
