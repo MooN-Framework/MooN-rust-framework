@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+use serde::Deserialize;
 use std::fmt;
 
 pub const BRAKE_BUILDUP_TIME_S: f64 = 2.5;
@@ -49,7 +50,7 @@ pub const DECELERATION_STAGES: &[DecelerationStage] = &[
 // ---------------------------------------------------------------------------
 
 /// Eingabegrößen für eine Bremswegberechnung.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct BrakeInput {
     /// Aktuelle Geschwindigkeit `v_0` in m/s.
     pub current_speed: f64,

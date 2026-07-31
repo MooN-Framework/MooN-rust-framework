@@ -1,9 +1,14 @@
 use log::Level::Warn;
+use serde::Deserialize;
 use std::cell::Cell;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+use crate::framework::diagnostic::{
+    Command, Diagnostic, DiagnosticConfig, InjectionSnapshot, OutgoingTelegram, PeerStatus,
+    StatusResponse,
+};
 use crate::framework::peer_sync::{PeerSync, SyncFields, extract_sync_fields};
 use crate::framework::run_state::{AckInfo, FaultKind, PeerHealth, RunState};
 use crate::framework::state_machine::{NodeState, StateEvent};
@@ -43,8 +48,11 @@ where
     sink: S,
     timing: CycleTiming,
     last_cycle_start: Option<Instant>,
+    last_cycle_us: Option<u128>,
     next_cycle_deadline: Option<Instant>,
     cycles_since_last_sync: u32,
+
+    diagnostic: Option<Diagnostic>,
 }
 
 impl<C, V, S, const N: usize> Runner<C, V, S, N>
@@ -52,6 +60,8 @@ where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
+    // Fuer die Diagnose-Schnittstelle: Input muss aus JSON deserialisierbar sein.
+    C::Input: for<'de> Deserialize<'de>,
 {
     pub fn new(
         state: RunState<V, N>,
@@ -60,8 +70,25 @@ where
         input: C::Input,
         sink: S,
         timing: CycleTiming,
+        diag_cfg: DiagnosticConfig,
     ) -> Self {
         info!(own_id = state.own_id(), "Runner constructed");
+
+        let diagnostic = if diag_cfg.enabled {
+            match Diagnostic::new(&diag_cfg, state.own_id()) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    error!(
+                        error = ?e,
+                        "failed to init diagnostic interface, continuing without"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             state,
             transport,
@@ -70,13 +97,15 @@ where
             sink,
             timing,
             last_cycle_start: None,
+            last_cycle_us: None,
             next_cycle_deadline: None,
             cycles_since_last_sync: 0,
+            diagnostic,
         }
     }
 
     pub fn set_input(&mut self, input: C::Input) {
-        debug!("input updated via diagnostic path");
+        debug!("input updated directly (bypassing staging)");
         self.input = input;
     }
 
@@ -103,9 +132,103 @@ where
                 }
             };
 
+            self.poll_diagnostic();
+
             let next = current.next(event);
             info!(from = ?current, event = ?event, to = ?next, "state transition");
             self.state.set_node_state(next);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // Diagnose
+    // -------------------------------------------------------------
+
+    /// Verarbeitet eingehende Diagnose-Telegramme. Kommandos die
+    /// Zustand aendern werden in `diagnostic.pending` gestagt und beim
+    /// naechsten `handle_read_inputs` wirksam. GetStatus wird sofort
+    /// mit vollem Zustand beantwortet, weil der Runner Zugriff auf
+    /// RunState braucht.
+    fn poll_diagnostic(&mut self) {
+        let Some(mut diag) = self.diagnostic.take() else {
+            return;
+        };
+
+        while let Some(immediate) = diag.try_recv() {
+            match immediate {
+                Command::GetStatus => {
+                    let status = self.build_status_response(&diag);
+                    diag.send(&OutgoingTelegram::Status {
+                        source_node_id: diag.node_id(),
+                        data: status,
+                    });
+                }
+                _ => {
+                    // Sollte nicht passieren — alle anderen Kommandos
+                    // werden in diag.try_recv() bereits gestagt.
+                    debug!("unexpected immediate command returned from diagnostic");
+                }
+            }
+        }
+
+        self.diagnostic = Some(diag);
+    }
+
+    /// Wendet gestagete Diagnose-Aenderungen zu Beginn eines neuen Zyklus
+    /// an. Wird von `handle_read_inputs` VOR der Berechnung aufgerufen,
+    /// damit alle Nodes die Aenderung im selben logischen Zyklus sehen.
+    fn apply_pending_diagnostic(&mut self) {
+        let Some(diag) = self.diagnostic.as_mut() else {
+            return;
+        };
+
+        // Input-Update: opaque JSON gegen C::Input deserialisieren.
+        if let Some(json) = diag.take_pending_input() {
+            match serde_json::from_value::<C::Input>(json) {
+                Ok(new_input) => {
+                    info!("applying staged input at cycle start");
+                    self.input = new_input;
+                }
+                Err(e) => {
+                    warn!(
+                        error = ?e,
+                        "failed to deserialize staged input, keeping previous"
+                    );
+                }
+            }
+        }
+
+        // Injection-Updates: Zaehler in aktiven State uebertragen.
+        diag.apply_pending_injection();
+    }
+
+    fn build_status_response(&self, diag: &Diagnostic) -> StatusResponse {
+        StatusResponse {
+            node_id: self.state.own_id(),
+            session_id: self.state.session_id(),
+            node_state: format!("{:?}", self.state.node_state()),
+            current_seq: self.state.current_seq(),
+            last_cycle_us: self.last_cycle_us,
+            sync_valid: self.state.sync_valid(),
+            sync_epsilon_ns: self.state.sync_epsilon_ns(),
+            cycles_since_last_sync: self.cycles_since_last_sync,
+            peers: self
+                .state
+                .peers()
+                .iter()
+                .map(|p| PeerStatus {
+                    id: p.id,
+                    health: format!("{:?}", p.health),
+                    consecutive_faults: p.consecutive_faults,
+                    consecutive_healthy_cycles: p.consecutive_healthy_cycles,
+                })
+                .collect(),
+            injection: InjectionSnapshot {
+                drop_next_n_results: diag.injection.drop_next_n_results,
+                drop_next_n_acks: diag.injection.drop_next_n_acks,
+            },
+            pending_input: diag.pending.has_input(),
+            pending_injection_update: diag.pending.has_injection_update(),
         }
     }
 
@@ -121,6 +244,7 @@ where
         loop {
             warn!("isolation state entered, waiting for manual intervention");
             sleep(Duration::from_secs(1));
+            self.poll_diagnostic();
         }
     }
 
@@ -177,9 +301,6 @@ where
             self.state.invalidate_sync();
         }
 
-        // Nur mit Peers syncen, die nicht Lost sind. Lost-Peers antworten
-        // nicht mehr; sie einzubeziehen wuerde nur unnoetig zum
-        // peer_sync_timeout laufen.
         let peer_ids: Vec<u8> = self
             .state
             .peers()
@@ -329,14 +450,18 @@ where
     }
 
     fn handle_read_inputs(&mut self) -> StateEvent {
+        // Gestagete Diagnose-Aenderungen zum Zyklusstart anwenden.
+        // Alle Nodes sind wegen CycleSync-Barrier hier zum selben
+        // logischen Zeitpunkt — Aenderungen wirken damit synchron.
+        self.apply_pending_diagnostic();
+
         self.wait_for_next_cycle_tick();
 
         let now = Instant::now();
         if let Some(prev) = self.last_cycle_start {
-            info!(
-                cycle_us = now.duration_since(prev).as_micros(),
-                "cycle duration"
-            );
+            let elapsed = now.duration_since(prev);
+            self.last_cycle_us = Some(elapsed.as_micros());
+            info!(cycle_us = elapsed.as_micros(), "cycle duration");
         }
         self.last_cycle_start = Some(now);
 
@@ -354,6 +479,14 @@ where
     }
 
     fn handle_share_result(&mut self) -> StateEvent {
+        if let Some(diag) = self.diagnostic.as_mut() {
+            if diag.should_drop_result() {
+                warn!("injection: dropping share_result this cycle");
+                sleep(self.timing.share_timeout);
+                return StateEvent::ShareResultTimeout;
+            }
+        }
+
         let own = match self.state.cycle().own_result {
             Some(r) => r,
             None => {
@@ -390,6 +523,14 @@ where
     }
 
     fn handle_send_ack(&mut self) -> StateEvent {
+        if let Some(diag) = self.diagnostic.as_mut() {
+            if diag.should_drop_ack() {
+                warn!("injection: dropping send_ack this cycle");
+                sleep(self.timing.ack_timeout);
+                return StateEvent::AckTimeout;
+            }
+        }
+
         let mask = self.received_mask();
         let candidate = self.pick_publisher_candidate();
         let node_state = self.state.node_state();
@@ -426,12 +567,6 @@ where
 
         match outcome {
             VotingOutcome::Consensus(decision) => {
-                // Dissenter-Analyse: hat der Voter Werte gesehen, die zwar
-                // eine Mehrheit erreichten, aber Minderheiten waren?
-                //
-                // Wir muessen own_result und peer_results VOR der
-                // Mutation kopieren, weil find_dissenters immutable auf
-                // self.state.voter zugreift.
                 let own_result = self.state.cycle().own_result;
                 let dissenter_analysis = own_result.map(|own| {
                     self.state.voter().find_dissenters(
@@ -443,9 +578,6 @@ where
 
                 if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
                     if own_dissented {
-                        // Wir selbst waren der Ausreisser. Nicht publizieren,
-                        // sondern in Failsafe — von uns aus koennen wir dem
-                        // eigenen Wert nicht mehr trauen.
                         error!(
                             own_id = self.state.own_id(),
                             "own value dissented from consensus, self-isolating to failsafe"
@@ -453,17 +585,12 @@ where
                         return StateEvent::Fault;
                     }
 
-                    // Peer-Dissenter -> ValueDivergence-Fault zaehlen und
-                    // ueber ErrorManagement rekonfigurieren.
                     if !peer_dissenter_indices.is_empty() {
                         let dissenter_ids: Vec<u8> = peer_dissenter_indices
                             .iter()
                             .filter_map(|idx| self.state.peers().get(*idx as usize).map(|p| p.id))
                             .collect();
 
-                        // Publisher publiziert VOR der Rekonfiguration —
-                        // der Consensus ist ja gueltig, nur die
-                        // Minderheit war auffaellig.
                         let publisher = self.pick_publisher_candidate();
                         let own_id = self.state.own_id();
                         if publisher == own_id {
@@ -484,7 +611,6 @@ where
                     }
                 }
 
-                // Sauberer Consensus, keine Dissenter.
                 let publisher = self.pick_publisher_candidate();
                 let own_id = self.state.own_id();
                 if publisher == own_id {
@@ -494,10 +620,7 @@ where
                     );
                     self.sink.publish(&decision);
                 } else {
-                    debug!(
-                        publisher,
-                        own_id, "Consensus reached — peer is publisher, no local publish"
-                    );
+                    debug!(publisher, own_id, "Consensus reached — peer is publisher");
                 }
 
                 self.credit_peers_delivered();
@@ -533,9 +656,6 @@ where
     fn handle_error_management(&mut self) -> StateEvent {
         debug!("handle_error_management entered");
 
-        // 1. Health-Transitions basierend auf den waehrend des letzten
-        //    Zyklus gesammelten Zaehlern anwenden. Einziger Ort im System,
-        //    an dem sich das health-Feld eines Peers aendert.
         let transitions = self.state.apply_health_transitions();
         if transitions > 0 {
             info!(
@@ -545,13 +665,9 @@ where
             );
         }
 
-        // 2. Neuen Zyklus starten. Die Zaehler-Slots werden geleert
-        //    (peer_results, peer_acks), damit der naechste Zyklus frisch
-        //    startet.
         let next_deadline = self.next_cycle_tick();
         self.state.start_new_cycle(next_deadline);
 
-        // 3. Quorum-Check: haben wir noch genug aktive Nodes?
         if !self.state.quorum_available() {
             error!(
                 active_peers = self.state.active_peer_count(),
@@ -560,12 +676,6 @@ where
             );
             return StateEvent::TooFewNodes;
         }
-
-        // 4. Divergenz war der Grund? Dann gilt der Zyklus als nicht
-        //    aufloesbar — auch wenn Quorum nominell reicht.
-        //    (Aktuell wird das ueber State-Event unterschieden; der
-        //    ErrorManagement-Handler selbst kennt nicht den Ausloeser.
-        //    StateDiverged fuehrt aber sowieso zu Failsafe.)
 
         StateEvent::StateOk
     }
@@ -578,7 +688,7 @@ where
     }
 
     // -------------------------------------------------------------
-    // Fehler-Buchhaltung (Zaehler-Update, keine Transitions)
+    // Fehler-Buchhaltung
     // -------------------------------------------------------------
 
     fn fault_peers_missing_result(&mut self) {
@@ -665,10 +775,6 @@ where
     // Hilfsroutinen
     // -------------------------------------------------------------
 
-    fn self_test(&mut self) -> Result<(), ()> {
-        Ok(())
-    }
-
     fn discovery_complete(&self) -> bool {
         (self.state.peers().len() as u8 + 1) >= self.state.voter().required_participants()
     }
@@ -706,8 +812,6 @@ where
     fn ingest_frame(&mut self, frame: UdpFrame<V::Payload>) {
         let peer_id = frame.node_id();
 
-        // Lost-Peers werden komplett ignoriert — sie sind vom System
-        // ausgeschlossen und duerfen den Zyklus nicht mehr beeinflussen.
         if let Some(idx) = self.state.peer_index(peer_id) {
             if self.state.peers()[idx].health == PeerHealth::Lost {
                 debug!(peer_id, "frame from lost peer dropped");
@@ -777,10 +881,6 @@ where
         0
     }
 
-    fn probation_passed(&self) -> bool {
-        true
-    }
-
     fn collect_phase<Snd, Done, Ing>(
         &mut self,
         phase: &'static str,
@@ -834,8 +934,6 @@ where
                     new_session,
                     frame,
                 } => {
-                    // Rejoin-Vorsicht: Peers, die als Lost markiert waren,
-                    // duerfen sich nicht automatisch rehabilitieren.
                     let was_lost = self
                         .state
                         .peer_index(peer_id)
@@ -845,9 +943,7 @@ where
                     if was_lost {
                         warn!(
                             peer_id,
-                            previous_session,
-                            new_session,
-                            "rejoin attempt from lost peer ignored (probation not yet implemented)"
+                            previous_session, new_session, "rejoin attempt from lost peer ignored"
                         );
                     } else {
                         warn!(

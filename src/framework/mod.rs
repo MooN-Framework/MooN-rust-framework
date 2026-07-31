@@ -1,3 +1,4 @@
+pub mod diagnostic;
 pub mod peer_sync;
 pub mod run_state;
 pub mod runner;

@@ -1,17 +1,17 @@
 use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use swb_fault_tolerance::brake::braking_curve::BrakeInput;
 use swb_fault_tolerance::brake::computation::BrakeComputation;
 use swb_fault_tolerance::brake::sink::BrakeSink;
 use swb_fault_tolerance::brake::voter::BrakeVoter;
+use swb_fault_tolerance::framework::diagnostic::DiagnosticConfig;
 use swb_fault_tolerance::framework::run_state::RunState;
 use swb_fault_tolerance::framework::runner::{CycleTiming, Runner};
 use swb_fault_tolerance::framework::udp_transport::{TransportConfig, UdpTransport};
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::WARN)
         .init();
     // -------------------------------------------------------------
     // Konfiguration (spaeter aus Datei/CLI laden)
@@ -71,11 +71,26 @@ fn main() {
         /* available_distance */ 100.0,
     );
 
+    let diag_cfg = DiagnosticConfig {
+        enabled: true,
+        interface_name: "lo".to_string(),
+        multicast_group: Ipv4Addr::new(239, 10, 0, 2),
+        port: 6666,
+    };
+
     // -------------------------------------------------------------
     // Loop
     // -------------------------------------------------------------
 
-    let mut runner = Runner::new(state, transport, computation, initial_input, sink, timing);
+    let mut runner = Runner::new(
+        state,
+        transport,
+        computation,
+        initial_input,
+        sink,
+        timing,
+        diag_cfg,
+    );
     runner.run();
 
     // Wenn run() zurueckkehrt, ist der Node in Failsafe.

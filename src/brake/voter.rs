@@ -133,7 +133,7 @@ impl Voter for BrakeVoter {
         VotingOutcome::Disagreement
     }
 
-        fn find_dissenters(
+    fn find_dissenters(
         &self,
         own: &BrakeResult,
         peers: &[Option<BrakeResult>],
