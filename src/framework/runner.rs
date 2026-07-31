@@ -29,11 +29,11 @@ pub struct CycleTiming {
 
     /// Maximal zulaessiges Alter eines empfangenen Frames, bevor er als
     /// stale verworfen wird. Wird erst nach abgeschlossener Zeitsynchronisation
-    /// ausgewertet — vorher sind Timestamps nur Rohdaten.
-    ///
-    /// Faustregel: `max(2 * sync_epsilon_ns, cycle_duration / 2)`.
-    /// Bei 10ms Zyklus und sub-ms epsilon also z.B. 5ms.
+    /// ausgewertet.
     pub stale_threshold: Duration,
+
+    /// Anzahl erfolgreicher Zyklen, nach denen periodisch resynchronisiert wird.
+    pub resync_interval_cycles: u32,
 }
 
 pub struct Runner<C, V, S, const N: usize>
@@ -48,6 +48,22 @@ where
     input: C::Input,
     sink: S,
     timing: CycleTiming,
+
+    /// Zeitpunkt, an dem der letzte Zyklus begonnen hat. Fuer Zyklusdauer-
+    /// Messung (Diagnose).
+    last_cycle_start: Option<Instant>,
+
+    /// Absolute Deadline fuer den naechsten Zyklusstart. Wird ausschliesslich
+    /// in `wait_for_next_cycle_tick` fortgeschrieben (Deadline + cycle_duration),
+    /// damit Zyklen nicht driften: ueberzogene Zyklen fressen sich in die
+    /// Reserve des naechsten Zyklus, gleichen aber nicht die absolute
+    /// Ausrichtung an der Startzeit auf.
+    next_cycle_deadline: Option<Instant>,
+
+    /// Zaehler fuer die periodische Resync-Ausloesung. Wird nach jedem
+    /// erfolgreichen Publish erhoeht, nach jedem erfolgreichen PeerSync
+    /// auf 0 zurueckgesetzt.
+    cycles_since_last_sync: u32,
 }
 
 impl<C, V, S, const N: usize> Runner<C, V, S, N>
@@ -72,6 +88,9 @@ where
             input,
             sink,
             timing,
+            last_cycle_start: None,
+            next_cycle_deadline: None,
+            cycles_since_last_sync: 0,
         }
     }
 
@@ -170,7 +189,14 @@ where
 
     /// Zeitsynchronisation zu allen entdeckten Peers nach Cristian.
     fn handle_peer_sync(&mut self) -> StateEvent {
-        debug!("handle_peer_sync entered");
+        debug!(
+            cycles_since_last_sync = self.cycles_since_last_sync,
+            "handle_peer_sync entered"
+        );
+
+        if self.state.sync_valid() {
+            self.state.invalidate_sync();
+        }
 
         let peer_ids: Vec<u8> = self.state.peers().iter().map(|p| p.id).collect();
         if peer_ids.is_empty() {
@@ -195,6 +221,13 @@ where
                 self.state.set_peer_clocks(&clocks);
                 self.state.set_sync_epsilon(epsilon);
                 self.state.mark_sync_valid();
+                self.cycles_since_last_sync = 0;
+
+                // Nach dem Resync die Cycle-Deadline zuruecksetzen — sonst wuerden
+                // wir versuchen, die verpasste Zeit im naechsten Zyklus aufzuholen,
+                // was die Zyklusdauer verzerrt.
+                self.next_cycle_deadline = None;
+
                 self.state.start_new_cycle(self.next_cycle_tick());
                 return StateEvent::PeerSyncOk;
             }
@@ -312,6 +345,20 @@ where
     }
 
     fn handle_read_inputs(&mut self) -> StateEvent {
+        // Auf naechsten Zyklus-Tick warten. Muss vor allem anderen passieren,
+        // damit die gemessene Zyklusdauer die tatsaechliche Zykluszeit
+        // widerspiegelt, nicht die Rechendauer eines einzelnen Durchlaufs.
+        self.wait_for_next_cycle_tick();
+
+        let now = Instant::now();
+        if let Some(prev) = self.last_cycle_start {
+            info!(
+                cycle_us = now.duration_since(prev).as_micros(),
+                "cycle duration"
+            );
+        }
+        self.last_cycle_start = Some(now);
+
         debug!("reading inputs and computing payload");
         match self.computation.compute(self.input) {
             Ok(payload) => {
@@ -392,7 +439,20 @@ where
             VotingOutcome::Consensus(decision) => {
                 warn!("Consensus reached, publishing decision");
                 self.sink.publish(&decision);
-                StateEvent::ResultPublished
+
+                self.cycles_since_last_sync =
+                    self.cycles_since_last_sync.saturating_add(1);
+
+                if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
+                    info!(
+                        cycles = self.cycles_since_last_sync,
+                        interval = self.timing.resync_interval_cycles,
+                        "resync interval reached, triggering time sync refresh"
+                    );
+                    StateEvent::ResyncDue
+                } else {
+                    StateEvent::ResultPublished
+                }
             }
             VotingOutcome::Disagreement => {
                 warn!("vote resulted in disagreement");
@@ -441,16 +501,37 @@ where
         (self.state.peers().len() as u8 + 1) >= self.state.voter().required_participants()
     }
 
+    /// Wartet bis zum naechsten geplanten Zyklusstart. Nutzt absolute
+    /// Deadlines, damit sich Ueberziehungen nicht ueber viele Zyklen
+    /// akkumulieren: die Deadline schreibt sich immer um genau `cycle_duration`
+    /// weiter, unabhaengig davon, wie lange der letzte Zyklus wirklich
+    /// gedauert hat.
+    ///
+    /// Beim ersten Aufruf gibt es noch keine Deadline — dann wird sie ab
+    /// jetzt gesetzt und kein Sleep durchgefuehrt.
+    fn wait_for_next_cycle_tick(&mut self) {
+        let now = Instant::now();
+
+        match self.next_cycle_deadline {
+            None => {
+                self.next_cycle_deadline = Some(now + self.timing.cycle_duration);
+            }
+            Some(deadline) => {
+                if now < deadline {
+                    sleep(deadline - now);
+                } else {
+                    let overrun = now - deadline;
+                    warn!(
+                        overrun_us = overrun.as_micros(),
+                        "cycle overrun, no sleep"
+                    );
+                }
+                self.next_cycle_deadline = Some(deadline + self.timing.cycle_duration);
+            }
+        }
+    }
+
     /// Prueft, ob ein Frame als stale zu verwerfen ist.
-    ///
-    /// Ausgewertet wird nur, wenn `sync_valid` ist — vorher sind Timestamps
-    /// nur Rohdaten. Solange die Sync nicht gueltig ist oder der Offset zum
-    /// Peer nicht bekannt ist, wird der Frame durchgelassen (defensiv:
-    /// lieber einen fragwuerdigen Frame verarbeiten als einen echten
-    /// falsch verwerfen).
-    ///
-    /// Rueckgabe: `Some(age_ns)` wenn stale, `None` wenn frisch oder nicht
-    /// pruefbar.
     fn frame_age_if_stale(&self, frame: &UdpFrame<V::Payload>) -> Option<u64> {
         if !self.state.sync_valid() {
             return None;
@@ -470,8 +551,6 @@ where
     fn ingest_frame(&mut self, frame: UdpFrame<V::Payload>) {
         let peer_id = frame.node_id();
 
-        // Stale-Check zuerst — verworfene Frames werden gar nicht erst
-        // klassifiziert oder verarbeitet.
         if let Some(age) = self.frame_age_if_stale(&frame) {
             let threshold = self.timing.stale_threshold.as_nanos() as u64;
             warn!(

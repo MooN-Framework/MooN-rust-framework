@@ -18,6 +18,8 @@ pub enum NodeState {
     PublishResult = 0x07,
     ErrorManagement = 0x08,
     Isolation = 0x09,
+    /// Zeitsynchronisation nach Cristian, zwischen Discovery und
+    /// Zyklusbetrieb sowie periodisch zur Kompensation von Uhrendrift.
     PeerSync = 0x0A,
     Failsafe = 0xFF,
 }
@@ -46,6 +48,10 @@ pub enum StateEvent {
     AckTimeout,
     /* Publish Events */
     ResultPublished,
+    /// Nach erfolgreicher Publikation ist das periodische Resync-Intervall
+    /// erreicht — statt dem normalen Uebergang nach CycleSync geht's zurueck
+    /// nach PeerSync, um Uhrendrift zu kompensieren.
+    ResyncDue,
     /* Error Management */
     StateOk,
     StateDiverged,
@@ -65,14 +71,10 @@ impl NodeState {
             (Startup, SelfTestErr) => Failsafe,
 
             // --- InitSync -> PeerSync ---
-            // Nach erfolgreicher Discovery folgt die Zeitsynchronisation,
-            // bevor der Zyklusbetrieb beginnt.
             (InitSync, InitialSyncOk) => PeerSync,
             (InitSync, InitialSyncTimeout) => Failsafe,
 
             // --- PeerSync -> ReadInputs ---
-            // Timeout ist terminal: ohne synchronisierte Uhren keine
-            // deterministische Zyklus-Auslegung moeglich.
             (PeerSync, PeerSyncOk) => ReadInputs,
             (PeerSync, PeerSyncTimeout) => Failsafe,
 
@@ -86,7 +88,10 @@ impl NodeState {
             (ShareResult, ResultShared) => SendACK,
             (SendACK, AckTimeout) => ErrorManagement,
             (SendACK, AckReceived) => PublishResult,
+
+            // --- Publish: normal weiter, oder periodischer Resync ---
             (PublishResult, ResultPublished) => CycleSync,
+            (PublishResult, ResyncDue) => PeerSync,
 
             // --- Error management ---
             (ErrorManagement, StateOk) => ReadInputs,

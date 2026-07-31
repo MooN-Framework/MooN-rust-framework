@@ -79,12 +79,18 @@ pub enum Payload<P: CyclePayload> {
     /// Cristian-Request. `t1` = Sendezeit auf der Uhr des Anfragers (ns).
     /// Identisch mit dem Header-`timestamp`, wird zusaetzlich hier gefuehrt,
     /// damit die Sync-Logik unabhaengig vom Header-Layout bleibt.
-    TimeSyncReq { t1: u64 },
+    TimeSyncReq {
+        t1: u64,
+    },
     /// Cristian-Response. `t1` = Echo aus Request, `t2` = Empfangszeit beim
     /// Responder, `t3` = Sendezeit der Antwort (beide auf der Responder-Uhr).
     /// Der Requester misst `t4` lokal beim Empfang und bildet daraus RTT +
     /// Fehlerband. `t3` ist identisch mit dem Header-`timestamp`.
-    TimeSyncResp { t1: u64, t2: u64, t3: u64 },
+    TimeSyncResp {
+        t1: u64,
+        t2: u64,
+        t3: u64,
+    },
 }
 
 // -------------------------------------------------------------

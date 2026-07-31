@@ -299,11 +299,7 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             .offset_ns;
         // local = peer_ts - offset, defensiv gegen Underflow.
         let local = (peer_ts as i128) - (offset as i128);
-        if local < 0 {
-            None
-        } else {
-            Some(local as u64)
-        }
+        if local < 0 { None } else { Some(local as u64) }
     }
 
     // ---- Accessors ----
