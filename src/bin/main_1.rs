@@ -45,7 +45,7 @@ fn main() {
     .expect("transport init failed");
 
     let timing = CycleTiming {
-        cycle_duration: Duration::from_millis(2000),
+        cycle_duration: Duration::from_millis(5000),
         init_sync_timeout: Duration::from_millis(10000),
         cycle_sync_timeout: Duration::from_millis(10000),
         share_timeout: Duration::from_millis(10000),
@@ -53,7 +53,7 @@ fn main() {
         peer_sync_request_interval: Duration::from_millis(2),
         peer_sync_timeout: Duration::from_millis(500),
         stale_threshold: Duration::from_millis(50),
-        resync_interval_cycles: 6000,
+        resync_interval_cycles: 2,
     };
 
     // -------------------------------------------------------------

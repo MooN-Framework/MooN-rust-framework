@@ -227,7 +227,8 @@ where
                 // wir versuchen, die verpasste Zeit im naechsten Zyklus aufzuholen,
                 // was die Zyklusdauer verzerrt.
                 self.next_cycle_deadline = None;
-
+                self.last_cycle_start = None;
+                
                 self.state.start_new_cycle(self.next_cycle_tick());
                 return StateEvent::PeerSyncOk;
             }
