@@ -34,13 +34,30 @@ pub trait Voter {
     /// Mindestanzahl vorliegender Antworten (inkl. eigener), damit `decide`
     /// nicht sofort `InsufficientQuorum` liefert. Bei 2oo3: 2.
     fn required_participants(&self) -> u8;
+
+    /// Nach `decide` mit `Consensus` aufzurufen. Identifiziert Werte, die
+    /// nicht mit der Consensus-Entscheidung uebereinstimmen.
+    ///
+    /// Rueckgabe:
+    /// - `own_dissented`: true wenn der eigene Wert von der Consensus-
+    ///   Entscheidung abwich. In diesem Fall ist der eigene Node der
+    ///   Ausreisser und sollte sich isolieren.
+    /// - `peer_dissenter_indices`: Indizes in den urspruenglichen
+    ///   `peers`-Slice, deren Wert von der Consensus-Entscheidung abwich.
+    ///
+    /// Wird ausschliesslich nach `Consensus` aufgerufen — bei
+    /// `Disagreement` oder `InsufficientQuorum` gibt es keine Referenz
+    /// zum Vergleichen.
+    fn find_dissenters(
+        &self,
+        own: &Self::Payload,
+        peers: &[Option<Self::Payload>],
+        decision: &Self::Decision,
+    ) -> (bool, heapless::Vec<u8, 16>);
 }
 
 /// Anwendungsspezifische Berechnung: aus Rohdaten (Input) den Wert
 /// erzeugen, der im Zyklus mit den Peers geteilt wird.
-///
-/// Zustandsbehaftet erlaubt (Kalibrierung, Caches, Historie), aber
-/// deterministisch: gleicher Zustand + gleicher Input -> gleicher Output.
 pub trait Computation {
     type Input: Copy;
     type Payload: CyclePayload;

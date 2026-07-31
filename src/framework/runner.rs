@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::framework::peer_sync::{PeerSync, SyncFields, extract_sync_fields};
-use crate::framework::run_state::{AckInfo, RunState};
+use crate::framework::run_state::{AckInfo, FaultKind, PeerHealth, RunState};
 use crate::framework::state_machine::{NodeState, StateEvent};
 use crate::framework::traits::{Computation, DecisionSink, Voter, VotingOutcome};
 use crate::framework::types::PeerMask;
@@ -20,19 +20,13 @@ enum PhaseOutcome {
 
 pub struct CycleTiming {
     pub cycle_duration: Duration,
-    pub init_sync_timeout: Duration,          // z.B. 5s
-    pub peer_sync_timeout: Duration,          // z.B. 500ms
-    pub peer_sync_request_interval: Duration, // z.B. 2ms zwischen Sync-Requests
-    pub cycle_sync_timeout: Duration,         // z.B. 20ms
+    pub init_sync_timeout: Duration,
+    pub peer_sync_timeout: Duration,
+    pub peer_sync_request_interval: Duration,
+    pub cycle_sync_timeout: Duration,
     pub share_timeout: Duration,
     pub ack_timeout: Duration,
-
-    /// Maximal zulaessiges Alter eines empfangenen Frames, bevor er als
-    /// stale verworfen wird. Wird erst nach abgeschlossener Zeitsynchronisation
-    /// ausgewertet.
     pub stale_threshold: Duration,
-
-    /// Anzahl erfolgreicher Zyklen, nach denen periodisch resynchronisiert wird.
     pub resync_interval_cycles: u32,
 }
 
@@ -48,21 +42,8 @@ where
     input: C::Input,
     sink: S,
     timing: CycleTiming,
-
-    /// Zeitpunkt, an dem der letzte Zyklus begonnen hat. Fuer Zyklusdauer-
-    /// Messung (Diagnose).
     last_cycle_start: Option<Instant>,
-
-    /// Absolute Deadline fuer den naechsten Zyklusstart. Wird ausschliesslich
-    /// in `wait_for_next_cycle_tick` fortgeschrieben (Deadline + cycle_duration),
-    /// damit Zyklen nicht driften: ueberzogene Zyklen fressen sich in die
-    /// Reserve des naechsten Zyklus, gleichen aber nicht die absolute
-    /// Ausrichtung an der Startzeit auf.
     next_cycle_deadline: Option<Instant>,
-
-    /// Zaehler fuer die periodische Resync-Ausloesung. Wird nach jedem
-    /// erfolgreichen Publish erhoeht, nach jedem erfolgreichen PeerSync
-    /// auf 0 zurueckgesetzt.
     cycles_since_last_sync: u32,
 }
 
@@ -94,7 +75,6 @@ where
         }
     }
 
-    /// Vom Diagnose-Pfad aufzurufen, wenn per UDP neue Eingaben eintreffen.
     pub fn set_input(&mut self, input: C::Input) {
         debug!("input updated via diagnostic path");
         self.input = input;
@@ -187,7 +167,6 @@ where
         }
     }
 
-    /// Zeitsynchronisation zu allen entdeckten Peers nach Cristian.
     fn handle_peer_sync(&mut self) -> StateEvent {
         debug!(
             cycles_since_last_sync = self.cycles_since_last_sync,
@@ -198,9 +177,18 @@ where
             self.state.invalidate_sync();
         }
 
-        let peer_ids: Vec<u8> = self.state.peers().iter().map(|p| p.id).collect();
+        // Nur mit Peers syncen, die nicht Lost sind. Lost-Peers antworten
+        // nicht mehr; sie einzubeziehen wuerde nur unnoetig zum
+        // peer_sync_timeout laufen.
+        let peer_ids: Vec<u8> = self
+            .state
+            .peers()
+            .iter()
+            .filter(|p| p.health != PeerHealth::Lost)
+            .map(|p| p.id)
+            .collect();
         if peer_ids.is_empty() {
-            error!("peer_sync entered without discovered peers");
+            error!("peer_sync entered without active peers");
             return StateEvent::Fault;
         }
 
@@ -222,13 +210,8 @@ where
                 self.state.set_sync_epsilon(epsilon);
                 self.state.mark_sync_valid();
                 self.cycles_since_last_sync = 0;
-
-                // Nach dem Resync die Cycle-Deadline zuruecksetzen — sonst wuerden
-                // wir versuchen, die verpasste Zeit im naechsten Zyklus aufzuholen,
-                // was die Zyklusdauer verzerrt.
                 self.next_cycle_deadline = None;
                 self.last_cycle_start = None;
-                
                 self.state.start_new_cycle(self.next_cycle_tick());
                 return StateEvent::PeerSyncOk;
             }
@@ -238,8 +221,7 @@ where
                 warn!(
                     peers_with_samples = with_samples,
                     peers_total = peer_ids.len(),
-                    target_samples_per_peer =
-                        crate::framework::peer_sync::SAMPLES_PER_PEER,
+                    target_samples_per_peer = crate::framework::peer_sync::SAMPLES_PER_PEER,
                     "peer sync deadline exceeded"
                 );
                 return StateEvent::PeerSyncTimeout;
@@ -271,8 +253,7 @@ where
                     ..
                 } => match extract_sync_fields(&frame, local_recv_ns) {
                     Some(SyncFields::Request { t1, t2_local, .. }) => {
-                        if let Err(e) =
-                            self.transport.send_time_sync_resp(node_state, t1, t2_local)
+                        if let Err(e) = self.transport.send_time_sync_resp(node_state, t1, t2_local)
                         {
                             warn!(error = ?e, "send_time_sync_resp failed");
                         }
@@ -335,10 +316,12 @@ where
                 StateEvent::CycleSyncOk
             }
             PhaseOutcome::Timeout => {
+                let synced = peers_synced.get();
                 warn!(
-                    got_mask = peers_synced.get(),
+                    got_mask = synced,
                     expected_mask, "cycle sync deadline exceeded"
                 );
+                self.fault_peers_missing_cycle_sync(synced);
                 StateEvent::CycleSyncTimeout
             }
             PhaseOutcome::Fault => StateEvent::Fault,
@@ -346,9 +329,6 @@ where
     }
 
     fn handle_read_inputs(&mut self) -> StateEvent {
-        // Auf naechsten Zyklus-Tick warten. Muss vor allem anderen passieren,
-        // damit die gemessene Zyklusdauer die tatsaechliche Zykluszeit
-        // widerspiegelt, nicht die Rechendauer eines einzelnen Durchlaufs.
         self.wait_for_next_cycle_tick();
 
         let now = Instant::now();
@@ -401,7 +381,10 @@ where
 
         match outcome {
             PhaseOutcome::Complete => StateEvent::ResultShared,
-            PhaseOutcome::Timeout => StateEvent::ShareResultTimeout,
+            PhaseOutcome::Timeout => {
+                self.fault_peers_missing_result();
+                StateEvent::ShareResultTimeout
+            }
             PhaseOutcome::Fault => StateEvent::Fault,
         }
     }
@@ -430,19 +413,96 @@ where
 
         match outcome {
             PhaseOutcome::Complete => StateEvent::AckReceived,
-            PhaseOutcome::Timeout => StateEvent::AckTimeout,
+            PhaseOutcome::Timeout => {
+                self.fault_peers_missing_ack();
+                StateEvent::AckTimeout
+            }
             PhaseOutcome::Fault => StateEvent::Fault,
         }
     }
 
     fn handle_publish(&mut self) -> StateEvent {
-        match self.state.run_vote() {
-            VotingOutcome::Consensus(decision) => {
-                warn!("Consensus reached, publishing decision");
-                self.sink.publish(&decision);
+        let outcome = self.state.run_vote();
 
-                self.cycles_since_last_sync =
-                    self.cycles_since_last_sync.saturating_add(1);
+        match outcome {
+            VotingOutcome::Consensus(decision) => {
+                // Dissenter-Analyse: hat der Voter Werte gesehen, die zwar
+                // eine Mehrheit erreichten, aber Minderheiten waren?
+                //
+                // Wir muessen own_result und peer_results VOR der
+                // Mutation kopieren, weil find_dissenters immutable auf
+                // self.state.voter zugreift.
+                let own_result = self.state.cycle().own_result;
+                let dissenter_analysis = own_result.map(|own| {
+                    self.state.voter().find_dissenters(
+                        &own,
+                        &self.state.cycle().peer_results,
+                        &decision,
+                    )
+                });
+
+                if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
+                    if own_dissented {
+                        // Wir selbst waren der Ausreisser. Nicht publizieren,
+                        // sondern in Failsafe — von uns aus koennen wir dem
+                        // eigenen Wert nicht mehr trauen.
+                        error!(
+                            own_id = self.state.own_id(),
+                            "own value dissented from consensus, self-isolating to failsafe"
+                        );
+                        return StateEvent::Fault;
+                    }
+
+                    // Peer-Dissenter -> ValueDivergence-Fault zaehlen und
+                    // ueber ErrorManagement rekonfigurieren.
+                    if !peer_dissenter_indices.is_empty() {
+                        let dissenter_ids: Vec<u8> = peer_dissenter_indices
+                            .iter()
+                            .filter_map(|idx| self.state.peers().get(*idx as usize).map(|p| p.id))
+                            .collect();
+
+                        // Publisher publiziert VOR der Rekonfiguration —
+                        // der Consensus ist ja gueltig, nur die
+                        // Minderheit war auffaellig.
+                        let publisher = self.pick_publisher_candidate();
+                        let own_id = self.state.own_id();
+                        if publisher == own_id {
+                            warn!(
+                                publisher,
+                                "Consensus with dissenters — publishing before reconfig"
+                            );
+                            self.sink.publish(&decision);
+                        }
+
+                        for peer_id in dissenter_ids {
+                            warn!(peer_id, "peer value diverged from consensus");
+                            let _ = self
+                                .state
+                                .record_peer_fault(peer_id, FaultKind::ValueDivergence);
+                        }
+                        return StateEvent::DissenterDetected;
+                    }
+                }
+
+                // Sauberer Consensus, keine Dissenter.
+                let publisher = self.pick_publisher_candidate();
+                let own_id = self.state.own_id();
+                if publisher == own_id {
+                    warn!(
+                        publisher,
+                        "Consensus reached — publishing as designated publisher"
+                    );
+                    self.sink.publish(&decision);
+                } else {
+                    debug!(
+                        publisher,
+                        own_id, "Consensus reached — peer is publisher, no local publish"
+                    );
+                }
+
+                self.credit_peers_delivered();
+
+                self.cycles_since_last_sync = self.cycles_since_last_sync.saturating_add(1);
 
                 if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
                     info!(
@@ -456,7 +516,7 @@ where
                 }
             }
             VotingOutcome::Disagreement => {
-                warn!("vote resulted in disagreement");
+                warn!("vote resulted in disagreement (no majority)");
                 StateEvent::StateDiverged
             }
             VotingOutcome::InsufficientQuorum => {
@@ -471,16 +531,43 @@ where
     }
 
     fn handle_error_management(&mut self) -> StateEvent {
+        debug!("handle_error_management entered");
+
+        // 1. Health-Transitions basierend auf den waehrend des letzten
+        //    Zyklus gesammelten Zaehlern anwenden. Einziger Ort im System,
+        //    an dem sich das health-Feld eines Peers aendert.
+        let transitions = self.state.apply_health_transitions();
+        if transitions > 0 {
+            info!(
+                transitions,
+                active_peers = self.state.active_peer_count(),
+                "health transitions applied"
+            );
+        }
+
+        // 2. Neuen Zyklus starten. Die Zaehler-Slots werden geleert
+        //    (peer_results, peer_acks), damit der naechste Zyklus frisch
+        //    startet.
         let next_deadline = self.next_cycle_tick();
-        debug!(next_deadline, "starting next cycle");
         self.state.start_new_cycle(next_deadline);
 
-        if self.any_peer_diverged() {
-            warn!("peer divergence detected during state management");
-            StateEvent::StateDiverged
-        } else {
-            StateEvent::StateOk
+        // 3. Quorum-Check: haben wir noch genug aktive Nodes?
+        if !self.state.quorum_available() {
+            error!(
+                active_peers = self.state.active_peer_count(),
+                required = self.state.voter().required_participants(),
+                "quorum lost, transitioning to failsafe"
+            );
+            return StateEvent::TooFewNodes;
         }
+
+        // 4. Divergenz war der Grund? Dann gilt der Zyklus als nicht
+        //    aufloesbar — auch wenn Quorum nominell reicht.
+        //    (Aktuell wird das ueber State-Event unterschieden; der
+        //    ErrorManagement-Handler selbst kennt nicht den Ausloeser.
+        //    StateDiverged fuehrt aber sowieso zu Failsafe.)
+
+        StateEvent::StateOk
     }
 
     fn enter_failsafe(&mut self) {
@@ -488,6 +575,90 @@ where
             own_id = self.state.own_id(),
             "entering failsafe — emergency brake"
         );
+    }
+
+    // -------------------------------------------------------------
+    // Fehler-Buchhaltung (Zaehler-Update, keine Transitions)
+    // -------------------------------------------------------------
+
+    fn fault_peers_missing_result(&mut self) {
+        let missing_ids: Vec<u8> = self
+            .state
+            .peers()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, p)| {
+                if self.state.cycle().peer_results[idx].is_none() {
+                    Some(p.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for peer_id in missing_ids {
+            let _ = self
+                .state
+                .record_peer_fault(peer_id, FaultKind::MissedShareResult);
+        }
+    }
+
+    fn fault_peers_missing_ack(&mut self) {
+        let missing_ids: Vec<u8> = self
+            .state
+            .peers()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, p)| {
+                if self.state.cycle().peer_acks[idx].is_none() {
+                    Some(p.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for peer_id in missing_ids {
+            let _ = self.state.record_peer_fault(peer_id, FaultKind::MissedAck);
+        }
+    }
+
+    fn fault_peers_missing_cycle_sync(&mut self, synced_mask: u8) {
+        let missing_ids: Vec<u8> = self
+            .state
+            .peers()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, p)| {
+                if (synced_mask & (1 << idx)) == 0 {
+                    Some(p.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for peer_id in missing_ids {
+            let _ = self
+                .state
+                .record_peer_fault(peer_id, FaultKind::MissedCycleSync);
+        }
+    }
+
+    fn credit_peers_delivered(&mut self) {
+        let delivered_ids: Vec<u8> = self
+            .state
+            .peers()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, p)| {
+                if self.state.cycle().peer_results[idx].is_some() {
+                    Some(p.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for peer_id in delivered_ids {
+            let _ = self.state.record_peer_healthy_cycle(peer_id);
+        }
     }
 
     // -------------------------------------------------------------
@@ -502,17 +673,8 @@ where
         (self.state.peers().len() as u8 + 1) >= self.state.voter().required_participants()
     }
 
-    /// Wartet bis zum naechsten geplanten Zyklusstart. Nutzt absolute
-    /// Deadlines, damit sich Ueberziehungen nicht ueber viele Zyklen
-    /// akkumulieren: die Deadline schreibt sich immer um genau `cycle_duration`
-    /// weiter, unabhaengig davon, wie lange der letzte Zyklus wirklich
-    /// gedauert hat.
-    ///
-    /// Beim ersten Aufruf gibt es noch keine Deadline — dann wird sie ab
-    /// jetzt gesetzt und kein Sleep durchgefuehrt.
     fn wait_for_next_cycle_tick(&mut self) {
         let now = Instant::now();
-
         match self.next_cycle_deadline {
             None => {
                 self.next_cycle_deadline = Some(now + self.timing.cycle_duration);
@@ -522,17 +684,13 @@ where
                     sleep(deadline - now);
                 } else {
                     let overrun = now - deadline;
-                    warn!(
-                        overrun_us = overrun.as_micros(),
-                        "cycle overrun, no sleep"
-                    );
+                    warn!(overrun_us = overrun.as_micros(), "cycle overrun, no sleep");
                 }
                 self.next_cycle_deadline = Some(deadline + self.timing.cycle_duration);
             }
         }
     }
 
-    /// Prueft, ob ein Frame als stale zu verwerfen ist.
     fn frame_age_if_stale(&self, frame: &UdpFrame<V::Payload>) -> Option<u64> {
         if !self.state.sync_valid() {
             return None;
@@ -542,15 +700,20 @@ where
         let now = now_monotonic_ns();
         let age = now.saturating_sub(local_send);
         let threshold_ns = self.timing.stale_threshold.as_nanos() as u64;
-        if age > threshold_ns {
-            Some(age)
-        } else {
-            None
-        }
+        if age > threshold_ns { Some(age) } else { None }
     }
 
     fn ingest_frame(&mut self, frame: UdpFrame<V::Payload>) {
         let peer_id = frame.node_id();
+
+        // Lost-Peers werden komplett ignoriert — sie sind vom System
+        // ausgeschlossen und duerfen den Zyklus nicht mehr beeinflussen.
+        if let Some(idx) = self.state.peer_index(peer_id) {
+            if self.state.peers()[idx].health == PeerHealth::Lost {
+                debug!(peer_id, "frame from lost peer dropped");
+                return;
+            }
+        }
 
         if let Some(age) = self.frame_age_if_stale(&frame) {
             let threshold = self.timing.stale_threshold.as_nanos() as u64;
@@ -560,6 +723,7 @@ where
                 threshold_ns = threshold,
                 "stale frame dropped"
             );
+            let _ = self.state.record_peer_fault(peer_id, FaultKind::StaleFrame);
             return;
         }
 
@@ -606,22 +770,17 @@ where
     }
 
     fn pick_publisher_candidate(&self) -> u8 {
-        self.state.own_id()
+        self.state.lowest_alive_id()
     }
 
     fn next_cycle_tick(&self) -> u64 {
         0
     }
 
-    fn any_peer_diverged(&self) -> bool {
-        false
-    }
-
     fn probation_passed(&self) -> bool {
         true
     }
 
-    /// Generischer „periodisch senden + empfangen bis Bedingung erfuellt" Loop.
     fn collect_phase<Snd, Done, Ing>(
         &mut self,
         phase: &'static str,
@@ -675,12 +834,29 @@ where
                     new_session,
                     frame,
                 } => {
-                    warn!(
-                        peer_id,
-                        previous_session, new_session, "peer rebooted mid-phase"
-                    );
-                    self.transport.accept(&frame);
-                    ingest(self, frame);
+                    // Rejoin-Vorsicht: Peers, die als Lost markiert waren,
+                    // duerfen sich nicht automatisch rehabilitieren.
+                    let was_lost = self
+                        .state
+                        .peer_index(peer_id)
+                        .map(|idx| self.state.peers()[idx].health == PeerHealth::Lost)
+                        .unwrap_or(false);
+
+                    if was_lost {
+                        warn!(
+                            peer_id,
+                            previous_session,
+                            new_session,
+                            "rejoin attempt from lost peer ignored (probation not yet implemented)"
+                        );
+                    } else {
+                        warn!(
+                            peer_id,
+                            previous_session, new_session, "peer rebooted mid-phase"
+                        );
+                        self.transport.accept(&frame);
+                        ingest(self, frame);
+                    }
                 }
                 RecvOutcome::TimeSync {
                     frame,

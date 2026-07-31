@@ -18,8 +18,6 @@ pub enum NodeState {
     PublishResult = 0x07,
     ErrorManagement = 0x08,
     Isolation = 0x09,
-    /// Zeitsynchronisation nach Cristian, zwischen Discovery und
-    /// Zyklusbetrieb sowie periodisch zur Kompensation von Uhrendrift.
     PeerSync = 0x0A,
     Failsafe = 0xFF,
 }
@@ -38,7 +36,7 @@ pub enum StateEvent {
     /* CycleSync */
     CycleSyncOk,
     CycleSyncTimeout,
-    /* Operational cycle — Platzhalter, bitte final benennen */
+    /* Operational cycle */
     InputsRead,
     /* Result Events */
     ResultShared,
@@ -48,14 +46,16 @@ pub enum StateEvent {
     AckTimeout,
     /* Publish Events */
     ResultPublished,
-    /// Nach erfolgreicher Publikation ist das periodische Resync-Intervall
-    /// erreicht — statt dem normalen Uebergang nach CycleSync geht's zurueck
-    /// nach PeerSync, um Uhrendrift zu kompensieren.
     ResyncDue,
+    /// Consensus erreicht, aber mindestens ein Peer wich vom Consensus ab.
+    /// Fuehrt nach ErrorManagement, damit die Health-Transition zentral
+    /// angestossen und Peer ggf. isoliert werden kann.
+    DissenterDetected,
     /* Error Management */
     StateOk,
     StateDiverged,
     StateTimeout,
+    TooFewNodes,
     /* Generisch */
     Fault,
 }
@@ -89,13 +89,18 @@ impl NodeState {
             (SendACK, AckTimeout) => ErrorManagement,
             (SendACK, AckReceived) => PublishResult,
 
-            // --- Publish: normal weiter, oder periodischer Resync ---
+            // --- Publish: normal weiter, oder periodischer Resync, oder
+            //     Dissenter erkannt (Rekonfiguration ueber ErrorManagement) ---
             (PublishResult, ResultPublished) => CycleSync,
             (PublishResult, ResyncDue) => PeerSync,
+            (PublishResult, DissenterDetected) => ErrorManagement,
 
             // --- Error management ---
-            (ErrorManagement, StateOk) => ReadInputs,
-            (ErrorManagement, StateDiverged) => Isolation,
+            // Nach jeder Rekonfiguration zurueck ueber CycleSync — Barrier,
+            // damit alle Nodes wieder am selben Zyklus-Tick aufsetzen.
+            (ErrorManagement, StateOk) => CycleSync,
+            (ErrorManagement, StateDiverged) => Failsafe,
+            (ErrorManagement, TooFewNodes) => Failsafe,
 
             // --- Failsafe ist terminal ---
             (Failsafe, _) => Failsafe,

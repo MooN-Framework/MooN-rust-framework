@@ -11,6 +11,67 @@ pub enum PeerHealth {
     Lost,
 }
 
+impl PeerHealth {
+    /// Reine Uebergangsfunktion. Wird ausschliesslich von
+    /// `RunState::apply_health_transitions` in ErrorManagement aufgerufen —
+    /// zaehlerbasierte Updates in den Handlern lassen dieses Feld
+    /// unangetastet, damit die Rekonfiguration zentral bleibt.
+    pub fn transition(
+        current: PeerHealth,
+        consecutive_faults: u32,
+        consecutive_healthy: u32,
+        cfg: &HealthConfig,
+    ) -> PeerHealth {
+        match current {
+            PeerHealth::Lost => PeerHealth::Lost,
+
+            PeerHealth::Alive => {
+                if consecutive_faults >= cfg.suspect_threshold {
+                    PeerHealth::Suspect
+                } else {
+                    PeerHealth::Alive
+                }
+            }
+
+            PeerHealth::Suspect => {
+                if consecutive_healthy >= cfg.recovery_threshold {
+                    PeerHealth::Alive
+                } else if consecutive_faults >= cfg.lost_threshold {
+                    PeerHealth::Lost
+                } else {
+                    PeerHealth::Suspect
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    MissedShareResult,
+    MissedAck,
+    MissedCycleSync,
+    ValueDivergence,
+    StaleFrame,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HealthConfig {
+    pub suspect_threshold: u32,
+    pub lost_threshold: u32,
+    pub recovery_threshold: u32,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            suspect_threshold: 3,
+            lost_threshold: 10,
+            recovery_threshold: 20,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PeerInfo {
     pub id: u8,
@@ -19,6 +80,8 @@ pub struct PeerInfo {
     pub last_state_wire: u8,
     pub last_seen_cycle: u32,
     pub health: PeerHealth,
+    pub consecutive_faults: u32,
+    pub consecutive_healthy_cycles: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -46,7 +109,6 @@ pub enum DiscoveryError {
     UnknownPeer,
 }
 
-/// Zyklus-lokaler Zustand. Wird bei jedem Zyklusstart zurueckgesetzt.
 pub struct CycleState<P: CyclePayload, const N: usize> {
     pub own_result: Option<P>,
     pub peer_results: Vec<Option<P>, N>,
@@ -76,48 +138,26 @@ impl<P: CyclePayload, const N: usize> CycleState<P, N> {
     }
 }
 
-/// Kompletter Laufzeitzustand eines Nodes.
-///
-/// Generisch ueber:
-///   V: die anwendungsspezifische Voting-Logik (bestimmt auch den Payload-Typ)
-///   N: die maximale Anzahl Peers (compile-time Obergrenze; tatsaechliche
-///      Anzahl wird beim Discovery befuellt).
 pub struct RunState<V: Voter, const N: usize> {
-    // session-persistent
     own_id: u8,
     session_id: u64,
     voter: V,
 
-    // node-level
     node_state: NodeState,
     system_state: SystemState,
     current_seq: u32,
     probation: Option<ProbationInfo>,
 
-    // peers: nach Discovery befuellt, Laenge <= N
+    health_config: HealthConfig,
+
     peers: Vec<PeerInfo, N>,
 
-    // Ergebnis der PeerSync-Phase: Uhrenoffsets zu jedem Peer, jeweils mit
-    // bewiesener Fehlerschranke. Wird nach `handle_peer_sync` befuellt und
-    // im weiteren Betrieb nur gelesen.
     peer_clocks: Vec<PeerClock, N>,
-
-    // Maximale Fehlerschranke ueber alle Peers in ns.
-    // Geht als epsilon in die Voter-Timeout-Auslegung ein.
     sync_epsilon_ns: i64,
-
-    // Ist die Zeitsynchronisation erfolgreich abgeschlossen? Vor dem
-    // ersten erfolgreichen PeerSync sind Timestamps in eingehenden Frames
-    // nur Rohdaten und duerfen NICHT fuer Stale-Frame-Erkennung, Cycle-
-    // Alignment oder aehnliches ausgewertet werden. Nach dem Setzen sind
-    // die Offsets in `peer_clocks` gueltig und Timestamps koennen ueber
-    // `peer_ts_to_local` in die eigene Uhr umgerechnet werden.
     sync_valid: bool,
 
-    // zyklus-lokal
     cycle: CycleState<V::Payload, N>,
 
-    // letzte Voting-Entscheidung fuer Publikation und State-Management
     last_decision: Option<VotingOutcome<V::Decision>>,
 }
 
@@ -131,6 +171,7 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             system_state: SystemState::Startup,
             current_seq: 0,
             probation: None,
+            health_config: HealthConfig::default(),
             peers: Vec::new(),
             peer_clocks: Vec::new(),
             sync_epsilon_ns: 0,
@@ -140,6 +181,14 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         }
     }
 
+    pub fn set_health_config(&mut self, cfg: HealthConfig) {
+        self.health_config = cfg;
+    }
+
+    pub fn health_config(&self) -> &HealthConfig {
+        &self.health_config
+    }
+
     // ---- Discovery ----
 
     pub fn on_peer_discovered(&mut self, id: u8) -> Result<(), DiscoveryError> {
@@ -147,7 +196,7 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             return Ok(());
         }
         if self.peers.iter().any(|p| p.id == id) {
-            return Ok(()); // idempotent
+            return Ok(());
         }
         let mask_bit = self.peers.len() as u8;
         self.peers
@@ -158,12 +207,12 @@ impl<V: Voter, const N: usize> RunState<V, N> {
                 last_state_wire: 0,
                 last_seen_cycle: 0,
                 health: PeerHealth::Alive,
+                consecutive_faults: 0,
+                consecutive_healthy_cycles: 0,
             })
             .map_err(|_| DiscoveryError::TooManyPeers)
     }
 
-    /// Peer-Set einfrieren. Sortierung nach node_id -> deterministische
-    /// Mask-Bit-Vergabe ohne Verhandlung zwischen den Nodes.
     pub fn finalize_discovery(&mut self) -> Result<(), DiscoveryError> {
         let participants = self.peers.len() as u8 + 1;
         if participants < self.voter.required_participants() {
@@ -239,11 +288,112 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         mask
     }
 
+    // ---- Fehler-Buchhaltung (nur Zaehler) ----
+
+    /// Erhoeht `consecutive_faults`, resettet `consecutive_healthy_cycles`.
+    /// Aendert das `health`-Feld NICHT — Transitions passieren
+    /// ausschliesslich in `apply_health_transitions`, aufgerufen von
+    /// ErrorManagement.
+    pub fn record_peer_fault(
+        &mut self,
+        peer_id: u8,
+        kind: FaultKind,
+    ) -> Result<(), DiscoveryError> {
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
+        let peer = &mut self.peers[idx];
+        peer.consecutive_faults = peer.consecutive_faults.saturating_add(1);
+        peer.consecutive_healthy_cycles = 0;
+        debug!(
+            peer_id,
+            fault_kind = ?kind,
+            consecutive_faults = peer.consecutive_faults,
+            "peer fault counter incremented"
+        );
+        Ok(())
+    }
+
+    /// Erhoeht `consecutive_healthy_cycles`, resettet `consecutive_faults`.
+    /// Aendert das `health`-Feld NICHT.
+    pub fn record_peer_healthy_cycle(&mut self, peer_id: u8) -> Result<(), DiscoveryError> {
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
+        let peer = &mut self.peers[idx];
+        peer.consecutive_healthy_cycles = peer.consecutive_healthy_cycles.saturating_add(1);
+        peer.consecutive_faults = 0;
+        Ok(())
+    }
+
+    /// Wendet fuer alle Peers die Transition an, basierend auf ihren
+    /// aktuellen Zaehlerstaenden. Der einzige Ort, an dem sich das
+    /// `health`-Feld eines Peers aendert.
+    ///
+    /// Wird von `handle_error_management` am Anfang jedes Durchlaufs
+    /// aufgerufen. Rueckgabe: Anzahl der Transitions, die tatsaechlich
+    /// stattgefunden haben (fuer Diagnose / Logging in ErrorManagement).
+    pub fn apply_health_transitions(&mut self) -> usize {
+        let cfg = self.health_config;
+        let mut transitions = 0usize;
+        for peer in self.peers.iter_mut() {
+            let old = peer.health;
+            let new = PeerHealth::transition(
+                peer.health,
+                peer.consecutive_faults,
+                peer.consecutive_healthy_cycles,
+                &cfg,
+            );
+            if new != old {
+                warn!(
+                    peer_id = peer.id,
+                    from = ?old,
+                    to = ?new,
+                    consecutive_faults = peer.consecutive_faults,
+                    consecutive_healthy = peer.consecutive_healthy_cycles,
+                    "peer health transitioned in ErrorManagement"
+                );
+                peer.health = new;
+                transitions += 1;
+            }
+        }
+        transitions
+    }
+
+    pub fn peers_with_health(&self, health: PeerHealth) -> usize {
+        self.peers.iter().filter(|p| p.health == health).count()
+    }
+
+    pub fn active_peer_count(&self) -> usize {
+        self.peers
+            .iter()
+            .filter(|p| p.health != PeerHealth::Lost)
+            .count()
+    }
+
+    /// Kleinste ID unter allen Nodes, die aktuell als Publisher taugen
+    /// (nur Alive). Eigener Node wird immer als Alive betrachtet.
+    pub fn lowest_alive_id(&self) -> u8 {
+        let mut min_id = self.own_id;
+        for peer in self.peers.iter() {
+            if peer.health == PeerHealth::Alive && peer.id < min_id {
+                min_id = peer.id;
+            }
+        }
+        min_id
+    }
+
+    pub fn has_alive_peer(&self) -> bool {
+        self.peers.iter().any(|p| p.health == PeerHealth::Alive)
+    }
+
+    pub fn quorum_available(&self) -> bool {
+        let active_total = 1 + self.active_peer_count();
+        active_total >= self.voter.required_participants() as usize
+    }
+
     // ---- PeerSync-Ergebnis ----
 
-    /// Uebernimmt die vom PeerSync-Modul ermittelten Uhrenoffsets.
-    /// Uebersteigende Eintraege (theoretisch nicht moeglich, da |peer_clocks|
-    /// <= |peers| <= N) werden verworfen und geloggt.
     pub fn set_peer_clocks(&mut self, clocks: &[PeerClock]) {
         self.peer_clocks.clear();
         for c in clocks {
@@ -266,14 +416,11 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         self.sync_epsilon_ns
     }
 
-    /// Als gueltig markieren nach erfolgreichem PeerSync.
     pub fn mark_sync_valid(&mut self) {
         self.sync_valid = true;
         info!("time sync marked valid");
     }
 
-    /// Als ungueltig markieren, z.B. bei Peer-Rejoin oder erkannter
-    /// Uhrendrift, die eine erneute Synchronisation erfordert.
     pub fn invalidate_sync(&mut self) {
         self.sync_valid = false;
         warn!("time sync invalidated");
@@ -283,11 +430,6 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         self.sync_valid
     }
 
-    /// Rechnet einen Zeitstempel des angegebenen Peers auf die eigene Uhr um.
-    /// Liefert None, wenn fuer diesen Peer kein Offset bekannt ist ODER
-    /// die Zeitsynchronisation noch nicht gueltig ist. Der zweite Check
-    /// verhindert, dass Aufrufer versehentlich mit Rohdaten arbeiten, die
-    /// vor PeerSync auf der Leitung waren.
     pub fn peer_ts_to_local(&self, peer_id: u8, peer_ts: u64) -> Option<u64> {
         if !self.sync_valid {
             return None;
@@ -297,7 +439,6 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             .iter()
             .find(|c| c.peer_id == peer_id)?
             .offset_ns;
-        // local = peer_ts - offset, defensiv gegen Underflow.
         let local = (peer_ts as i128) - (offset as i128);
         if local < 0 { None } else { Some(local as u64) }
     }
@@ -336,5 +477,58 @@ impl<V: Voter, const N: usize> RunState<V, N> {
     }
     pub fn voter(&self) -> &V {
         &self.voter
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> HealthConfig {
+        HealthConfig {
+            suspect_threshold: 3,
+            lost_threshold: 10,
+            recovery_threshold: 20,
+        }
+    }
+
+    #[test]
+    fn alive_stays_alive_below_threshold() {
+        assert_eq!(
+            PeerHealth::transition(PeerHealth::Alive, 2, 0, &cfg()),
+            PeerHealth::Alive
+        );
+    }
+
+    #[test]
+    fn alive_becomes_suspect_at_threshold() {
+        assert_eq!(
+            PeerHealth::transition(PeerHealth::Alive, 3, 0, &cfg()),
+            PeerHealth::Suspect
+        );
+    }
+
+    #[test]
+    fn suspect_recovers_at_threshold() {
+        assert_eq!(
+            PeerHealth::transition(PeerHealth::Suspect, 0, 20, &cfg()),
+            PeerHealth::Alive
+        );
+    }
+
+    #[test]
+    fn suspect_becomes_lost_at_threshold() {
+        assert_eq!(
+            PeerHealth::transition(PeerHealth::Suspect, 10, 0, &cfg()),
+            PeerHealth::Lost
+        );
+    }
+
+    #[test]
+    fn lost_is_terminal() {
+        assert_eq!(
+            PeerHealth::transition(PeerHealth::Lost, 0, 1000, &cfg()),
+            PeerHealth::Lost
+        );
     }
 }

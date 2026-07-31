@@ -132,4 +132,25 @@ impl Voter for BrakeVoter {
 
         VotingOutcome::Disagreement
     }
+
+        fn find_dissenters(
+        &self,
+        own: &BrakeResult,
+        peers: &[Option<BrakeResult>],
+        decision: &BrakeResult,
+    ) -> (bool, heapless::Vec<u8, 16>) {
+        let own_dissented = !self.agree(own, decision);
+
+        let mut peer_dissenter_indices = heapless::Vec::<u8, 16>::new();
+
+        for (idx, peer) in peers.iter().enumerate() {
+            if let Some(peer_value) = peer {
+                if !self.agree(peer_value, decision) {
+                    let _ = peer_dissenter_indices.push(idx as u8);
+                }
+            }
+        }
+
+        (own_dissented, peer_dissenter_indices)
+    }
 }
