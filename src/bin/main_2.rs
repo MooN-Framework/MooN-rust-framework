@@ -21,7 +21,7 @@ fn main() {
     // Bei 2-oo-3 sind 2 Peers aktiv; N=7 laesst bis zu 8 Nodes zu.
     const NUM_PEERS: usize = 2;
 
-    let own_id: u8 = 0;
+    let own_id: u8 = 2;
     let session_id: u64 = fresh_session_id();
     let interface_name: String = "lo".into();
 
