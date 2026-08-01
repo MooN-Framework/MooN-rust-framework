@@ -8,6 +8,7 @@ use swb_fault_tolerance::framework::diagnostic::DiagnosticConfig;
 use swb_fault_tolerance::framework::run_state::RunState;
 use swb_fault_tolerance::framework::runner::{CycleTiming, Runner};
 use swb_fault_tolerance::framework::udp_transport::{TransportConfig, UdpTransport};
+use swb_fault_tolerance::framework::config::ParticipantConfig;
 
 fn main() {
     // -------------------------------------------------------------
@@ -28,11 +29,14 @@ fn main() {
     // Framework-Komponenten
     // -------------------------------------------------------------
 
-    let voter = BrakeVoter::new(
-        /* required */ 1, /* distance_tolerance in Metern */ 0.5,
+    let participants = ParticipantConfig::new(2, 3);   // 2oo3
+    let voter = BrakeVoter::new(participants.min_participants, 0.5);
+    let state: RunState<BrakeVoter> = RunState::new(
+        own_id,
+        session_id,
+        voter,
+        participants,
     );
-
-    let state: RunState<BrakeVoter, MAX_PEERS> = RunState::new(own_id, session_id, voter);
 
     let transport = UdpTransport::<_>::new(TransportConfig {
         interface_name,
@@ -47,10 +51,10 @@ fn main() {
     let timing = CycleTiming {
         cycle_duration: Duration::from_millis(2000),
         init_sync_timeout: Duration::from_millis(10000),
-        cycle_sync_timeout: Duration::from_millis(5),
-        share_timeout: Duration::from_millis(5),
-        ack_timeout: Duration::from_millis(5),
-        peer_sync_request_interval: Duration::from_millis(2),
+        cycle_sync_timeout: Duration::from_millis(50),
+        share_timeout: Duration::from_millis(50),
+        ack_timeout: Duration::from_millis(50),
+        peer_sync_request_interval: Duration::from_millis(1),
         peer_sync_timeout: Duration::from_millis(500),
         stale_threshold: Duration::from_millis(50),
         resync_interval_cycles: 30,

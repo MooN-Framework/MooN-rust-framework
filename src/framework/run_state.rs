@@ -1,3 +1,4 @@
+use crate::framework::config::{MAX_PEERS, ParticipantConfig};
 use crate::framework::peer_sync::PeerClock;
 use crate::framework::state_machine::{NodeState, SystemState};
 use crate::framework::traits::{CyclePayload, Voter, VotingOutcome};
@@ -13,9 +14,7 @@ pub enum PeerHealth {
 
 impl PeerHealth {
     /// Reine Uebergangsfunktion. Wird ausschliesslich von
-    /// `RunState::apply_health_transitions` in ErrorManagement aufgerufen —
-    /// zaehlerbasierte Updates in den Handlern lassen dieses Feld
-    /// unangetastet, damit die Rekonfiguration zentral bleibt.
+    /// `RunState::apply_health_transitions` in ErrorManagement aufgerufen.
     pub fn transition(
         current: PeerHealth,
         consecutive_faults: u32,
@@ -102,21 +101,25 @@ pub enum ProbationReason {
     LatePeer,
 }
 
+/// Fehler bei Peer-Discovery und -Verwaltung.
+///
+/// `WrongNodeCount` wird zum Ende der Discovery zurueckgegeben, wenn
+/// die Anzahl gefundener Nodes nicht mit `nominal_participants`
+/// uebereinstimmt (weder zuwenig noch zuviel — striktes ==).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryError {
-    TooManyPeers,
-    NotEnoughPeers,
+    WrongNodeCount { found: u8, expected: u8 },
     UnknownPeer,
 }
 
-pub struct CycleState<P: CyclePayload, const N: usize> {
+pub struct CycleState<P: CyclePayload> {
     pub own_result: Option<P>,
-    pub peer_results: Vec<Option<P>, N>,
-    pub peer_acks: Vec<Option<AckInfo>, N>,
+    pub peer_results: Vec<Option<P>, MAX_PEERS>,
+    pub peer_acks: Vec<Option<AckInfo>, MAX_PEERS>,
     pub phase_deadline: u64,
 }
 
-impl<P: CyclePayload, const N: usize> CycleState<P, N> {
+impl<P: CyclePayload> CycleState<P> {
     pub const fn empty() -> Self {
         Self {
             own_result: None,
@@ -138,10 +141,11 @@ impl<P: CyclePayload, const N: usize> CycleState<P, N> {
     }
 }
 
-pub struct RunState<V: Voter, const N: usize> {
+pub struct RunState<V: Voter> {
     own_id: u8,
     session_id: u64,
     voter: V,
+    participants: ParticipantConfig,
 
     node_state: NodeState,
     system_state: SystemState,
@@ -150,29 +154,40 @@ pub struct RunState<V: Voter, const N: usize> {
 
     health_config: HealthConfig,
 
-    peers: Vec<PeerInfo, N>,
+    peers: Vec<PeerInfo, MAX_PEERS>,
+    /// True sobald Discovery mit korrekter Node-Anzahl abgeschlossen ist.
+    /// Danach werden keine neuen Peers mehr aufgenommen — Frames von
+    /// unbekannten Peers werden vom Runner verworfen.
+    discovery_locked: bool,
 
-    peer_clocks: Vec<PeerClock, N>,
+    peer_clocks: Vec<PeerClock, MAX_PEERS>,
     sync_epsilon_ns: i64,
     sync_valid: bool,
 
-    cycle: CycleState<V::Payload, N>,
+    cycle: CycleState<V::Payload>,
 
     last_decision: Option<VotingOutcome<V::Decision>>,
 }
 
-impl<V: Voter, const N: usize> RunState<V, N> {
-    pub fn new(own_id: u8, session_id: u64, voter: V) -> Self {
+impl<V: Voter> RunState<V> {
+    pub fn new(
+        own_id: u8,
+        session_id: u64,
+        voter: V,
+        participants: ParticipantConfig,
+    ) -> Self {
         Self {
             own_id,
             session_id,
             voter,
+            participants,
             node_state: NodeState::Startup,
             system_state: SystemState::Startup,
             current_seq: 0,
             probation: None,
             health_config: HealthConfig::default(),
             peers: Vec::new(),
+            discovery_locked: false,
             peer_clocks: Vec::new(),
             sync_epsilon_ns: 0,
             sync_valid: false,
@@ -189,8 +204,24 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         &self.health_config
     }
 
+    pub fn participants(&self) -> &ParticipantConfig {
+        &self.participants
+    }
+
+    pub fn discovery_locked(&self) -> bool {
+        self.discovery_locked
+    }
+
     // ---- Discovery ----
 
+    /// Neuen Peer aufnehmen. Ignoriert wenn:
+    /// - id == own_id
+    /// - Peer bereits bekannt
+    /// - Discovery abgeschlossen (Lock)
+    /// - Nominale Anzahl bereits erreicht
+    ///
+    /// Kein Err in diesen Faellen — nur Log, weil das kein Fehler ist,
+    /// den der Discovery-Loop verarbeiten muesste.
     pub fn on_peer_discovered(&mut self, id: u8) -> Result<(), DiscoveryError> {
         if id == self.own_id {
             return Ok(());
@@ -198,7 +229,25 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         if self.peers.iter().any(|p| p.id == id) {
             return Ok(());
         }
+        if self.discovery_locked {
+            warn!(id, "discovery locked, ignoring unknown node");
+            return Ok(());
+        }
+        let peers_limit = self.participants.max_peers();
+        if self.peers.len() >= peers_limit {
+            warn!(
+                id,
+                current = self.peers.len(),
+                limit = peers_limit,
+                "already have nominal peer count, ignoring additional node"
+            );
+            return Ok(());
+        }
+
         let mask_bit = self.peers.len() as u8;
+        // push kann nur fehlschlagen wenn peers.len() >= MAX_PEERS — was
+        // durch peers_limit-Check oben ausgeschlossen ist. Falls doch:
+        // struktureller Fehler, Fail-Stop.
         self.peers
             .push(PeerInfo {
                 id,
@@ -210,13 +259,18 @@ impl<V: Voter, const N: usize> RunState<V, N> {
                 consecutive_faults: 0,
                 consecutive_healthy_cycles: 0,
             })
-            .map_err(|_| DiscoveryError::TooManyPeers)
+            .expect("peers.push failed despite limit check");
+        Ok(())
     }
 
+    /// Schliesst die Discovery ab. Verlangt striktes `==` zwischen
+    /// gefundenen Nodes und `nominal_participants`. Weder mehr noch
+    /// weniger. Bei Erfolg wird das Peer-Set gesperrt.
     pub fn finalize_discovery(&mut self) -> Result<(), DiscoveryError> {
-        let participants = self.peers.len() as u8 + 1;
-        if participants < self.voter.required_participants() {
-            return Err(DiscoveryError::NotEnoughPeers);
+        let found = self.peers.len() as u8 + 1;
+        let expected = self.participants.nominal_participants;
+        if found != expected {
+            return Err(DiscoveryError::WrongNodeCount { found, expected });
         }
         self.peers.sort_unstable_by_key(|p| p.id);
         for (i, p) in self.peers.iter_mut().enumerate() {
@@ -226,6 +280,8 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             let _ = self.cycle.peer_results.push(None);
             let _ = self.cycle.peer_acks.push(None);
         }
+        self.discovery_locked = true;
+        info!(nodes = found, "discovery finalized and locked");
         Ok(())
     }
 
@@ -262,21 +318,16 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         Ok(())
     }
 
+    /// Fuehrt das Voting mit dem konfigurierten Voter durch.
+    /// Filtert Lost-Peers raus, damit der Voter die strikte Mehrheit
+    /// aus der Anzahl aktuell vertrauenswuerdiger Nodes berechnet.
     pub fn run_vote(&mut self) -> VotingOutcome<V::Decision> {
         let own = match self.cycle.own_result {
             Some(v) => v,
             None => return VotingOutcome::InsufficientQuorum,
         };
 
-        // Lost-Peers vor dem Voter-Aufruf rausfiltern. Der Voter berechnet
-        // die strikte Mehrheit aus `1 + peers.len()`; wenn Lost-Peers noch
-        // im Slice waeren, wuerden sie in dieser Zaehlung mitwirken und
-        // das Kriterium unangemessen verschaerfen.
-        //
-        // find_dissenters wird spaeter separat mit dem ungefilterten Slice
-        // aufgerufen, damit die zurueckgegebenen Indizes in
-        // self.peers passen (Runner uebersetzt Index -> peer_id).
-        let mut active_slots: Vec<Option<V::Payload>, N> = Vec::new();
+        let mut active_slots: Vec<Option<V::Payload>, MAX_PEERS> = Vec::new();
         for (idx, peer) in self.peers.iter().enumerate() {
             if peer.health != PeerHealth::Lost {
                 let _ = active_slots.push(self.cycle.peer_results[idx]);
@@ -304,12 +355,8 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         mask
     }
 
-    // ---- Fehler-Buchhaltung (nur Zaehler) ----
+    // ---- Fehler-Buchhaltung ----
 
-    /// Erhoeht `consecutive_faults`, resettet `consecutive_healthy_cycles`.
-    /// Aendert das `health`-Feld NICHT — Transitions passieren
-    /// ausschliesslich in `apply_health_transitions`, aufgerufen von
-    /// ErrorManagement.
     pub fn record_peer_fault(
         &mut self,
         peer_id: u8,
@@ -330,8 +377,6 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         Ok(())
     }
 
-    /// Erhoeht `consecutive_healthy_cycles`, resettet `consecutive_faults`.
-    /// Aendert das `health`-Feld NICHT.
     pub fn record_peer_healthy_cycle(
         &mut self,
         peer_id: u8,
@@ -346,13 +391,6 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         Ok(())
     }
 
-    /// Wendet fuer alle Peers die Transition an, basierend auf ihren
-    /// aktuellen Zaehlerstaenden. Der einzige Ort, an dem sich das
-    /// `health`-Feld eines Peers aendert.
-    ///
-    /// Wird von `handle_error_management` am Anfang jedes Durchlaufs
-    /// aufgerufen. Rueckgabe: Anzahl der Transitions, die tatsaechlich
-    /// stattgefunden haben (fuer Diagnose / Logging in ErrorManagement).
     pub fn apply_health_transitions(&mut self) -> usize {
         let cfg = self.health_config;
         let mut transitions = 0usize;
@@ -391,8 +429,6 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             .count()
     }
 
-    /// Kleinste ID unter allen Nodes, die aktuell als Publisher taugen
-    /// (nur Alive). Eigener Node wird immer als Alive betrachtet.
     pub fn lowest_alive_id(&self) -> u8 {
         let mut min_id = self.own_id;
         for peer in self.peers.iter() {
@@ -409,42 +445,22 @@ impl<V: Voter, const N: usize> RunState<V, N> {
 
     pub fn quorum_available(&self) -> bool {
         let active_total = 1 + self.active_peer_count();
-        active_total >= self.voter.required_participants() as usize
+        active_total >= self.participants.min_participants as usize
     }
 
-    /// Mindestanzahl uebereinstimmender Ergebnisse, die aktuell fuer
-    /// eine belastbare Entscheidung noetig sind. Kombiniert die
-    /// mathematische strikte Mehrheit der aktuell aktiven Nodes mit
-    /// dem Systemintegrator-Minimum aus dem Voter.
+    /// Mindestanzahl uebereinstimmender Ergebnisse fuer eine belastbare
+    /// Entscheidung.
     ///
-    /// Formel: `max(floor(N_aktiv / 2) + 1, required_participants)`
+    /// Formel: `max(floor(N_aktiv/2)+1, min_participants)`
     ///
-    /// - Strikte Mehrheit `floor(N/2)+1` schliesst Ties strukturell aus
-    ///   (bei geraden N wuerde `ceil(N/2)` einen 2:2-Tie noch als
-    ///   Mehrheit werten — deshalb `floor(N/2)+1`).
-    /// - `required_participants` erlaubt dem Systemintegrator, ein
-    ///   strengeres Kriterium als reine Mehrheit vorzugeben (z.B. 6oo8).
-    ///
-    /// Aktive Nodes = eigener Node + Peers mit Health != Lost.
+    /// Kombiniert strikte Mehrheit der aktuellen Situation mit dem
+    /// Systemintegrator-Minimum aus ParticipantConfig.
     pub fn required_agreement(&self) -> usize {
         let active_total = 1 + self.active_peer_count();
         let strict_majority = active_total / 2 + 1;
-        strict_majority.max(self.voter.required_participants() as usize)
+        strict_majority.max(self.participants.min_participants as usize)
     }
 
-    /// True, wenn die aktive Node-Anzahl gerade so die aktuell
-    /// benoetigte Uebereinstimmung erreicht — kein Puffer mehr fuer
-    /// weitere Ausfaelle. Weitere Faults sind fatal, weil das System
-    /// unter die Mindestanzahl fallen wuerde.
-    ///
-    /// Beispiele:
-    /// - 2oo3 alle Alive: active=3, required_agreement=2 → 3>2 → false (Puffer)
-    /// - 2oo3 mit einem Lost: active=2, required_agreement=2 → 2<=2 → true
-    /// - 2oo2 alle Alive: active=2, required_agreement=2 → true
-    /// - 6oo8 alle Alive: active=8, required_agreement=6 → false (Puffer 2)
-    /// - 6oo8 mit 2 Lost: active=6, required_agreement=6 → true
-    /// - 4oo8 alle Alive: active=8, required_agreement=5 → false
-    ///   (weil floor(8/2)+1 = 5 > required=4)
     pub fn in_fail_safe_mode(&self) -> bool {
         let active_total = 1 + self.active_peer_count();
         active_total <= self.required_agreement()
@@ -531,7 +547,7 @@ impl<V: Voter, const N: usize> RunState<V, N> {
     pub fn peers(&self) -> &[PeerInfo] {
         &self.peers
     }
-    pub fn cycle(&self) -> &CycleState<V::Payload, N> {
+    pub fn cycle(&self) -> &CycleState<V::Payload> {
         &self.cycle
     }
     pub fn last_decision(&self) -> Option<VotingOutcome<V::Decision>> {

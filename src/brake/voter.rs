@@ -1,4 +1,5 @@
 use crate::brake::braking_curve::BrakeResult;
+use crate::framework::config::MAX_TOTAL_NODES;
 use crate::framework::traits::{CyclePayload, Voter, VotingOutcome};
 use crate::framework::wire::{PayloadError, WireReader, WireWriter};
 use heapless::Vec;
@@ -36,9 +37,7 @@ impl CyclePayload for BrakeResult {
 // Voter
 // -------------------------------------------------------------
 
-const MAX_PARTICIPANTS: usize = 2;
-
-/// K-oo-M Voter fuer BrakeResult.
+/// M-oo-N Voter fuer BrakeResult.
 ///
 /// Uebereinstimmung ist definiert als:
 ///   - `emergency_brake` exakt gleich,
@@ -46,19 +45,19 @@ const MAX_PARTICIPANTS: usize = 2;
 ///   - `|a.total_distance - b.total_distance| <= distance_tolerance`.
 #[derive(Debug, Clone, Copy)]
 pub struct BrakeVoter {
-    pub required: u8,
+    pub min_participants: u8,
     pub distance_tolerance: f64,
 }
 
 impl BrakeVoter {
-    pub fn new(required: u8, distance_tolerance: f64) -> Self {
-        assert!(required >= 1, "required muss >= 1 sein");
+    pub fn new(min_participants: u8, distance_tolerance: f64) -> Self {
+        assert!(min_participants >= 1, "min_participants muss >= 1 sein");
         assert!(
             distance_tolerance >= 0.0 && distance_tolerance.is_finite(),
             "distance_tolerance muss endlich und nicht-negativ sein"
         );
         Self {
-            required,
+            min_participants,
             distance_tolerance,
         }
     }
@@ -74,7 +73,7 @@ impl BrakeVoter {
     }
 
     fn representative(&self, group: &[BrakeResult]) -> BrakeResult {
-        let mut distances: Vec<f64, MAX_PARTICIPANTS> = Vec::new();
+        let mut distances: Vec<f64, MAX_TOTAL_NODES> = Vec::new();
         for r in group {
             let _ = distances.push(r.total_distance);
         }
@@ -94,61 +93,61 @@ impl Voter for BrakeVoter {
     type Decision = BrakeResult;
 
     fn required_participants(&self) -> u8 {
-        self.required
+        self.min_participants
     }
 
-fn decide(
-    &self,
-    own: &BrakeResult,
-    peers: &[Option<BrakeResult>],
-) -> VotingOutcome<BrakeResult> {
-    // n_expected: alle Nodes von denen wir in diesem Zyklus einen Wert
-    // erwarten (eigener + alle Peer-Slots). Lost-Peers sind bereits
-    // durch RunState::run_vote rausgefiltert, tauchen hier nicht auf.
-    let n_expected = 1 + peers.len();
+    fn decide(
+        &self,
+        own: &BrakeResult,
+        peers: &[Option<BrakeResult>],
+    ) -> VotingOutcome<BrakeResult> {
+        // n_expected: alle Nodes von denen wir in diesem Zyklus einen Wert
+        // erwarten (eigener + alle Peer-Slots). Lost-Peers sind bereits
+        // durch RunState::run_vote rausgefiltert, tauchen hier nicht auf.
+        let n_expected = 1 + peers.len();
 
-    // Strikte Mehrheit schliesst Ties strukturell aus:
-    //   n=2 -> 2, n=3 -> 2, n=4 -> 3, n=5 -> 3, n=8 -> 5
-    let strict_majority = n_expected / 2 + 1;
+        // Strikte Mehrheit schliesst Ties strukturell aus:
+        //   n=2 -> 2, n=3 -> 2, n=4 -> 3, n=5 -> 3, n=8 -> 5
+        let strict_majority = n_expected / 2 + 1;
 
-    // Kombination mit Systemintegrator-Vorgabe: `required` als
-    // Untergrenze, falls der Systemintegrator ein strengeres Kriterium
-    // als die reine Mehrheit gesetzt hat (z.B. 6oo8).
-    let min_agreement = strict_majority.max(self.required as usize);
+        // Kombination mit Systemintegrator-Vorgabe: min_participants als
+        // Untergrenze, falls der Systemintegrator ein strengeres Kriterium
+        // als die reine Mehrheit gesetzt hat (z.B. 6oo8).
+        let min_agreement = strict_majority.max(self.min_participants as usize);
 
-    // Vorhandene Werte sammeln
-    let mut all: Vec<BrakeResult, MAX_PARTICIPANTS> = Vec::new();
-    let _ = all.push(*own);
-    for p in peers.iter().flatten() {
-        let _ = all.push(*p);
-    }
+        // Vorhandene Werte sammeln
+        let mut all: Vec<BrakeResult, MAX_TOTAL_NODES> = Vec::new();
+        let _ = all.push(*own);
+        for p in peers.iter().flatten() {
+            let _ = all.push(*p);
+        }
 
-    // Reichen die Antworten ueberhaupt aus, um min_agreement zu erreichen?
-    if all.len() < min_agreement {
-        error!(
-            "insufficient responses: got {} of {} expected, need {} to agree",
-            all.len(),
-            n_expected,
-            min_agreement
-        );
-        return VotingOutcome::InsufficientQuorum;
-    }
+        // Reichen die Antworten ueberhaupt aus, um min_agreement zu erreichen?
+        if all.len() < min_agreement {
+            error!(
+                "insufficient responses: got {} of {} expected, need {} to agree",
+                all.len(),
+                n_expected,
+                min_agreement
+            );
+            return VotingOutcome::InsufficientQuorum;
+        }
 
-    // Suche eine Gruppe uebereinstimmender Werte
-    for candidate in all.iter() {
-        let mut group: Vec<BrakeResult, MAX_PARTICIPANTS> = Vec::new();
-        for other in all.iter() {
-            if self.agree(candidate, other) {
-                let _ = group.push(*other);
+        // Suche eine Gruppe uebereinstimmender Werte
+        for candidate in all.iter() {
+            let mut group: Vec<BrakeResult, MAX_TOTAL_NODES> = Vec::new();
+            for other in all.iter() {
+                if self.agree(candidate, other) {
+                    let _ = group.push(*other);
+                }
+            }
+            if group.len() >= min_agreement {
+                return VotingOutcome::Consensus(self.representative(&group));
             }
         }
-        if group.len() >= min_agreement {
-            return VotingOutcome::Consensus(self.representative(&group));
-        }
-    }
 
-    VotingOutcome::Disagreement
-}
+        VotingOutcome::Disagreement
+    }
 
     fn find_dissenters(
         &self,

@@ -5,6 +5,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+use crate::framework::config::MAX_PEERS;
 use crate::framework::diagnostic::{
     Command, Diagnostic, DiagnosticConfig, InjectionSnapshot, OutgoingTelegram,
     PeerStatus, StatusResponse,
@@ -35,13 +36,13 @@ pub struct CycleTiming {
     pub resync_interval_cycles: u32,
 }
 
-pub struct Runner<C, V, S, const N: usize>
+pub struct Runner<C, V, S>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
 {
-    state: RunState<V, N>,
+    state: RunState<V>,
     transport: UdpTransport<V::Payload>,
     computation: C,
     input: C::Input,
@@ -55,16 +56,15 @@ where
     diagnostic: Option<Diagnostic>,
 }
 
-impl<C, V, S, const N: usize> Runner<C, V, S, N>
+impl<C, V, S> Runner<C, V, S>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
-    // Fuer die Diagnose-Schnittstelle: Input muss aus JSON deserialisierbar sein.
     C::Input: for<'de> Deserialize<'de>,
 {
     pub fn new(
-        state: RunState<V, N>,
+        state: RunState<V>,
         transport: UdpTransport<V::Payload>,
         computation: C,
         input: C::Input,
@@ -144,11 +144,6 @@ where
     // Diagnose
     // -------------------------------------------------------------
 
-    /// Verarbeitet eingehende Diagnose-Telegramme. Kommandos die
-    /// Zustand aendern werden in `diagnostic.pending` gestagt und beim
-    /// naechsten `handle_read_inputs` wirksam. GetStatus wird sofort
-    /// mit vollem Zustand beantwortet, weil der Runner Zugriff auf
-    /// RunState braucht.
     fn poll_diagnostic(&mut self) {
         let Some(mut diag) = self.diagnostic.take() else {
             return;
@@ -164,8 +159,6 @@ where
                     });
                 }
                 _ => {
-                    // Sollte nicht passieren — alle anderen Kommandos
-                    // werden in diag.try_recv() bereits gestagt.
                     debug!("unexpected immediate command returned from diagnostic");
                 }
             }
@@ -174,15 +167,11 @@ where
         self.diagnostic = Some(diag);
     }
 
-    /// Wendet gestagete Diagnose-Aenderungen zu Beginn eines neuen Zyklus
-    /// an. Wird von `handle_read_inputs` VOR der Berechnung aufgerufen,
-    /// damit alle Nodes die Aenderung im selben logischen Zyklus sehen.
     fn apply_pending_diagnostic(&mut self) {
         let Some(diag) = self.diagnostic.as_mut() else {
             return;
         };
 
-        // Input-Update: opaque JSON gegen C::Input deserialisieren.
         if let Some(json) = diag.take_pending_input() {
             match serde_json::from_value::<C::Input>(json) {
                 Ok(new_input) => {
@@ -198,7 +187,6 @@ where
             }
         }
 
-        // Injection-Updates: Zaehler in aktiven State uebertragen.
         diag.apply_pending_injection();
     }
 
@@ -249,7 +237,10 @@ where
     }
 
     fn handle_init_sync(&mut self) -> StateEvent {
-        info!("Init entered");
+        info!(
+            expected = self.state.participants().nominal_participants,
+            "Init entered — waiting for full peer set"
+        );
         let node_state = self.state.node_state();
         let deadline = Instant::now() + self.timing.init_sync_timeout;
 
@@ -273,8 +264,8 @@ where
 
         match outcome {
             PhaseOutcome::Complete => {
-                if self.state.finalize_discovery().is_err() {
-                    error!("finalize_discovery failed");
+                if let Err(e) = self.state.finalize_discovery() {
+                    error!(error = ?e, "finalize_discovery failed");
                     return StateEvent::SelfTestErr;
                 }
                 self.state.start_new_cycle(self.next_cycle_tick());
@@ -283,7 +274,8 @@ where
             PhaseOutcome::Timeout => {
                 warn!(
                     peers_found = self.state.peers().len(),
-                    "discovery window elapsed without enough peers"
+                    expected = self.state.participants().nominal_participants,
+                    "discovery window elapsed without full peer set"
                 );
                 StateEvent::InitialSyncTimeout
             }
@@ -350,19 +342,31 @@ where
             }
 
             if Instant::now() >= next_request {
-                for &peer_id in &peer_ids {
-                    if !peer_sync.has_pending(peer_id) {
-                        match self.transport.send_time_sync_req(node_state) {
-                            Ok((_seq, t1)) => {
-                                peer_sync.record_outgoing_request(peer_id, t1);
-                                next_request =
-                                    Instant::now() + self.timing.peer_sync_request_interval;
-                                break;
+                // Multicast erreicht alle Peers gleichzeitig. Nur senden
+                // wenn mindestens ein Peer noch keine offene Response hat;
+                // sonst warten wir auf die noch offenen Antworten.
+                let any_needs_sync =
+                    peer_ids.iter().any(|&id| !peer_sync.has_pending(id));
+                if any_needs_sync {
+                    match self.transport.send_time_sync_req(node_state) {
+                        Ok((_seq, t1)) => {
+                            // Ein Multicast-Request — allen Peers ohne
+                            // offenen Request wird t1 als erwartete
+                            // Response-Referenz vermerkt. Peers mit noch
+                            // offenem Request behalten ihre alte pending_t1
+                            // (deren spaete Response wird dann normal
+                            // gematcht).
+                            for &peer_id in &peer_ids {
+                                if !peer_sync.has_pending(peer_id) {
+                                    peer_sync.record_outgoing_request(peer_id, t1);
+                                }
                             }
-                            Err(e) => {
-                                error!(error = ?e, "send_time_sync_req failed");
-                                return StateEvent::Fault;
-                            }
+                            next_request =
+                                Instant::now() + self.timing.peer_sync_request_interval;
+                        }
+                        Err(e) => {
+                            error!(error = ?e, "send_time_sync_req failed");
+                            return StateEvent::Fault;
                         }
                     }
                 }
@@ -408,7 +412,7 @@ where
         let outcome = self.collect_phase(
             "cycle_sync",
             deadline,
-            self.timing.cycle_sync_timeout,
+            Duration::from_millis(1),
             |this| {
                 if let Err(e) = this.transport.send_state(node_state) {
                     error!(error = ?e, "send_state failed in cycle sync");
@@ -452,9 +456,6 @@ where
     }
 
     fn handle_read_inputs(&mut self) -> StateEvent {
-        // Gestagete Diagnose-Aenderungen zum Zyklusstart anwenden.
-        // Alle Nodes sind wegen CycleSync-Barrier hier zum selben
-        // logischen Zeitpunkt — Aenderungen wirken damit synchron.
         self.apply_pending_diagnostic();
 
         self.wait_for_next_cycle_tick();
@@ -481,9 +482,6 @@ where
     }
 
     fn handle_share_result(&mut self) -> StateEvent {
-        // Injection: statt wirklich zu senden, wird das Senden fuer diesen
-        // Zyklus unterdrueckt. collect_phase laeuft aber normal, damit wir
-        // eingehende Frames weiter verarbeiten und im Zyklustakt bleiben.
         let suppress_send = if let Some(diag) = self.diagnostic.as_mut() {
             diag.should_drop_result()
         } else {
@@ -507,7 +505,7 @@ where
         let outcome = self.collect_phase(
             "share_result",
             deadline,
-            Duration::from_millis(10),
+            Duration::from_millis(1),
             |this| {
                 if suppress_send {
                     return Ok(());
@@ -551,7 +549,7 @@ where
         let outcome = self.collect_phase(
             "send_ack",
             deadline,
-            Duration::from_millis(10),
+            Duration::from_millis(1),
             |this| {
                 if suppress_send {
                     return Ok(());
@@ -682,27 +680,21 @@ where
         let next_deadline = self.next_cycle_tick();
         self.state.start_new_cycle(next_deadline);
 
-        // Erst pruefen: haben wir noch das Minimum an aktiven Nodes?
         if !self.state.quorum_available() {
             error!(
                 active_peers = self.state.active_peer_count(),
-                required = self.state.voter().required_participants(),
+                min_participants = self.state.participants().min_participants,
                 "quorum lost, transitioning to failsafe"
             );
             return StateEvent::TooFewNodes;
         }
 
-        // Dann pruefen: haben wir noch Puffer? Regel:
-        //   required_agreement = max(floor(N_aktiv/2)+1, required_participants)
-        //   in_fail_safe_mode: active_total <= required_agreement
-        //
-        // Wenn ja: kein Puffer mehr, jeder Fault ist fatal (KooK-Regel:
-        // 2oo2, degradiertes 2oo3, 6oo8 mit 2 Ausfaellen, etc.).
+        // Kein Puffer mehr fuer weitere Ausfaelle: fail-safe.
         if self.state.in_fail_safe_mode() {
             error!(
                 active_peers = self.state.active_peer_count(),
                 required_agreement = self.state.required_agreement(),
-                required_participants = self.state.voter().required_participants(),
+                min_participants = self.state.participants().min_participants,
                 "fail-safe mode: no tolerance buffer left, fault triggers failsafe"
             );
             return StateEvent::TooFewNodes;
@@ -807,7 +799,8 @@ where
     // -------------------------------------------------------------
 
     fn discovery_complete(&self) -> bool {
-        (self.state.peers().len() as u8 + 1) >= self.state.voter().required_participants()
+        let found = self.state.peers().len() as u8 + 1;
+        found == self.state.participants().nominal_participants
     }
 
     fn wait_for_next_cycle_tick(&mut self) {
@@ -850,6 +843,15 @@ where
     fn ingest_frame(&mut self, frame: UdpFrame<V::Payload>) {
         let peer_id = frame.node_id();
 
+        // Nach abgeschlossener Discovery ist das Peer-Set gefroren.
+        // Frames von unbekannten Peers werden abgewiesen — verhindert
+        // dass sich fremde Nodes ins System einschleichen koennen.
+        if self.state.discovery_locked() && self.state.peer_index(peer_id).is_none() {
+            warn!(peer_id, "frame from unknown peer after discovery lock — dropped");
+            return;
+        }
+
+        // Lost-Peers werden komplett ignoriert.
         if let Some(idx) = self.state.peer_index(peer_id) {
             if self.state.peers()[idx].health == PeerHealth::Lost {
                 debug!(peer_id, "frame from lost peer dropped");
@@ -859,20 +861,27 @@ where
 
         if let Some(age) = self.frame_age_if_stale(&frame) {
             let threshold = self.timing.stale_threshold.as_nanos() as u64;
-            warn!(
+            debug!(
                 peer_id,
                 age_ns = age,
                 threshold_ns = threshold,
                 "stale frame dropped"
             );
-            let _ = self.state.record_peer_fault(peer_id, FaultKind::StaleFrame);
+            // Bewusst kein record_peer_fault: Stale-Frames sind ambigu.
+            // Sie koennen von einer echten Peer-Verspaetung stammen oder
+            // von lokalem Buffer-Delay (Sleep zwischen Zyklen sammelt
+            // Frames im OS-Buffer, die dann als "alt" gelesen werden).
+            // Der Peer wird nur ueber Timeouts der jeweiligen Phase
+            // (MissedShareResult, MissedAck, MissedCycleSync) belastet,
+            // wenn er in dieser konkreten Runde nichts liefert. Das ist
+            // eindeutiger als Timestamp-basiertes Stale-Fault-Counting.
             return;
         }
 
         let payload = frame.payload();
         match payload {
             Payload::Result(value) => {
-                warn!(peer_id, "matched Result arm");
+                debug!(peer_id, "matched Result arm");
                 if let Err(e) = self.state.record_peer_result(peer_id, value) {
                     warn!(peer_id, error = ?e, "could not record peer result");
                 }

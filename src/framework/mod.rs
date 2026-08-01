@@ -8,3 +8,4 @@ pub mod types;
 pub mod udp_frame;
 pub mod udp_transport;
 pub mod wire;
+pub mod config;
