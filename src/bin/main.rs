@@ -11,7 +11,7 @@ use swb_fault_tolerance::framework::udp_transport::{TransportConfig, UdpTranspor
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
+        .with_max_level(tracing::Level::INFO)
         .init();
     // -------------------------------------------------------------
     // Konfiguration (spaeter aus Datei/CLI laden)
@@ -30,7 +30,7 @@ fn main() {
     // -------------------------------------------------------------
 
     let voter = BrakeVoter::new(
-        /* required */ 2, /* distance_tolerance in Metern */ 0.5,
+        /* required */ 1, /* distance_tolerance in Metern */ 0.5,
     );
 
     let state: RunState<BrakeVoter, 1> = RunState::new(own_id, session_id, voter);
@@ -48,9 +48,9 @@ fn main() {
     let timing = CycleTiming {
         cycle_duration: Duration::from_millis(2000),
         init_sync_timeout: Duration::from_millis(10000),
-        cycle_sync_timeout: Duration::from_millis(10000),
-        share_timeout: Duration::from_millis(10000),
-        ack_timeout: Duration::from_millis(10000),
+        cycle_sync_timeout: Duration::from_millis(5),
+        share_timeout: Duration::from_millis(5),
+        ack_timeout: Duration::from_millis(5),
         peer_sync_request_interval: Duration::from_millis(2),
         peer_sync_timeout: Duration::from_millis(500),
         stale_threshold: Duration::from_millis(50),

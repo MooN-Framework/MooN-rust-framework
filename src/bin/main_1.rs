@@ -18,7 +18,7 @@ fn main() {
         .init();
     // Kapazitaet des Peer-Arrays (compile-time Obergrenze).
     // Bei 2-oo-3 sind 2 Peers aktiv; N=7 laesst bis zu 8 Nodes zu.
-    const MAX_PEERS: usize = 1;
+    const MAX_PEERS: usize = 2;
 
     let own_id: u8 = 1;
     let session_id: u64 = fresh_session_id();
@@ -29,7 +29,7 @@ fn main() {
     // -------------------------------------------------------------
 
     let voter = BrakeVoter::new(
-        /* required */ 2, /* distance_tolerance in Metern */ 0.5,
+        /* required */ 1, /* distance_tolerance in Metern */ 0.5,
     );
 
     let state: RunState<BrakeVoter, MAX_PEERS> = RunState::new(own_id, session_id, voter);
@@ -47,9 +47,9 @@ fn main() {
     let timing = CycleTiming {
         cycle_duration: Duration::from_millis(2000),
         init_sync_timeout: Duration::from_millis(10000),
-        cycle_sync_timeout: Duration::from_millis(10000),
-        share_timeout: Duration::from_millis(10000),
-        ack_timeout: Duration::from_millis(10000),
+        cycle_sync_timeout: Duration::from_millis(5),
+        share_timeout: Duration::from_millis(5),
+        ack_timeout: Duration::from_millis(5),
         peer_sync_request_interval: Duration::from_millis(2),
         peer_sync_timeout: Duration::from_millis(500),
         stale_threshold: Duration::from_millis(50),

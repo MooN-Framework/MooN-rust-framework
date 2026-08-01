@@ -267,7 +267,23 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             Some(v) => v,
             None => return VotingOutcome::InsufficientQuorum,
         };
-        let outcome = self.voter.decide(&own, &self.cycle.peer_results);
+
+        // Lost-Peers vor dem Voter-Aufruf rausfiltern. Der Voter berechnet
+        // die strikte Mehrheit aus `1 + peers.len()`; wenn Lost-Peers noch
+        // im Slice waeren, wuerden sie in dieser Zaehlung mitwirken und
+        // das Kriterium unangemessen verschaerfen.
+        //
+        // find_dissenters wird spaeter separat mit dem ungefilterten Slice
+        // aufgerufen, damit die zurueckgegebenen Indizes in
+        // self.peers passen (Runner uebersetzt Index -> peer_id).
+        let mut active_slots: Vec<Option<V::Payload>, N> = Vec::new();
+        for (idx, peer) in self.peers.iter().enumerate() {
+            if peer.health != PeerHealth::Lost {
+                let _ = active_slots.push(self.cycle.peer_results[idx]);
+            }
+        }
+
+        let outcome = self.voter.decide(&own, &active_slots);
         self.last_decision = Some(outcome);
         outcome
     }
@@ -316,12 +332,16 @@ impl<V: Voter, const N: usize> RunState<V, N> {
 
     /// Erhoeht `consecutive_healthy_cycles`, resettet `consecutive_faults`.
     /// Aendert das `health`-Feld NICHT.
-    pub fn record_peer_healthy_cycle(&mut self, peer_id: u8) -> Result<(), DiscoveryError> {
+    pub fn record_peer_healthy_cycle(
+        &mut self,
+        peer_id: u8,
+    ) -> Result<(), DiscoveryError> {
         let idx = self
             .peer_index(peer_id)
             .ok_or(DiscoveryError::UnknownPeer)?;
         let peer = &mut self.peers[idx];
-        peer.consecutive_healthy_cycles = peer.consecutive_healthy_cycles.saturating_add(1);
+        peer.consecutive_healthy_cycles =
+            peer.consecutive_healthy_cycles.saturating_add(1);
         peer.consecutive_faults = 0;
         Ok(())
     }
@@ -392,6 +412,44 @@ impl<V: Voter, const N: usize> RunState<V, N> {
         active_total >= self.voter.required_participants() as usize
     }
 
+    /// Mindestanzahl uebereinstimmender Ergebnisse, die aktuell fuer
+    /// eine belastbare Entscheidung noetig sind. Kombiniert die
+    /// mathematische strikte Mehrheit der aktuell aktiven Nodes mit
+    /// dem Systemintegrator-Minimum aus dem Voter.
+    ///
+    /// Formel: `max(floor(N_aktiv / 2) + 1, required_participants)`
+    ///
+    /// - Strikte Mehrheit `floor(N/2)+1` schliesst Ties strukturell aus
+    ///   (bei geraden N wuerde `ceil(N/2)` einen 2:2-Tie noch als
+    ///   Mehrheit werten — deshalb `floor(N/2)+1`).
+    /// - `required_participants` erlaubt dem Systemintegrator, ein
+    ///   strengeres Kriterium als reine Mehrheit vorzugeben (z.B. 6oo8).
+    ///
+    /// Aktive Nodes = eigener Node + Peers mit Health != Lost.
+    pub fn required_agreement(&self) -> usize {
+        let active_total = 1 + self.active_peer_count();
+        let strict_majority = active_total / 2 + 1;
+        strict_majority.max(self.voter.required_participants() as usize)
+    }
+
+    /// True, wenn die aktive Node-Anzahl gerade so die aktuell
+    /// benoetigte Uebereinstimmung erreicht — kein Puffer mehr fuer
+    /// weitere Ausfaelle. Weitere Faults sind fatal, weil das System
+    /// unter die Mindestanzahl fallen wuerde.
+    ///
+    /// Beispiele:
+    /// - 2oo3 alle Alive: active=3, required_agreement=2 → 3>2 → false (Puffer)
+    /// - 2oo3 mit einem Lost: active=2, required_agreement=2 → 2<=2 → true
+    /// - 2oo2 alle Alive: active=2, required_agreement=2 → true
+    /// - 6oo8 alle Alive: active=8, required_agreement=6 → false (Puffer 2)
+    /// - 6oo8 mit 2 Lost: active=6, required_agreement=6 → true
+    /// - 4oo8 alle Alive: active=8, required_agreement=5 → false
+    ///   (weil floor(8/2)+1 = 5 > required=4)
+    pub fn in_fail_safe_mode(&self) -> bool {
+        let active_total = 1 + self.active_peer_count();
+        active_total <= self.required_agreement()
+    }
+
     // ---- PeerSync-Ergebnis ----
 
     pub fn set_peer_clocks(&mut self, clocks: &[PeerClock]) {
@@ -440,7 +498,11 @@ impl<V: Voter, const N: usize> RunState<V, N> {
             .find(|c| c.peer_id == peer_id)?
             .offset_ns;
         let local = (peer_ts as i128) - (offset as i128);
-        if local < 0 { None } else { Some(local as u64) }
+        if local < 0 {
+            None
+        } else {
+            Some(local as u64)
+        }
     }
 
     // ---- Accessors ----

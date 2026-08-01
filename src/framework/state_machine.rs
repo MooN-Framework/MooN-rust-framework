@@ -90,10 +90,12 @@ impl NodeState {
             (SendACK, AckReceived) => PublishResult,
 
             // --- Publish: normal weiter, oder periodischer Resync, oder
-            //     Dissenter erkannt (Rekonfiguration ueber ErrorManagement) ---
+            //     Dissenter erkannt (Rekonfiguration ueber ErrorManagement),
+            //     oder keine Mehrheit moeglich (direkt Failsafe) ---
             (PublishResult, ResultPublished) => CycleSync,
             (PublishResult, ResyncDue) => PeerSync,
             (PublishResult, DissenterDetected) => ErrorManagement,
+            (PublishResult, StateDiverged) => Failsafe,
 
             // --- Error management ---
             // Nach jeder Rekonfiguration zurueck ueber CycleSync — Barrier,

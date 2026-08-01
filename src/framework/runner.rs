@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::framework::diagnostic::{
-    Command, Diagnostic, DiagnosticConfig, InjectionSnapshot, OutgoingTelegram, PeerStatus,
-    StatusResponse,
+    Command, Diagnostic, DiagnosticConfig, InjectionSnapshot, OutgoingTelegram,
+    PeerStatus, StatusResponse,
 };
 use crate::framework::peer_sync::{PeerSync, SyncFields, extract_sync_fields};
 use crate::framework::run_state::{AckInfo, FaultKind, PeerHealth, RunState};
@@ -157,7 +157,6 @@ where
         while let Some(immediate) = diag.try_recv() {
             match immediate {
                 Command::GetStatus => {
-                    warn!("received get status.");
                     let status = self.build_status_response(&diag);
                     diag.send(&OutgoingTelegram::Status {
                         source_node_id: diag.node_id(),
@@ -343,7 +342,8 @@ where
                 warn!(
                     peers_with_samples = with_samples,
                     peers_total = peer_ids.len(),
-                    target_samples_per_peer = crate::framework::peer_sync::SAMPLES_PER_PEER,
+                    target_samples_per_peer =
+                        crate::framework::peer_sync::SAMPLES_PER_PEER,
                     "peer sync deadline exceeded"
                 );
                 return StateEvent::PeerSyncTimeout;
@@ -375,7 +375,8 @@ where
                     ..
                 } => match extract_sync_fields(&frame, local_recv_ns) {
                     Some(SyncFields::Request { t1, t2_local, .. }) => {
-                        if let Err(e) = self.transport.send_time_sync_resp(node_state, t1, t2_local)
+                        if let Err(e) =
+                            self.transport.send_time_sync_resp(node_state, t1, t2_local)
                         {
                             warn!(error = ?e, "send_time_sync_resp failed");
                         }
@@ -480,12 +481,16 @@ where
     }
 
     fn handle_share_result(&mut self) -> StateEvent {
-        if let Some(diag) = self.diagnostic.as_mut() {
-            if diag.should_drop_result() {
-                warn!("injection: dropping share_result this cycle");
-                sleep(self.timing.share_timeout);
-                return StateEvent::ShareResultTimeout;
-            }
+        // Injection: statt wirklich zu senden, wird das Senden fuer diesen
+        // Zyklus unterdrueckt. collect_phase laeuft aber normal, damit wir
+        // eingehende Frames weiter verarbeiten und im Zyklustakt bleiben.
+        let suppress_send = if let Some(diag) = self.diagnostic.as_mut() {
+            diag.should_drop_result()
+        } else {
+            false
+        };
+        if suppress_send {
+            warn!("injection: suppressing send_result this cycle");
         }
 
         let own = match self.state.cycle().own_result {
@@ -504,6 +509,9 @@ where
             deadline,
             Duration::from_millis(10),
             |this| {
+                if suppress_send {
+                    return Ok(());
+                }
                 if let Err(e) = this.transport.send_result(node_state, own) {
                     error!(error = ?e, "send_result failed");
                 }
@@ -524,12 +532,13 @@ where
     }
 
     fn handle_send_ack(&mut self) -> StateEvent {
-        if let Some(diag) = self.diagnostic.as_mut() {
-            if diag.should_drop_ack() {
-                warn!("injection: dropping send_ack this cycle");
-                sleep(self.timing.ack_timeout);
-                return StateEvent::AckTimeout;
-            }
+        let suppress_send = if let Some(diag) = self.diagnostic.as_mut() {
+            diag.should_drop_ack()
+        } else {
+            false
+        };
+        if suppress_send {
+            warn!("injection: suppressing send_ack this cycle");
         }
 
         let mask = self.received_mask();
@@ -544,6 +553,9 @@ where
             deadline,
             Duration::from_millis(10),
             |this| {
+                if suppress_send {
+                    return Ok(());
+                }
                 if let Err(e) = this.transport.send_ack(node_state, mask, candidate) {
                     error!(error = ?e, "send_ack failed");
                 }
@@ -570,11 +582,9 @@ where
             VotingOutcome::Consensus(decision) => {
                 let own_result = self.state.cycle().own_result;
                 let dissenter_analysis = own_result.map(|own| {
-                    self.state.voter().find_dissenters(
-                        &own,
-                        &self.state.cycle().peer_results,
-                        &decision,
-                    )
+                    self.state
+                        .voter()
+                        .find_dissenters(&own, &self.state.cycle().peer_results, &decision)
                 });
 
                 if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
@@ -589,7 +599,9 @@ where
                     if !peer_dissenter_indices.is_empty() {
                         let dissenter_ids: Vec<u8> = peer_dissenter_indices
                             .iter()
-                            .filter_map(|idx| self.state.peers().get(*idx as usize).map(|p| p.id))
+                            .filter_map(|idx| {
+                                self.state.peers().get(*idx as usize).map(|p| p.id)
+                            })
                             .collect();
 
                         let publisher = self.pick_publisher_candidate();
@@ -615,18 +627,19 @@ where
                 let publisher = self.pick_publisher_candidate();
                 let own_id = self.state.own_id();
                 if publisher == own_id {
-                    warn!(
-                        publisher,
-                        "Consensus reached — publishing as designated publisher"
-                    );
+                    warn!(publisher, "Consensus reached — publishing as designated publisher");
                     self.sink.publish(&decision);
                 } else {
-                    debug!(publisher, own_id, "Consensus reached — peer is publisher");
+                    debug!(
+                        publisher,
+                        own_id, "Consensus reached — peer is publisher"
+                    );
                 }
 
                 self.credit_peers_delivered();
 
-                self.cycles_since_last_sync = self.cycles_since_last_sync.saturating_add(1);
+                self.cycles_since_last_sync =
+                    self.cycles_since_last_sync.saturating_add(1);
 
                 if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
                     info!(
@@ -669,11 +682,28 @@ where
         let next_deadline = self.next_cycle_tick();
         self.state.start_new_cycle(next_deadline);
 
+        // Erst pruefen: haben wir noch das Minimum an aktiven Nodes?
         if !self.state.quorum_available() {
             error!(
                 active_peers = self.state.active_peer_count(),
                 required = self.state.voter().required_participants(),
                 "quorum lost, transitioning to failsafe"
+            );
+            return StateEvent::TooFewNodes;
+        }
+
+        // Dann pruefen: haben wir noch Puffer? Regel:
+        //   required_agreement = max(floor(N_aktiv/2)+1, required_participants)
+        //   in_fail_safe_mode: active_total <= required_agreement
+        //
+        // Wenn ja: kein Puffer mehr, jeder Fault ist fatal (KooK-Regel:
+        // 2oo2, degradiertes 2oo3, 6oo8 mit 2 Ausfaellen, etc.).
+        if self.state.in_fail_safe_mode() {
+            error!(
+                active_peers = self.state.active_peer_count(),
+                required_agreement = self.state.required_agreement(),
+                required_participants = self.state.voter().required_participants(),
+                "fail-safe mode: no tolerance buffer left, fault triggers failsafe"
             );
             return StateEvent::TooFewNodes;
         }
@@ -791,7 +821,10 @@ where
                     sleep(deadline - now);
                 } else {
                     let overrun = now - deadline;
-                    warn!(overrun_us = overrun.as_micros(), "cycle overrun, no sleep");
+                    warn!(
+                        overrun_us = overrun.as_micros(),
+                        "cycle overrun, no sleep"
+                    );
                 }
                 self.next_cycle_deadline = Some(deadline + self.timing.cycle_duration);
             }
@@ -807,7 +840,11 @@ where
         let now = now_monotonic_ns();
         let age = now.saturating_sub(local_send);
         let threshold_ns = self.timing.stale_threshold.as_nanos() as u64;
-        if age > threshold_ns { Some(age) } else { None }
+        if age > threshold_ns {
+            Some(age)
+        } else {
+            None
+        }
     }
 
     fn ingest_frame(&mut self, frame: UdpFrame<V::Payload>) {
@@ -835,6 +872,7 @@ where
         let payload = frame.payload();
         match payload {
             Payload::Result(value) => {
+                warn!(peer_id, "matched Result arm");
                 if let Err(e) = self.state.record_peer_result(peer_id, value) {
                     warn!(peer_id, error = ?e, "could not record peer result");
                 }
@@ -943,7 +981,9 @@ where
                     if was_lost {
                         warn!(
                             peer_id,
-                            previous_session, new_session, "rejoin attempt from lost peer ignored"
+                            previous_session,
+                            new_session,
+                            "rejoin attempt from lost peer ignored"
                         );
                     } else {
                         warn!(
