@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
 Kleines Diagnose-Testtool: sendet ein Telegramm an die Multicast-Gruppe
-und zeigt die naechsten paar Antworten an.
+und wartet non-blocking auf Antworten. Sendet periodisch neu, bis die
+erwartete Anzahl an Antworten eingetroffen ist oder das Gesamttimeout
+ablaeuft.
+
+Duplikate (Antwort desselben source_node_id mehrfach) werden gezaehlt
+als eine Antwort, damit mehrfaches Neusenden nicht die Zaehlung
+verfaelscht.
 """
 
+import argparse
 import json
+import select
 import socket
 import struct
 import sys
@@ -12,15 +20,17 @@ import time
 
 MULTICAST_GROUP = "239.10.0.2"
 PORT = 6666
-INTERFACE_IP = "127.0.0.1"  # anpassen wenn du nicht auf lo bist
-RECV_TIMEOUT_SECONDS = 3.0
+INTERFACE_IP = "127.0.0.1"
+
+RESEND_INTERVAL = 1.0     # sek. zwischen Sendungen
+OVERALL_TIMEOUT = 10.0    # sek. bis endgueltig aufgegeben wird
+POLL_INTERVAL   = 0.05    # sek. select-Poll
 
 
 def make_socket():
-    """Empfangs-Socket auf der Multicast-Gruppe."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)  # NEU
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
     s.bind(("", PORT))
 
     mreq = struct.pack(
@@ -29,15 +39,14 @@ def make_socket():
         socket.inet_aton(INTERFACE_IP),
     )
     s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-
-    # Interface auch fuers Senden setzen (damit Multicast raus geht).
     s.setsockopt(
         socket.IPPROTO_IP,
         socket.IP_MULTICAST_IF,
         socket.inet_aton(INTERFACE_IP),
     )
     s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
-    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+    s.setblocking(False)
     return s
 
 
@@ -47,94 +56,167 @@ def send(sock, telegram):
     print(f"→ sent: {json.dumps(telegram)}")
 
 
-def listen(sock, duration=RECV_TIMEOUT_SECONDS):
-    sock.settimeout(0.2)
-    end = time.time() + duration
-    while time.time() < end:
+def is_response(parsed):
+    """Loopback (eigene commands/inputs) rausfiltern."""
+    return parsed.get("type") not in ("command", "input")
+
+
+def send_and_wait(sock, telegram, expected_count,
+                  resend_interval=RESEND_INTERVAL,
+                  overall_timeout=OVERALL_TIMEOUT,
+                  poll_interval=POLL_INTERVAL):
+    """
+    Sendet telegram periodisch und liest non-blocking bis:
+      - expected_count verschiedene source_node_ids geantwortet haben
+        (return True)
+      - overall_timeout erreicht ist (return False)
+
+    Wenn ein Node auf mehrfaches Neusenden mehrfach antwortet, zaehlt
+    das trotzdem als eine Antwort (Deduplizierung per source_node_id).
+    """
+    start = time.monotonic()
+    next_send = 0.0
+    seen_nodes = set()
+
+    while True:
+        now = time.monotonic()
+
+        if now - start >= overall_timeout:
+            print(f"--- timeout, {len(seen_nodes)}/{expected_count} Antworten erhalten ---")
+            return False
+
+        if now >= next_send:
+            send(sock, telegram)
+            next_send = now + resend_interval
+
+        rlist, _, _ = select.select([sock], [], [], poll_interval)
+        if not rlist:
+            continue
+
         try:
             data, addr = sock.recvfrom(4096)
-        except socket.timeout:
+        except BlockingIOError:
             continue
+
         try:
             parsed = json.loads(data)
-            # Eigene Sendungen (loopback) ignorieren.
-            # Nur Node-Antworten haben type: status, staged, error.
-            if parsed.get("type") in ("command", "input"):
-                continue
-            print(f"← from {addr[0]}: {json.dumps(parsed, indent=2)}")
         except json.JSONDecodeError:
             print(f"← from {addr[0]} (raw): {data!r}")
+            continue
+
+        if not is_response(parsed):
+            continue
+
+        src = parsed.get("source_node_id")
+        if src in seen_nodes:
+            continue  # Duplikat, still schlucken
+
+        seen_nodes.add(src)
+        print(f"← from {addr[0]} (node {src}): {json.dumps(parsed, indent=2)}")
+
+        if len(seen_nodes) >= expected_count:
+            print(f"--- {len(seen_nodes)}/{expected_count} Antworten, fertig ---")
+            return True
+
+
+def build_telegram(args):
+    cmd = args.cmd
+
+    if cmd == "status":
+        return {
+            "type": "command",
+            "targets": [args.node_id],
+            "cmd": "get_status",
+        }
+    if cmd == "drop-results":
+        return {
+            "type": "command",
+            "targets": [args.node_id],
+            "cmd": "inject_drop_results",
+            "count": args.count,
+        }
+    if cmd == "drop-acks":
+        return {
+            "type": "command",
+            "targets": [args.node_id],
+            "cmd": "inject_drop_acks",
+            "count": args.count,
+        }
+    if cmd == "clear":
+        return {
+            "type": "command",
+            "targets": [args.node_id],
+            "cmd": "clear_injection",
+        }
+    if cmd == "set-input":
+        return {
+            "type": "input",
+            "value": {
+                "current_speed": args.speed,
+                "target_speed": args.target_speed,
+                "available_distance": args.available_distance,
+            },
+        }
+    raise ValueError(f"unknown command: {cmd}")
+
+
+def default_expected(cmd):
+    """Sinnvolle Defaults, wenn --expect nicht gesetzt wurde."""
+    if cmd in ("status", "drop-results", "drop-acks", "clear"):
+        return 1  # gerichtet an einen Node
+    if cmd == "set-input":
+        return 3  # broadcast an alle
+    return 1
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: diag_client.py <command> [args]")
-        print("Commands:")
-        print("  status <node_id>")
-        print("  drop-results <node_id> <count>")
-        print("  drop-acks <node_id> <count>")
-        print("  clear <node_id>")
-        print("  set-input <speed> <target_speed> <available_distance>")
-        return
+    parser = argparse.ArgumentParser(description="Diagnose-Testtool")
+    parser.add_argument(
+        "--expect", type=int, default=None,
+        help="Anzahl erwarteter Antworten (Default: 1 fuer gerichtete "
+             "Kommandos, 3 fuer set-input)"
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=OVERALL_TIMEOUT,
+        help=f"Gesamttimeout in Sekunden (Default: {OVERALL_TIMEOUT})"
+    )
 
-    cmd = sys.argv[1]
+    subs = parser.add_subparsers(dest="cmd", required=True)
+
+    p_status = subs.add_parser("status", help="Status eines Nodes abfragen")
+    p_status.add_argument("node_id", type=int)
+
+    p_drop_r = subs.add_parser("drop-results", help="Result-Sendungen droppen")
+    p_drop_r.add_argument("node_id", type=int)
+    p_drop_r.add_argument("count", type=int)
+
+    p_drop_a = subs.add_parser("drop-acks", help="Ack-Sendungen droppen")
+    p_drop_a.add_argument("node_id", type=int)
+    p_drop_a.add_argument("count", type=int)
+
+    p_clear = subs.add_parser("clear", help="Injection loeschen")
+    p_clear.add_argument("node_id", type=int)
+
+    p_input = subs.add_parser("set-input", help="Input-Daten broadcasten")
+    p_input.add_argument("speed", type=float)
+    p_input.add_argument("target_speed", type=float)
+    p_input.add_argument("available_distance", type=float)
+
+    args = parser.parse_args()
+
+    try:
+        telegram = build_telegram(args)
+    except ValueError as e:
+        print(e)
+        sys.exit(2)
+
+    expected = args.expect if args.expect is not None else default_expected(args.cmd)
+
     sock = make_socket()
-
-    if cmd == "status":
-        node_id = int(sys.argv[2])
-        send(sock, {
-            "type": "command",
-            "targets": [node_id],
-            "cmd": "get_status",
-        })
-
-    elif cmd == "drop-results":
-        node_id = int(sys.argv[2])
-        count = int(sys.argv[3])
-        send(sock, {
-            "type": "command",
-            "targets": [node_id],
-            "cmd": "inject_drop_results",
-            "count": count,
-        })
-
-    elif cmd == "drop-acks":
-        node_id = int(sys.argv[2])
-        count = int(sys.argv[3])
-        send(sock, {
-            "type": "command",
-            "targets": [node_id],
-            "cmd": "inject_drop_acks",
-            "count": count,
-        })
-
-    elif cmd == "clear":
-        node_id = int(sys.argv[2])
-        send(sock, {
-            "type": "command",
-            "targets": [node_id],
-            "cmd": "clear_injection",
-        })
-
-    elif cmd == "set-input":
-        speed = float(sys.argv[2])
-        target = float(sys.argv[3])
-        dist = float(sys.argv[4])
-        send(sock, {
-            "type": "input",
-            "value": {
-                "current_speed": speed,
-                "target_speed": target,
-                "available_distance": dist,
-            },
-        })
-
-    else:
-        print(f"unknown command: {cmd}")
-        return
-
-    print("--- listening for responses ---")
-    listen(sock)
+    print(f"--- send loop, warte auf {expected} Antwort(en) ---")
+    ok = send_and_wait(sock, telegram, expected_count=expected,
+                       overall_timeout=args.timeout)
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

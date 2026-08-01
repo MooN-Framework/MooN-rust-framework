@@ -216,7 +216,6 @@ impl Diagnostic {
 
         let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         s.set_reuse_address(true)?;
-        s.set_reuse_port(true)?;
         s.bind(&SocketAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, cfg.port)).into())?;
         s.join_multicast_v4(&cfg.multicast_group, &iface_ip)?;
         s.set_multicast_loop_v4(true)?;
@@ -261,37 +260,20 @@ impl Diagnostic {
             }
         };
 
-        // Kurzcheck: ist das ueberhaupt ein Incoming-Telegramm?
-        // Nodes senden auch Antworten in dieselbe Multicast-Gruppe und
-        // empfangen sie durch Multicast-Loopback. Wir muessen die
-        // Antworten von uns selbst (und von Peers) still verwerfen,
-        // sonst entsteht ein Error-Feedback-Loop.
-        let text = match std::str::from_utf8(&buf[..n]) {
-            Ok(s) => s,
-            Err(_) => {
-                debug!("dropped non-utf8 diagnostic frame");
-                return None;
-            }
-        };
-        if !text.contains("\"type\":\"input\"") && !text.contains("\"type\":\"command\"") {
-            // Keine unserer erwarteten Incoming-Typen — vermutlich eine
-            // Antwort von uns selbst oder von einem Peer.
-            debug!(raw = %text, "dropped non-incoming diagnostic frame");
-            return None;
-        }
-
+        // Direktversuch, das Telegramm zu parsen. Nodes senden auch
+        // OutgoingTelegrams in dieselbe Multicast-Gruppe und empfangen
+        // sie via Loopback zurueck — die sind aus Sicht des Incoming-
+        // Parsers ungueltig und werden hier still verworfen, statt eine
+        // Error-Antwort zu produzieren (das wuerde einen Feedback-Loop
+        // ausloesen).
         let telegram = match serde_json::from_slice::<IncomingTelegram>(&buf[..n]) {
             Ok(t) => t,
             Err(e) => {
-                warn!(
+                debug!(
                     error = ?e,
-                    raw = %text,
-                    "failed to parse incoming telegram"
+                    raw = %String::from_utf8_lossy(&buf[..n]),
+                    "dropped unparseable diagnostic frame"
                 );
-                self.send(&OutgoingTelegram::Error {
-                    source_node_id: self.node_id,
-                    message: format!("parse error: {}", e),
-                });
                 return None;
             }
         };
@@ -319,7 +301,6 @@ impl Diagnostic {
     fn handle_command(&mut self, cmd: Command) -> Option<Command> {
         match cmd {
             Command::GetStatus => {
-                warn!("RECEIVED GetStatus command, sending immediate status response");
                 // Sofort — Runner baut die Antwort mit vollem Zustand.
                 Some(Command::GetStatus)
             }

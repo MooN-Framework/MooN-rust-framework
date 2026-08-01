@@ -157,6 +157,7 @@ where
         while let Some(immediate) = diag.try_recv() {
             match immediate {
                 Command::GetStatus => {
+                    warn!("received get status.");
                     let status = self.build_status_response(&diag);
                     diag.send(&OutgoingTelegram::Status {
                         source_node_id: diag.node_id(),
@@ -834,7 +835,6 @@ where
         let payload = frame.payload();
         match payload {
             Payload::Result(value) => {
-                warn!(peer_id, "matched Result arm");
                 if let Err(e) = self.state.record_peer_result(peer_id, value) {
                     warn!(peer_id, error = ?e, "could not record peer result");
                 }
