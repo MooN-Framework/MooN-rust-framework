@@ -1,11 +1,8 @@
-use log::Level::Warn;
 use serde::Deserialize;
-use std::cell::Cell;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-use crate::framework::config::MAX_PEERS;
 use crate::framework::diagnostic::{
     Command, Diagnostic, DiagnosticConfig, InjectionSnapshot, OutgoingTelegram,
     PeerStatus, StatusResponse,
@@ -32,6 +29,11 @@ pub struct CycleTiming {
     pub cycle_sync_timeout: Duration,
     pub share_timeout: Duration,
     pub ack_timeout: Duration,
+    /// Zeitfenster fuer die Exclusion-Voting-Phase in ErrorManagement.
+    /// Kurze Nachricht (1 Byte Mask) von jedem gesunden Peer — sollte
+    /// in der Groessenordnung von `ack_timeout` liegen. Ueberschreitung
+    /// mit gesundem Silence triggert Regel 2 (b): Failsafe.
+    pub error_management_vote_timeout: Duration,
     pub stale_threshold: Duration,
     pub resync_interval_cycles: u32,
 }
@@ -249,7 +251,8 @@ where
             deadline,
             Duration::from_millis(10),
             |this| {
-                if let Err(e) = this.transport.send_state(node_state) {
+                // InitSync hat noch keine relevante Beobachtungs-Mask.
+                if let Err(e) = this.transport.send_state(node_state, PeerMask::EMPTY) {
                     error!(error = ?e, "send_state failed in init sync");
                     return Err(());
                 }
@@ -342,20 +345,11 @@ where
             }
 
             if Instant::now() >= next_request {
-                // Multicast erreicht alle Peers gleichzeitig. Nur senden
-                // wenn mindestens ein Peer noch keine offene Response hat;
-                // sonst warten wir auf die noch offenen Antworten.
                 let any_needs_sync =
                     peer_ids.iter().any(|&id| !peer_sync.has_pending(id));
                 if any_needs_sync {
                     match self.transport.send_time_sync_req(node_state) {
                         Ok((_seq, t1)) => {
-                            // Ein Multicast-Request — allen Peers ohne
-                            // offenen Request wird t1 als erwartete
-                            // Response-Referenz vermerkt. Peers mit noch
-                            // offenem Request behalten ihre alte pending_t1
-                            // (deren spaete Response wird dann normal
-                            // gematcht).
                             for &peer_id in &peer_ids {
                                 if !peer_sync.has_pending(peer_id) {
                                     peer_sync.record_outgoing_request(peer_id, t1);
@@ -404,9 +398,12 @@ where
     fn handle_cycle_sync(&mut self) -> StateEvent {
         debug!("handle_cycle_sync entered");
 
+        // Distributed Observation zuruecksetzen: eigene Sicht + alle
+        // gemeldeten Peer-Masken der letzten Runde.
+        self.state.reset_cycle_sync_evidence();
+
         let node_state = self.state.node_state();
         let expected_mask = self.state.expected_sync_mask();
-        let peers_synced = Cell::new(0u8);
         let deadline = Instant::now() + self.timing.cycle_sync_timeout;
 
         let outcome = self.collect_phase(
@@ -414,20 +411,29 @@ where
             deadline,
             Duration::from_millis(1),
             |this| {
-                if let Err(e) = this.transport.send_state(node_state) {
+                // Bei jedem Resend die AKTUELLE own_seen_mask piggybacken.
+                // Die entwickelt sich waehrend der Phase mit — Peers sehen
+                // beim naechsten Resend eine aktuellere Sicht.
+                let mask = this.state.own_seen_mask();
+                if let Err(e) = this.transport.send_state(node_state, mask) {
                     error!(error = ?e, "send_state failed in cycle sync");
                     return Err(());
                 }
                 Ok(())
             },
-            |_this| peers_synced.get() == expected_mask,
+            |this| this.state.own_seen_mask().as_u8() == expected_mask,
             |this, frame| {
                 let peer_id = frame.node_id();
                 match frame.payload() {
-                    Payload::State => {
+                    Payload::State { seen_mask } => {
                         if let Some(idx) = this.state.peer_index(peer_id) {
-                            peers_synced.set(peers_synced.get() | (1 << idx));
-                            debug!(peer_id, "peer reached CycleSync");
+                            this.state.set_own_seen_bit(idx);
+                            let _ = this.state.record_peer_seen_mask(peer_id, seen_mask);
+                            debug!(
+                                peer_id,
+                                seen_mask = seen_mask.as_u8(),
+                                "peer reached CycleSync"
+                            );
                         }
                     }
                     _ => {
@@ -437,18 +443,21 @@ where
             },
         );
 
+        // Cross-Observed-Evidenz auswerten — sowohl auf Complete- als
+        // auch Timeout-Pfad. Faultet Peers nur bei Mehrheitsbeschluss.
+        self.state.aggregate_cycle_sync_evidence();
+
         match outcome {
             PhaseOutcome::Complete => {
                 self.state.start_new_cycle(self.next_cycle_tick());
                 StateEvent::CycleSyncOk
             }
             PhaseOutcome::Timeout => {
-                let synced = peers_synced.get();
                 warn!(
-                    got_mask = synced,
-                    expected_mask, "cycle sync deadline exceeded"
+                    got_mask = self.state.own_seen_mask().as_u8(),
+                    expected_mask,
+                    "cycle sync deadline exceeded"
                 );
-                self.fault_peers_missing_cycle_sync(synced);
                 StateEvent::CycleSyncTimeout
             }
             PhaseOutcome::Fault => StateEvent::Fault,
@@ -522,7 +531,10 @@ where
         match outcome {
             PhaseOutcome::Complete => StateEvent::ResultShared,
             PhaseOutcome::Timeout => {
-                self.fault_peers_missing_result();
+                // Ohne Peer-Acks (die kommen erst in SendACK) faellt
+                // aggregate_result_evidence auf unilateral zurueck —
+                // aequivalent zum alten fault_peers_missing_result.
+                self.state.aggregate_result_evidence();
                 StateEvent::ShareResultTimeout
             }
             PhaseOutcome::Fault => StateEvent::Fault,
@@ -564,9 +576,16 @@ where
         );
 
         match outcome {
-            PhaseOutcome::Complete => StateEvent::AckReceived,
+            PhaseOutcome::Complete => {
+                // Alle Acks eingesammelt → volle Cross-Observed-Evidenz.
+                self.state.aggregate_result_evidence();
+                StateEvent::AckReceived
+            }
             PhaseOutcome::Timeout => {
-                self.fault_peers_missing_ack();
+                // Partial Acks: aggregate mit dem was wir haben.
+                self.state.aggregate_result_evidence();
+                // MissedAck bleibt unilateral (siehe Doc unten).
+                self.fault_peers_missing_ack_unilateral();
                 StateEvent::AckTimeout
             }
             PhaseOutcome::Fault => StateEvent::Fault,
@@ -634,7 +653,10 @@ where
                     );
                 }
 
-                self.credit_peers_delivered();
+                // Cross-observed credit: nur Peers, die die Mehrheit als
+                // liefernd gesehen hat, bekommen einen Healthy-Cycle.
+                // Ersetzt den frueheren unilateralen credit_peers_delivered.
+                self.state.credit_majority_delivered_peers();
 
                 self.cycles_since_last_sync =
                     self.cycles_since_last_sync.saturating_add(1);
@@ -665,43 +687,126 @@ where
         }
     }
 
-    fn handle_error_management(&mut self) -> StateEvent {
-        debug!("handle_error_management entered");
+   fn handle_error_management(&mut self) -> StateEvent {
+    debug!("handle_error_management entered");
 
-        let transitions = self.state.apply_health_transitions();
-        if transitions > 0 {
-            info!(
-                transitions,
-                active_peers = self.state.active_peer_count(),
-                "health transitions applied"
-            );
+    // === Voting-Phase: Exclusion-Proposals austauschen ===
+    //
+    // Kernprinzip: kein Node wird durch einseitige Entscheidung
+    // ausgeschlossen. Jeder Node sendet seine lokale Empfehlung
+    // (proposed_exclusions basierend auf Fault-Countern), sammelt
+    // die Empfehlungen der anderen ein, und wendet nur die durch
+    // Mehrheit bestaetigten Uebergaenge an.
+    self.state.reset_exclusion_proposals();
+
+    let own_proposal = self.state.proposed_exclusions();
+    let node_state = self.state.node_state();
+    let deadline =
+        Instant::now() + self.timing.error_management_vote_timeout;
+
+    debug!(
+        own_proposal = own_proposal.as_u8(),
+        "starting exclusion vote"
+    );
+
+    let outcome = self.collect_phase(
+        "exclusion_vote",
+        deadline,
+        Duration::from_millis(1),
+        |this| {
+            if let Err(e) = this
+                .transport
+                .send_exclusion_proposal(node_state, own_proposal)
+            {
+                error!(error = ?e, "send_exclusion_proposal failed");
+                return Err(());
+            }
+            Ok(())
+        },
+        // Done wenn alle gesunden (nicht-angeklagten) Peers geantwortet
+        // haben. Silence eines Peers, den WIR selbst ausschliessen
+        // wollen, wird nicht erwartet — das ist bestaetigende Evidenz.
+        |this| this.state.healthy_peers_missing_vote().is_empty(),
+        |this, frame| this.ingest_frame(frame),
+    );
+
+    match outcome {
+        PhaseOutcome::Complete => {
+            let confirmed = self.state.aggregate_exclusion_votes();
+            let transitions = self.state.apply_confirmed_exclusions(confirmed);
+            if transitions > 0 {
+                info!(
+                    transitions,
+                    confirmed = confirmed.as_u8(),
+                    active_peers = self.state.active_peer_count(),
+                    "vote-confirmed health transitions applied"
+                );
+            }
+
+            let next_deadline = self.next_cycle_tick();
+            self.state.start_new_cycle(next_deadline);
+
+            if !self.state.quorum_available() {
+                error!(
+                    active_peers = self.state.active_peer_count(),
+                    min_participants = self.state.participants().min_participants,
+                    "quorum lost after vote, transitioning to failsafe"
+                );
+                return StateEvent::TooFewNodes;
+            }
+
+            // Degraded 2oo2 + keine Peer-Evidence in dieser Runde:
+            // kein dritter Node mehr zum Cross-Check. "Ich bin blind"
+            // und "der andere ist tot" sind aequivalent — beides fuehrt
+            // zu Failsafe. Wird hier gepruefft (nicht in den Phase-
+            // Handlern), damit die gesamte Failsafe-Logik an einem Ort
+            // bleibt.
+            if self.state.in_fail_safe_mode()
+                && !self.any_peer_evidence_this_cycle()
+            {
+                error!(
+                    active_peers = self.state.active_peer_count(),
+                    required_agreement = self.state.required_agreement(),
+                    "degraded mode with no peer evidence this cycle, failsafe"
+                );
+                return StateEvent::TooFewNodes;
+            }
+
+            // Kein Puffer mehr fuer weitere Ausfaelle — nur Warnung,
+            // solange noch Kontakt zum letzten Peer besteht.
+            if self.state.in_fail_safe_mode() {
+                warn!(
+                    active_peers = self.state.active_peer_count(),
+                    required_agreement = self.state.required_agreement(),
+                    "operating in degraded mode without fault tolerance buffer"
+                );
+            }
+
+            StateEvent::StateOk
         }
-
-        let next_deadline = self.next_cycle_tick();
-        self.state.start_new_cycle(next_deadline);
-
-        if !self.state.quorum_available() {
+        PhaseOutcome::Timeout => {
+            // Regel 2 (b): mindestens ein Peer, den wir NICHT ausschliessen
+            // wollen (= fuer uns gesund) hat nicht gevoted. Wenn die
+            // gesunden Nodes untereinander die Kommunikation verlieren,
+            // ist das System nicht mehr verlaesslich → Failsafe.
+            let missing = self.state.healthy_peers_missing_vote();
             error!(
-                active_peers = self.state.active_peer_count(),
-                min_participants = self.state.participants().min_participants,
-                "quorum lost, transitioning to failsafe"
+                missing_peers = ?missing.as_slice(),
+                "exclusion vote timed out — healthy peer(s) silent, failsafe"
             );
-            return StateEvent::TooFewNodes;
+            StateEvent::StateTimeout
         }
-
-        // Kein Puffer mehr fuer weitere Ausfaelle: fail-safe.
-        if self.state.in_fail_safe_mode() {
-            error!(
-                active_peers = self.state.active_peer_count(),
-                required_agreement = self.state.required_agreement(),
-                min_participants = self.state.participants().min_participants,
-                "fail-safe mode: no tolerance buffer left, fault triggers failsafe"
-            );
-            return StateEvent::TooFewNodes;
-        }
-
-        StateEvent::StateOk
+        PhaseOutcome::Fault => StateEvent::Fault,
     }
+}
+
+
+    fn any_peer_evidence_this_cycle(&self) -> bool {
+    let c = self.state.cycle();
+    c.peer_results.iter().any(|r| r.is_some())
+        || c.peer_acks.iter().any(|a| a.is_some())
+        || !self.state.own_seen_mask().is_empty()
+}
 
     fn enter_failsafe(&mut self) {
         error!(
@@ -711,37 +816,46 @@ where
     }
 
     // -------------------------------------------------------------
-    // Fehler-Buchhaltung
+    // Fehler-Buchhaltung (verbleibender unilateraler Pfad)
     // -------------------------------------------------------------
 
-    fn fault_peers_missing_result(&mut self) {
-        let missing_ids: Vec<u8> = self
+    /// MissedAck ist der einzige Fault-Kanal, der unilateral bleibt.
+    /// Cross-Observation ueber Acks selbst ist nicht moeglich: kein Peer
+    /// bezeugt in seinem Ack, wessen ACK er bekommen hat — das waere ein
+    /// weiterer Round-Trip, den wir nicht bezahlen wollen.
+    ///
+    /// Der Voting-Layer im ErrorManagement gleicht das aus: selbst ein
+    /// unilateral akkumulierter Counter fuehrt nur nach Mehrheitsbeschluss
+    /// zum tatsaechlichen Ausschluss.
+    ///
+    /// **Self-Diagnose-Guard**: Wenn KEIN Peer-Ack angekommen ist, koennte
+    /// unser eigener Inbound das Problem sein — dann keine Attribution.
+    /// Nur wenn wir mindestens ein Ack gesehen haben, faulten wir die
+    /// spezifisch fehlenden.
+    fn fault_peers_missing_ack_unilateral(&mut self) {
+        let any_ack_received = self
             .state
-            .peers()
+            .cycle()
+            .peer_acks
             .iter()
-            .enumerate()
-            .filter_map(|(idx, p)| {
-                if self.state.cycle().peer_results[idx].is_none() {
-                    Some(p.id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for peer_id in missing_ids {
-            let _ = self
-                .state
-                .record_peer_fault(peer_id, FaultKind::MissedShareResult);
+            .any(|a| a.is_some());
+        if !any_ack_received {
+            warn!(
+                "fault_peers_missing_ack_unilateral: no acks received \
+                 (own inbound may be broken), skipping fault attribution"
+            );
+            return;
         }
-    }
 
-    fn fault_peers_missing_ack(&mut self) {
         let missing_ids: Vec<u8> = self
             .state
             .peers()
             .iter()
             .enumerate()
             .filter_map(|(idx, p)| {
+                if p.health == PeerHealth::Lost {
+                    return None;
+                }
                 if self.state.cycle().peer_acks[idx].is_none() {
                     Some(p.id)
                 } else {
@@ -751,46 +865,6 @@ where
             .collect();
         for peer_id in missing_ids {
             let _ = self.state.record_peer_fault(peer_id, FaultKind::MissedAck);
-        }
-    }
-
-    fn fault_peers_missing_cycle_sync(&mut self, synced_mask: u8) {
-        let missing_ids: Vec<u8> = self
-            .state
-            .peers()
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, p)| {
-                if (synced_mask & (1 << idx)) == 0 {
-                    Some(p.id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for peer_id in missing_ids {
-            let _ = self
-                .state
-                .record_peer_fault(peer_id, FaultKind::MissedCycleSync);
-        }
-    }
-
-    fn credit_peers_delivered(&mut self) {
-        let delivered_ids: Vec<u8> = self
-            .state
-            .peers()
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, p)| {
-                if self.state.cycle().peer_results[idx].is_some() {
-                    Some(p.id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for peer_id in delivered_ids {
-            let _ = self.state.record_peer_healthy_cycle(peer_id);
         }
     }
 
@@ -868,13 +942,6 @@ where
                 "stale frame dropped"
             );
             // Bewusst kein record_peer_fault: Stale-Frames sind ambigu.
-            // Sie koennen von einer echten Peer-Verspaetung stammen oder
-            // von lokalem Buffer-Delay (Sleep zwischen Zyklen sammelt
-            // Frames im OS-Buffer, die dann als "alt" gelesen werden).
-            // Der Peer wird nur ueber Timeouts der jeweiligen Phase
-            // (MissedShareResult, MissedAck, MissedCycleSync) belastet,
-            // wenn er in dieser konkreten Runde nichts liefert. Das ist
-            // eindeutiger als Timestamp-basiertes Stale-Fault-Counting.
             return;
         }
 
@@ -899,8 +966,23 @@ where
                     warn!(peer_id, error = ?e, "could not record peer ack");
                 }
             }
-            Payload::State => {
-                debug!(peer_id, "matched State arm");
+            Payload::ExclusionProposal { propose_exclude } => {
+                debug!(
+                    peer_id,
+                    propose_exclude = propose_exclude.as_u8(),
+                    "matched ExclusionProposal arm"
+                );
+                if let Err(e) = self
+                    .state
+                    .record_peer_exclusion_proposal(peer_id, propose_exclude)
+                {
+                    warn!(peer_id, error = ?e, "could not record exclusion proposal");
+                }
+            }
+            Payload::State { .. } => {
+                // State ausserhalb von CycleSync ist Rauschen — CycleSync
+                // hat einen eigenen Ingest-Closure, der State frisst.
+                debug!(peer_id, "matched State arm (outside cycle sync, dropped)");
             }
             Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. } => {
                 debug!(peer_id, "unexpected sync frame outside PeerSync, dropped");
@@ -908,16 +990,47 @@ where
         }
     }
 
+    /// True wenn alle NICHT-Lost Peers ein Result geliefert haben.
+    /// Lost-Peers werden ignoriert — sie senden nichts, ihre Slots
+    /// blieben ohne diesen Filter dauerhaft None und die Phase liefe
+    /// stets in Timeout.
     fn all_peer_results_in(&self) -> bool {
-        self.state.cycle().peer_results.iter().all(|r| r.is_some())
+        for (idx, peer) in self.state.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            if self.state.cycle().peer_results[idx].is_none() {
+                return false;
+            }
+        }
+        true
     }
 
+    /// True wenn alle NICHT-Lost Peers ein Ack geliefert haben.
+    /// Filter-Logik analog zu `all_peer_results_in`.
     fn all_peer_acks_in(&self) -> bool {
-        self.state.cycle().peer_acks.iter().all(|a| a.is_some())
+        for (idx, peer) in self.state.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            if self.state.cycle().peer_acks[idx].is_none() {
+                return false;
+            }
+        }
+        true
     }
 
+    /// Reale Bitmask der in dieser Runde lokal empfangenen Peer-Results.
+    /// Wird in den Ack-Frame gepackt, damit die anderen Nodes darueber
+    /// aggregieren koennen (siehe aggregate_result_evidence).
     fn received_mask(&self) -> PeerMask {
-        PeerMask::from_u8(0)
+        let mut mask = PeerMask::EMPTY;
+        for (idx, slot) in self.state.cycle().peer_results.iter().enumerate() {
+            if slot.is_some() {
+                mask.set(idx);
+            }
+        }
+        mask
     }
 
     fn pick_publisher_candidate(&self) -> u8 {

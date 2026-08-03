@@ -54,6 +54,15 @@ pub enum StateEvent {
     /* Error Management */
     StateOk,
     StateDiverged,
+    /// Voting-Timeout in ErrorManagement: mindestens ein Peer, den WIR
+    /// nicht ausschliessen wollen (also fuer uns "gesund"), hat seinen
+    /// ExclusionProposal-Vote nicht rechtzeitig geliefert. Regel 2 (b):
+    /// wenn gesunde Nodes untereinander die Kommunikation verlieren,
+    /// ist das System nicht mehr verlaesslich → Failsafe.
+    ///
+    /// Silence eines Peers, den WIR selbst ausschliessen wollen, triggert
+    /// diesen Event NICHT — die Aggregation im RunState behandelt das
+    /// als bestaetigende Evidenz.
     StateTimeout,
     TooFewNodes,
     /* Generisch */
@@ -100,8 +109,13 @@ impl NodeState {
             // --- Error management ---
             // Nach jeder Rekonfiguration zurueck ueber CycleSync — Barrier,
             // damit alle Nodes wieder am selben Zyklus-Tick aufsetzen.
+            //
+            // StateTimeout: Voting-Phase konnte nicht mit Konsens
+            // abgeschlossen werden, weil ein von uns fuer gesund gehaltener
+            // Peer nicht geantwortet hat → Failsafe (Regel 2b).
             (ErrorManagement, StateOk) => CycleSync,
             (ErrorManagement, StateDiverged) => Failsafe,
+            (ErrorManagement, StateTimeout) => Failsafe,
             (ErrorManagement, TooFewNodes) => Failsafe,
 
             // --- Failsafe ist terminal ---

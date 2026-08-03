@@ -60,6 +60,7 @@ fn main() {
         peer_sync_request_interval: Duration::from_millis(1),
         peer_sync_timeout: Duration::from_millis(500),
         stale_threshold: Duration::from_millis(50),
+        error_management_vote_timeout: Duration::from_millis(2000),
         resync_interval_cycles: 30,
     };
 

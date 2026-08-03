@@ -1,9 +1,10 @@
-use crate::framework::config::{MAX_PEERS, ParticipantConfig};
+use crate::framework::config::{MAX_PEERS, MAX_TOTAL_NODES, ParticipantConfig};
 use crate::framework::peer_sync::PeerClock;
 use crate::framework::state_machine::{NodeState, SystemState};
 use crate::framework::traits::{CyclePayload, Voter, VotingOutcome};
+use crate::framework::types::PeerMask;
 use heapless::Vec;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerHealth {
@@ -13,8 +14,10 @@ pub enum PeerHealth {
 }
 
 impl PeerHealth {
-    /// Reine Uebergangsfunktion. Wird ausschliesslich von
-    /// `RunState::apply_health_transitions` in ErrorManagement aufgerufen.
+    /// Reine Uebergangsfunktion. Wird nur noch fuer Tests und interne
+    /// Konsistenzchecks genutzt — die produktive Anwendung geht ueber
+    /// `RunState::apply_confirmed_exclusions`, weil dort die Voting-
+    /// Bestaetigung mit einfliesst.
     pub fn transition(
         current: PeerHealth,
         consecutive_faults: u32,
@@ -167,6 +170,31 @@ pub struct RunState<V: Voter> {
     cycle: CycleState<V::Payload>,
 
     last_decision: Option<VotingOutcome<V::Decision>>,
+
+    // -------------------------------------------------------------
+    // Distributed Observation State
+    // -------------------------------------------------------------
+    //
+    // Diese Felder tragen Cross-Observed-Evidenz durch die jeweilige Phase.
+    // Sie sind KEIN Teil von CycleState, weil sie phasenlokal sind
+    // (CycleSync-Masken haben ausserhalb von CycleSync keine Bedeutung,
+    // Exclusion-Proposals nur waehrend ErrorManagement). Explizite
+    // Reset-Methoden am Phasen-Eingang halten die Lebensdauer sauber.
+    // -------------------------------------------------------------
+    /// Was ICH in der aktuellen CycleSync-Phase gesehen habe.
+    /// Bit-Index = mein `peers[]`-Index. Wird bei jedem eintreffenden
+    /// Peer-State-Frame gesetzt und in JEDEN eigenen State-Frame
+    /// piggyback-versendet.
+    cycle_own_seen: PeerMask,
+    /// Zuletzt beobachtete `seen_mask` jedes Peers in der aktuellen
+    /// CycleSync-Phase (indexiert nach unserem peers[]). `None` = keine
+    /// State-Frame in dieser Phase erhalten. Wird von
+    /// `aggregate_cycle_sync_evidence` mit `cycle_own_seen` kombiniert.
+    cycle_peer_seen: Vec<Option<PeerMask>, MAX_PEERS>,
+
+    /// Vote-Frames der Peers in der aktuellen ErrorManagement-Voting-Runde.
+    /// Bit-Interpretation: Sender-Peer-Ordnung (siehe `sender_observed`).
+    cycle_peer_exclusion_proposals: Vec<Option<PeerMask>, MAX_PEERS>,
 }
 
 impl<V: Voter> RunState<V> {
@@ -193,6 +221,9 @@ impl<V: Voter> RunState<V> {
             sync_valid: false,
             cycle: CycleState::empty(),
             last_decision: None,
+            cycle_own_seen: PeerMask::EMPTY,
+            cycle_peer_seen: Vec::new(),
+            cycle_peer_exclusion_proposals: Vec::new(),
         }
     }
 
@@ -279,6 +310,8 @@ impl<V: Voter> RunState<V> {
         for _ in 0..self.peers.len() {
             let _ = self.cycle.peer_results.push(None);
             let _ = self.cycle.peer_acks.push(None);
+            let _ = self.cycle_peer_seen.push(None);
+            let _ = self.cycle_peer_exclusion_proposals.push(None);
         }
         self.discovery_locked = true;
         info!(nodes = found, "discovery finalized and locked");
@@ -355,7 +388,414 @@ impl<V: Voter> RunState<V> {
         mask
     }
 
-    // ---- Fehler-Buchhaltung ----
+    // -------------------------------------------------------------
+    // Distributed Observation: CycleSync
+    // -------------------------------------------------------------
+
+    /// Aufzurufen am Eingang von handle_cycle_sync. Loescht die eigene
+    /// Sicht + alle Peer-berichteten Masks der letzten Runde.
+    pub fn reset_cycle_sync_evidence(&mut self) {
+        self.cycle_own_seen = PeerMask::EMPTY;
+        for slot in self.cycle_peer_seen.iter_mut() {
+            *slot = None;
+        }
+    }
+
+    /// Setzt Bit fuer Peer bei Index `peer_idx` in unserer eigenen
+    /// Beobachtungs-Mask.
+    pub fn set_own_seen_bit(&mut self, peer_idx: usize) {
+        if peer_idx < self.peers.len() {
+            self.cycle_own_seen.set(peer_idx);
+        }
+    }
+
+    /// Aktuelle eigene Beobachtungs-Mask. Wird in send_state piggyback
+    /// mitgeschickt.
+    pub fn own_seen_mask(&self) -> PeerMask {
+        self.cycle_own_seen
+    }
+
+    /// Speichert die zuletzt von `peer_id` gemeldete `seen_mask`.
+    /// Ueberschreibt aeltere Werte in derselben Phase — die letzte
+    /// beobachtete Sicht gewinnt (Sequenznummern regeln Ordering im
+    /// Transport-Layer).
+    pub fn record_peer_seen_mask(
+        &mut self,
+        peer_id: u8,
+        mask: PeerMask,
+    ) -> Result<(), DiscoveryError> {
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
+        self.cycle_peer_seen[idx] = Some(mask);
+        Ok(())
+    }
+
+    /// Aggregiert Cross-Observed-Evidenz aus `cycle_own_seen` +
+    /// `cycle_peer_seen`. Incrementiert MissedCycleSync-Zaehler nur fuer
+    /// Peers, die von der Mehrheit der Reporter (ausser dem Peer selbst)
+    /// nicht als anwesend beobachtet wurden.
+    ///
+    /// Am Ende von handle_cycle_sync aufzurufen — sowohl auf Complete-
+    /// als auch auf Timeout-Pfad.
+    ///
+    /// **Self-Diagnose-Guard**: Wenn wir in dieser Phase NICHTS gehoert
+    /// haben (weder eigene State-Frame-Ingests noch Peer-berichtete
+    /// Masks), koennte unser eigener Inbound der Fehler sein. In dem
+    /// Fall duerfen wir keine anderen Nodes beschuldigen — wir loggen
+    /// und skippen die Fault-Attribution.
+    pub fn aggregate_cycle_sync_evidence(&mut self) {
+        // Self-Diagnose: haben wir ueberhaupt irgendetwas gesehen oder
+        // gemeldet bekommen? Wenn nicht: mit hoher Wahrscheinlichkeit
+        // eigener Empfangsfehler, keine Attribution.
+        let any_own_seen = !self.cycle_own_seen.is_empty();
+        let any_peer_reported = self
+            .cycle_peer_seen
+            .iter()
+            .any(|m| m.is_some());
+        if !any_own_seen && !any_peer_reported {
+            warn!(
+                "aggregate_cycle_sync_evidence: no evidence collected \
+                 (own inbound may be broken), skipping fault attribution"
+            );
+            return;
+        }
+
+        let peer_count = self.peers.len();
+        let mut fault_ids: Vec<u8, MAX_PEERS> = Vec::new();
+
+        for idx in 0..peer_count {
+            let target = &self.peers[idx];
+            if target.health == PeerHealth::Lost {
+                continue;
+            }
+            let target_id = target.id;
+
+            let own_observed = self.cycle_own_seen.contains(idx);
+            let (observers, reporters) = self.count_observations(
+                idx,
+                target_id,
+                own_observed,
+                |rs, i| rs.cycle_peer_seen.get(i).and_then(|m| *m),
+            );
+
+            let threshold = reporters / 2 + 1; // strikte Mehrheit
+            if observers < threshold {
+                let _ = fault_ids.push(target_id);
+            }
+        }
+
+        for id in fault_ids {
+            let _ = self.record_peer_fault(id, FaultKind::MissedCycleSync);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // Distributed Observation: Results (via ACKs)
+    // -------------------------------------------------------------
+
+    /// Aggregiert Cross-Observed-Evidenz aus eigenen `peer_results` +
+    /// den `received_from`-Masken der Peer-ACKs. Incrementiert
+    /// MissedShareResult-Zaehler nach derselben Mehrheits-Regel wie
+    /// `aggregate_cycle_sync_evidence`.
+    ///
+    /// Wichtige Randfaelle:
+    /// - Wenn KEINE Peer-ACKs vorliegen (z.B. ShareResult-Timeout), zaehlt
+    ///   nur die eigene Beobachtung → Threshold = 1. Peers, die wir selbst
+    ///   nicht gesehen haben, werden dann per-target gefaultet — aber nur
+    ///   die spezifisch fehlenden, nicht alle. Und nur wenn wir insgesamt
+    ///   ueberhaupt was mitbekommen haben (siehe Self-Diagnose-Guard).
+    /// - Peers, die selbst als Lost gelten, sind weder Reporter noch
+    ///   Target.
+    ///
+    /// **Self-Diagnose-Guard**: Wenn wir in dieser Runde **weder** einen
+    /// Result-Frame **noch** ein Peer-Ack empfangen haben, ist der
+    /// wahrscheinlichste Grund unser eigener Inbound (Multicast-Filter,
+    /// Socket-Puffer, physikalisch getrennter Link). In dem Fall duerfen
+    /// wir keine anderen Nodes beschuldigen — wir loggen und skippen die
+    /// Fault-Attribution komplett. Sonst wuerden wir auf ShareResult-
+    /// Timeout automatisch alle anderen Nodes verdaechtigen, was das
+    /// System aus einem eigenen Fehler heraus fehlleiten koennte.
+    ///
+    /// Am Ende von handle_send_ack aufzurufen (fuer volle Cross-Obs)
+    /// oder auf handle_share_result-Timeout (fuer unilateralen Fallback).
+    pub fn aggregate_result_evidence(&mut self) {
+        // Self-Diagnose: nichts empfangen → kein Fault-Attribution.
+        let any_own_result = self.cycle.peer_results.iter().any(|r| r.is_some());
+        let any_peer_ack = self.cycle.peer_acks.iter().any(|a| a.is_some());
+        if !any_own_result && !any_peer_ack {
+            warn!(
+                "aggregate_result_evidence: no evidence collected \
+                 (own inbound may be broken), skipping fault attribution"
+            );
+            return;
+        }
+
+        let peer_count = self.peers.len();
+        let mut fault_ids: Vec<u8, MAX_PEERS> = Vec::new();
+
+        for idx in 0..peer_count {
+            let target = &self.peers[idx];
+            if target.health == PeerHealth::Lost {
+                continue;
+            }
+            let target_id = target.id;
+
+            let own_observed = self.cycle.peer_results[idx].is_some();
+            let (observers, reporters) = self.count_observations(
+                idx,
+                target_id,
+                own_observed,
+                |rs, i| {
+                    rs.cycle
+                        .peer_acks
+                        .get(i)
+                        .and_then(|a| a.map(|ack| PeerMask::from_u8(ack.received_from)))
+                },
+            );
+
+            let threshold = reporters / 2 + 1;
+            if observers < threshold {
+                let _ = fault_ids.push(target_id);
+            }
+        }
+
+        for id in fault_ids {
+            let _ = self.record_peer_fault(id, FaultKind::MissedShareResult);
+        }
+    }
+
+    pub fn credit_majority_delivered_peers(&mut self) {
+        let peer_count = self.peers.len();
+        let mut credit_ids: Vec<u8, MAX_PEERS> = Vec::new();
+
+        for idx in 0..peer_count {
+            let target = &self.peers[idx];
+            if target.health == PeerHealth::Lost {
+                continue;
+            }
+            let target_id = target.id;
+
+            let own_observed = self.cycle.peer_results[idx].is_some();
+            let (observers, reporters) = self.count_observations(
+                idx,
+                target_id,
+                own_observed,
+                |rs, i| {
+                    rs.cycle
+                        .peer_acks
+                        .get(i)
+                        .and_then(|a| a.map(|ack| PeerMask::from_u8(ack.received_from)))
+                },
+            );
+
+            let threshold = reporters / 2 + 1;
+            if observers >= threshold {
+                let _ = credit_ids.push(target_id);
+            }
+        }
+
+        for id in credit_ids {
+            let _ = self.record_peer_healthy_cycle(id);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // Voting: Exclusion Proposals
+    // -------------------------------------------------------------
+
+    /// Aufzurufen am Eingang der Voting-Phase in handle_error_management.
+    pub fn reset_exclusion_proposals(&mut self) {
+        for slot in self.cycle_peer_exclusion_proposals.iter_mut() {
+            *slot = None;
+        }
+    }
+
+    pub fn record_peer_exclusion_proposal(
+        &mut self,
+        peer_id: u8,
+        mask: PeerMask,
+    ) -> Result<(), DiscoveryError> {
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
+        self.cycle_peer_exclusion_proposals[idx] = Some(mask);
+        Ok(())
+    }
+
+    /// Baut die eigene Exclusion-Proposal aus den aktuellen
+    /// Fault-Countern: Peers, deren Uebergang eine Verschlechterung
+    /// waere (Alive→Suspect oder Suspect→Lost), landen im Vorschlag.
+    /// Erholungen (Suspect→Alive) werden NICHT vorgeschlagen — die laufen
+    /// ohne Voting.
+    pub fn proposed_exclusions(&self) -> PeerMask {
+        let cfg = self.health_config;
+        let mut mask = PeerMask::EMPTY;
+        for (idx, peer) in self.peers.iter().enumerate() {
+            match peer.health {
+                PeerHealth::Alive => {
+                    if peer.consecutive_faults >= cfg.suspect_threshold {
+                        mask.set(idx);
+                    }
+                }
+                PeerHealth::Suspect => {
+                    if peer.consecutive_faults >= cfg.lost_threshold {
+                        mask.set(idx);
+                    }
+                }
+                PeerHealth::Lost => {}
+            }
+        }
+        mask
+    }
+
+    /// Wer schweigt in dieser Runde, obwohl wir ihn NICHT ausschliessen
+    /// wollen? Rueckgabe: Liste der Peer-IDs, deren Silence Rule 2 (b)
+    /// triggert (StateTimeout → Failsafe).
+    ///
+    /// Silence eines Peers, den wir selbst vorschlagen auszuschliessen,
+    /// wird von dieser Funktion NICHT gemeldet — das ist bestaetigende
+    /// Evidenz, kein Kommunikationsproblem.
+    pub fn healthy_peers_missing_vote(&self) -> Vec<u8, MAX_PEERS> {
+        let own_proposal = self.proposed_exclusions();
+        let mut missing: Vec<u8, MAX_PEERS> = Vec::new();
+        for (idx, peer) in self.peers.iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            if own_proposal.contains(idx) {
+                continue; // wir wollen den eh ausschliessen → Silence okay
+            }
+            // NEU: Peer war in dieser Runde stumm bei Result UND Ack.
+            // Ohne Teilnahme am Cycle erwarten wir auch kein Vote —
+            // sein Silence ist Symptom des schon laufenden Ausfalls,
+            // nicht ein separates Kommunikationsproblem unter Gesunden.
+            let sent_result = self.cycle.peer_results[idx].is_some();
+            let sent_ack = self.cycle.peer_acks[idx].is_some();
+            if !sent_result && !sent_ack {
+                continue;
+            }
+            if self.cycle_peer_exclusion_proposals[idx].is_none() {
+                let _ = missing.push(peer.id);
+            }
+        }
+        missing
+    }
+
+    /// Aggregiert die eingegangenen Exclusion-Vorschlaege + eigenen
+    /// Vorschlag zu einer bestaetigten Ausschluss-Mask.
+    ///
+    /// Regeln:
+    /// - Regel 1 (a): Fuer Ausschluss von X wird die Stimme von X selbst
+    ///   ignoriert (die kann X nicht ueber sich selbst abstimmen).
+    /// - Ausschluss bestaetigt, wenn Anzahl Ja-Stimmen ≥ strikte Mehrheit
+    ///   der Nicht-X-Reporter.
+    ///
+    /// Rueckgabe: Mask der Peers (in unserem peers[]-Index), fuer die
+    /// eine Health-Verschlechterung freigegeben ist.
+    pub fn aggregate_exclusion_votes(&self) -> PeerMask {
+        let mut confirmed = PeerMask::EMPTY;
+        let own_proposal = self.proposed_exclusions();
+
+        for idx in 0..self.peers.len() {
+            let target = &self.peers[idx];
+            if target.health == PeerHealth::Lost {
+                continue;
+            }
+            let target_id = target.id;
+
+            // Reporters = wir + alle Nicht-Lost-Peers ausser dem Target.
+            // Ja-Stimme = Reporter hat Target-Bit in seinem Proposal gesetzt.
+            let mut yes_votes = 0usize;
+            let mut reporters = 0usize;
+
+            // Eigene Stimme (wir sind nie das Target — Target ist ein Peer).
+            reporters += 1;
+            if own_proposal.contains(idx) {
+                yes_votes += 1;
+            }
+
+            // Peer-Stimmen (Regel 1a: Target selbst wird uebersprungen).
+            for (i, other) in self.peers.iter().enumerate() {
+                if i == idx {
+                    continue;
+                }
+                if other.health == PeerHealth::Lost {
+                    continue;
+                }
+                if let Some(mask) = self.cycle_peer_exclusion_proposals[i] {
+                    reporters += 1;
+                    if self.sender_observed(other.id, mask, target_id) {
+                        yes_votes += 1;
+                    }
+                }
+            }
+
+            let threshold = reporters / 2 + 1;
+            if yes_votes >= threshold {
+                confirmed.set(idx);
+            }
+        }
+
+        confirmed
+    }
+
+    /// Wendet die durch Voting bestaetigten Ausschluss-Uebergaenge an
+    /// (Verschlechterungen). Erholungen (Suspect→Alive) werden IMMER
+    /// angewendet — die brauchen keine Bestaetigung.
+    ///
+    /// Ersetzt das bisherige `apply_health_transitions`.
+    pub fn apply_confirmed_exclusions(&mut self, confirmed: PeerMask) -> usize {
+        let cfg = self.health_config;
+        let mut transitions = 0usize;
+
+        for (idx, peer) in self.peers.iter_mut().enumerate() {
+            let old = peer.health;
+            let new = match peer.health {
+                PeerHealth::Alive => {
+                    if confirmed.contains(idx)
+                        && peer.consecutive_faults >= cfg.suspect_threshold
+                    {
+                        PeerHealth::Suspect
+                    } else {
+                        PeerHealth::Alive
+                    }
+                }
+                PeerHealth::Suspect => {
+                    // Recovery hat Vorrang und laeuft unilateral.
+                    if peer.consecutive_healthy_cycles >= cfg.recovery_threshold {
+                        PeerHealth::Alive
+                    } else if confirmed.contains(idx)
+                        && peer.consecutive_faults >= cfg.lost_threshold
+                    {
+                        PeerHealth::Lost
+                    } else {
+                        PeerHealth::Suspect
+                    }
+                }
+                PeerHealth::Lost => PeerHealth::Lost,
+            };
+
+            if new != old {
+                warn!(
+                    peer_id = peer.id,
+                    from = ?old,
+                    to = ?new,
+                    consecutive_faults = peer.consecutive_faults,
+                    consecutive_healthy = peer.consecutive_healthy_cycles,
+                    vote_confirmed = confirmed.contains(idx),
+                    "peer health transitioned"
+                );
+                peer.health = new;
+                transitions += 1;
+            }
+        }
+        transitions
+    }
+
+    // -------------------------------------------------------------
+    // Fehler-Buchhaltung (Zaehler-Ebene)
+    // -------------------------------------------------------------
 
     pub fn record_peer_fault(
         &mut self,
@@ -377,10 +817,7 @@ impl<V: Voter> RunState<V> {
         Ok(())
     }
 
-    pub fn record_peer_healthy_cycle(
-        &mut self,
-        peer_id: u8,
-    ) -> Result<(), DiscoveryError> {
+    pub fn record_peer_healthy_cycle(&mut self, peer_id: u8) -> Result<(), DiscoveryError> {
         let idx = self
             .peer_index(peer_id)
             .ok_or(DiscoveryError::UnknownPeer)?;
@@ -389,33 +826,6 @@ impl<V: Voter> RunState<V> {
             peer.consecutive_healthy_cycles.saturating_add(1);
         peer.consecutive_faults = 0;
         Ok(())
-    }
-
-    pub fn apply_health_transitions(&mut self) -> usize {
-        let cfg = self.health_config;
-        let mut transitions = 0usize;
-        for peer in self.peers.iter_mut() {
-            let old = peer.health;
-            let new = PeerHealth::transition(
-                peer.health,
-                peer.consecutive_faults,
-                peer.consecutive_healthy_cycles,
-                &cfg,
-            );
-            if new != old {
-                warn!(
-                    peer_id = peer.id,
-                    from = ?old,
-                    to = ?new,
-                    consecutive_faults = peer.consecutive_faults,
-                    consecutive_healthy = peer.consecutive_healthy_cycles,
-                    "peer health transitioned in ErrorManagement"
-                );
-                peer.health = new;
-                transitions += 1;
-            }
-        }
-        transitions
     }
 
     pub fn peers_with_health(&self, health: PeerHealth) -> usize {
@@ -464,6 +874,103 @@ impl<V: Voter> RunState<V> {
     pub fn in_fail_safe_mode(&self) -> bool {
         let active_total = 1 + self.active_peer_count();
         active_total <= self.required_agreement()
+    }
+
+    // -------------------------------------------------------------
+    // Cross-Observation Helper
+    // -------------------------------------------------------------
+
+    /// Zaehlt fuer `target_id` (bei unserem Index `target_idx`) die
+    /// Beobachter unter allen Reportern (uns selbst + Nicht-Lost-Peers
+    /// ausser dem Target).
+    ///
+    /// - `own_observed`: hat der lokale Node den Target gesehen?
+    ///   (Aggregator liefert das explizit, damit CycleSync
+    ///   [cycle_own_seen] und Result [peer_results.is_some] mit
+    ///   derselben Helper laufen koennen.)
+    /// - `sender_mask_getter`: extrahiert die relevante Peer-Mask fuer
+    ///   Reporter i (z.B. cycle_peer_seen[i] oder peer_acks[i].received_from).
+    ///
+    /// Rueckgabe: `(observers, reporters)`. Die eigene Sicht ist immer
+    /// mitgezaehlt (reporters startet bei 1).
+    fn count_observations<F>(
+        &self,
+        target_idx: usize,
+        target_id: u8,
+        own_observed: bool,
+        sender_mask_getter: F,
+    ) -> (usize, usize)
+    where
+        F: Fn(&Self, usize) -> Option<PeerMask>,
+    {
+        let mut observers = 0usize;
+        let mut reporters = 1usize; // eigener Node zaehlt immer als Reporter
+
+        if own_observed {
+            observers += 1;
+        }
+
+        for (i, other) in self.peers.iter().enumerate() {
+            if i == target_idx {
+                continue;
+            }
+            if other.health == PeerHealth::Lost {
+                continue;
+            }
+            if let Some(mask) = sender_mask_getter(self, i) {
+                reporters += 1;
+                if self.sender_observed(other.id, mask, target_id) {
+                    observers += 1;
+                }
+            }
+        }
+
+        (observers, reporters)
+    }
+
+    /// Prueft, ob `sender_id` in seiner `sender_mask` die Node `target_id`
+    /// als beobachtet markiert hat.
+    ///
+    /// Bit-Zuordnung: `sender_mask` ist ueber die Peer-Liste des SENDERS
+    /// indiziert (= alle Nodes ausser `sender_id`, sortiert nach id). Der
+    /// Empfaenger rekonstruiert diese Ordnung aus seinem Wissen ueber
+    /// das komplette Nodeset.
+    fn sender_observed(
+        &self,
+        sender_id: u8,
+        sender_mask: PeerMask,
+        target_id: u8,
+    ) -> bool {
+        if sender_id == target_id {
+            return false; // Sender kann sich selbst nicht beobachten
+        }
+
+        // Alle bekannten Node-IDs sammeln (own + Peers) und sortieren.
+        let mut all_ids = [0u8; MAX_TOTAL_NODES];
+        let mut n = 0usize;
+        all_ids[n] = self.own_id;
+        n += 1;
+        for p in self.peers.iter() {
+            if n >= MAX_TOTAL_NODES {
+                break;
+            }
+            all_ids[n] = p.id;
+            n += 1;
+        }
+        all_ids[..n].sort_unstable();
+
+        // Position von target_id in "all_ids ohne sender_id" bestimmen.
+        let mut position = 0usize;
+        for &id in &all_ids[..n] {
+            if id == sender_id {
+                continue;
+            }
+            if id == target_id {
+                return sender_mask.contains(position);
+            }
+            position += 1;
+        }
+        false
     }
 
     // ---- PeerSync-Ergebnis ----

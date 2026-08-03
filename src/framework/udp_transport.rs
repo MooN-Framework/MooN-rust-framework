@@ -139,8 +139,20 @@ impl<P: CyclePayload> UdpTransport<P> {
         })
     }
 
-    /// Sendet einen State-Frame mit automatisch hochgezaehlter seq_num.
-    pub fn send_state(&mut self, node_state: NodeState) -> Result<u32, TransportError> {
+    /// Sendet einen State-Frame mit angehaengter Beobachtungs-Mask.
+    ///
+    /// `seen_mask` beschreibt aus Sicht des Senders, welche seiner Peers
+    /// er in der aktuellen Phase (i.d.R. CycleSync) bereits gesehen hat.
+    /// Wird von der Aggregations-Logik in `RunState` genutzt, um
+    /// MissedCycleSync als majority-confirmed Observation zu behandeln.
+    ///
+    /// In Phasen ohne relevante Beobachtung (z.B. reine Barrier ohne
+    /// Voting-Bezug) darf `PeerMask::EMPTY` uebergeben werden.
+    pub fn send_state(
+        &mut self,
+        node_state: NodeState,
+        seen_mask: PeerMask,
+    ) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
         let timestamp = now_monotonic_ns();
         let frame = UdpFrame::<P>::state_frame(
@@ -149,6 +161,7 @@ impl<P: CyclePayload> UdpTransport<P> {
             seq,
             node_state,
             timestamp,
+            seen_mask,
         );
         self.socket.send_to(&frame.encode(), self.group_addr)?;
         self.next_seq_num = self.next_seq_num.wrapping_add(1);
@@ -187,6 +200,33 @@ impl<P: CyclePayload> UdpTransport<P> {
             timestamp,
             received_from,
             publisher_candidate,
+        );
+        self.socket.send_to(&frame.encode(), self.group_addr)?;
+        self.next_seq_num = self.next_seq_num.wrapping_add(1);
+        Ok(seq)
+    }
+
+    /// Sendet einen Exclusion-Vorschlag im ErrorManagement-Voting.
+    ///
+    /// `propose_exclude` ist die Bitmask der Peers (in Sender-Peer-Ordnung),
+    /// die der Sender im naechsten Health-Uebergang ausschliessen moechte
+    /// (Alive->Suspect oder Suspect->Lost). Der eigentliche Uebergang wird
+    /// nur von Peers ausgefuehrt, wenn eine Mehrheit der nicht-angeklagten
+    /// Nodes denselben Peer vorschlaegt (Regel 1a: X's Eigenvote ignoriert).
+    pub fn send_exclusion_proposal(
+        &mut self,
+        node_state: NodeState,
+        propose_exclude: PeerMask,
+    ) -> Result<u32, TransportError> {
+        let seq = self.next_seq_num;
+        let timestamp = now_monotonic_ns();
+        let frame = UdpFrame::<P>::exclusion_proposal_frame(
+            self.self_node_id,
+            self.self_session_id,
+            seq,
+            node_state,
+            timestamp,
+            propose_exclude,
         );
         self.socket.send_to(&frame.encode(), self.group_addr)?;
         self.next_seq_num = self.next_seq_num.wrapping_add(1);

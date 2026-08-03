@@ -12,7 +12,7 @@ use crc32fast::Hasher;
 //   13       node_state_wire   (1)
 //   14..22   timestamp         (8)   <-- Sende-Zeitstempel des Absenders (ns)
 //   22       payload_disc      (1)
-//   23..X    payload_body      (0 | P::WIRE_SIZE | 2 | 8 | 24)
+//   23..X    payload_body      (1 | P::WIRE_SIZE | 2 | 1 | 8 | 24)
 //   X..X+4   crc32             (4)
 // -------------------------------------------------------------
 // `timestamp` ist der lokale monotone Zeitstempel des Senders zum Zeitpunkt
@@ -21,9 +21,20 @@ use crc32fast::Hasher;
 // kann der Empfaenger ihn ueber die bekannten Offsets in seine lokale Uhr
 // umrechnen und damit Stale-Frame-Erkennung und Cycle-Alignment machen.
 // -------------------------------------------------------------
+// Payload-Bodies:
+//   State                : 1 Byte  (seen_mask)
+//   Result(P)            : P::WIRE_SIZE
+//   Ack                  : 2 Byte  (received_from + publisher_candidate)
+//   ExclusionProposal    : 1 Byte  (propose_exclude)
+//   TimeSyncReq          : 8 Byte  (t1)
+//   TimeSyncResp         : 24 Byte (t1 + t2 + t3)
+// -------------------------------------------------------------
 const HEADER_SIZE: usize = 23;
 const CRC_SIZE: usize = 4;
+
+const STATE_BODY: usize = 1;
 const ACK_BODY: usize = 2;
+const EXCLUSION_PROPOSAL_BODY: usize = 1;
 const TIME_SYNC_REQ_BODY: usize = 8; // t1
 const TIME_SYNC_RESP_BODY: usize = 24; // t1, t2, t3
 
@@ -32,6 +43,7 @@ const DISC_RESULT: u8 = 0x01;
 const DISC_ACK: u8 = 0x02;
 const DISC_TIMESYNC_REQ: u8 = 0x03;
 const DISC_TIMESYNC_RESP: u8 = 0x04;
+const DISC_EXCLUSION_PROPOSAL: u8 = 0x05;
 
 /// Obere Grenze fuer `CyclePayload::WIRE_SIZE`.
 ///
@@ -70,11 +82,36 @@ impl From<PayloadError> for FrameError {
 // -------------------------------------------------------------
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Payload<P: CyclePayload> {
-    State,
+    /// State-Frame mit angehaengter Beobachtungs-Mask.
+    ///
+    /// `seen_mask` ist eine bitweise Attestation des Senders: welche seiner
+    /// Peers hat er in der aktuellen Phase bereits gesehen? Wird in
+    /// CycleSync piggyback-genutzt, damit MissedCycleSync nicht rein lokal,
+    /// sondern als verteilte Beobachtung entschieden werden kann.
+    ///
+    /// Bit-Interpretation: Bit `k` bezieht sich auf den `k`-ten Peer des
+    /// SENDERS (dessen Peer-Liste = alle Nodes ausser Sender, sortiert
+    /// nach id). Der Empfaenger muss diese Zuordnung mit seinem eigenen
+    /// Wissen ueber das Nodeset rekonstruieren.
+    State {
+        seen_mask: PeerMask,
+    },
     Result(P),
     Ack {
         received_from: PeerMask,
         publisher_candidate: u8,
+    },
+    /// Ausschluss-Vorschlag im ErrorManagement-Voting.
+    ///
+    /// `propose_exclude` = Bitmask der Peers (aus Sender-Perspektive), die
+    /// der Sender im naechsten Health-Uebergang ausschliessen moechte
+    /// (Alive->Suspect oder Suspect->Lost). Der eigentliche Uebergang wird
+    /// nur ausgefuehrt, wenn eine Mehrheit der nicht-angeklagten Nodes
+    /// denselben Peer vorschlaegt.
+    ///
+    /// Bit-Interpretation wie bei `State.seen_mask`.
+    ExclusionProposal {
+        propose_exclude: PeerMask,
     },
     /// Cristian-Request. `t1` = Sendezeit auf der Uhr des Anfragers (ns).
     /// Identisch mit dem Header-`timestamp`, wird zusaetzlich hier gefuehrt,
@@ -122,6 +159,8 @@ impl<P: CyclePayload> UdpFrame<P> {
         let body = max_usize(P::WIRE_SIZE, ACK_BODY);
         let body = max_usize(body, TIME_SYNC_REQ_BODY);
         let body = max_usize(body, TIME_SYNC_RESP_BODY);
+        let body = max_usize(body, STATE_BODY);
+        let body = max_usize(body, EXCLUSION_PROPOSAL_BODY);
         HEADER_SIZE + body + CRC_SIZE
     };
 
@@ -152,6 +191,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         seq_num: u32,
         node_state: NodeState,
         timestamp: u64,
+        seen_mask: PeerMask,
     ) -> Self {
         Self::new(
             node_id,
@@ -159,7 +199,7 @@ impl<P: CyclePayload> UdpFrame<P> {
             seq_num,
             node_state,
             timestamp,
-            Payload::State,
+            Payload::State { seen_mask },
         )
     }
 
@@ -200,6 +240,24 @@ impl<P: CyclePayload> UdpFrame<P> {
                 received_from,
                 publisher_candidate,
             },
+        )
+    }
+
+    pub fn exclusion_proposal_frame(
+        node_id: u8,
+        session_id: u64,
+        seq_num: u32,
+        node_state: NodeState,
+        timestamp: u64,
+        propose_exclude: PeerMask,
+    ) -> Self {
+        Self::new(
+            node_id,
+            session_id,
+            seq_num,
+            node_state,
+            timestamp,
+            Payload::ExclusionProposal { propose_exclude },
         )
     }
 
@@ -272,8 +330,9 @@ impl<P: CyclePayload> UdpFrame<P> {
         h.update(&self.timestamp.to_le_bytes());
 
         match &self.payload {
-            Payload::State => {
+            Payload::State { seen_mask } => {
                 h.update(&[DISC_STATE]);
+                h.update(&[seen_mask.as_u8()]);
             }
             Payload::Result(r) => {
                 h.update(&[DISC_RESULT]);
@@ -291,6 +350,10 @@ impl<P: CyclePayload> UdpFrame<P> {
                 h.update(&[DISC_ACK]);
                 h.update(&[received_from.as_u8()]);
                 h.update(&[*publisher_candidate]);
+            }
+            Payload::ExclusionProposal { propose_exclude } => {
+                h.update(&[DISC_EXCLUSION_PROPOSAL]);
+                h.update(&[propose_exclude.as_u8()]);
             }
             Payload::TimeSyncReq { t1 } => {
                 h.update(&[DISC_TIMESYNC_REQ]);
@@ -321,7 +384,10 @@ impl<P: CyclePayload> UdpFrame<P> {
         buf.push(self.node_state_wire);
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
         match self.payload {
-            Payload::State => buf.push(DISC_STATE),
+            Payload::State { seen_mask } => {
+                buf.push(DISC_STATE);
+                buf.push(seen_mask.as_u8());
+            }
             Payload::Result(r) => {
                 buf.push(DISC_RESULT);
                 let mut staging = [0u8; MAX_PAYLOAD_WIRE_SIZE];
@@ -338,6 +404,10 @@ impl<P: CyclePayload> UdpFrame<P> {
                 buf.push(DISC_ACK);
                 buf.push(received_from.as_u8());
                 buf.push(publisher_candidate);
+            }
+            Payload::ExclusionProposal { propose_exclude } => {
+                buf.push(DISC_EXCLUSION_PROPOSAL);
+                buf.push(propose_exclude.as_u8());
             }
             Payload::TimeSyncReq { t1 } => {
                 buf.push(DISC_TIMESYNC_REQ);
@@ -374,7 +444,13 @@ impl<P: CyclePayload> UdpFrame<P> {
         let disc = bytes[22];
 
         let (payload, body_size) = match disc {
-            DISC_STATE => (Payload::State, 0usize),
+            DISC_STATE => {
+                if bytes.len() < HEADER_SIZE + STATE_BODY + CRC_SIZE {
+                    return Err(FrameError::TooShort);
+                }
+                let mask = PeerMask::from_u8(bytes[HEADER_SIZE]);
+                (Payload::State { seen_mask: mask }, STATE_BODY)
+            }
             DISC_RESULT => {
                 let end = HEADER_SIZE + P::WIRE_SIZE;
                 if bytes.len() < end + CRC_SIZE {
@@ -396,6 +472,18 @@ impl<P: CyclePayload> UdpFrame<P> {
                         publisher_candidate: cand,
                     },
                     ACK_BODY,
+                )
+            }
+            DISC_EXCLUSION_PROPOSAL => {
+                if bytes.len() < HEADER_SIZE + EXCLUSION_PROPOSAL_BODY + CRC_SIZE {
+                    return Err(FrameError::TooShort);
+                }
+                let mask = PeerMask::from_u8(bytes[HEADER_SIZE]);
+                (
+                    Payload::ExclusionProposal {
+                        propose_exclude: mask,
+                    },
+                    EXCLUSION_PROPOSAL_BODY,
                 )
             }
             DISC_TIMESYNC_REQ => {
