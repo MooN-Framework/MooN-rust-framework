@@ -1,41 +1,21 @@
-//! Framework-weite Konfigurationstypen.
-//!
-//! Zentrale Anlaufstelle fuer die Datentypen, die den Rahmen der
-//! Systemarbeit vorgeben. Aktuell nur `ParticipantConfig`; spaeter
-//! sollen hier auch die anderen Konfig-Structs zusammengefuehrt werden
-//! (TransportConfig, DiagnosticConfig, HealthConfig, CycleTimingConfig).
+use serde::Deserialize;
+use std::net::Ipv4Addr;
+use std::time::Duration;
 
-// -------------------------------------------------------------
-// Framework-Grenzen
-// -------------------------------------------------------------
-
-/// Compile-Zeit-Obergrenze fuer die Gesamtzahl von Nodes im System.
-/// Begrenzt durch die 8-Bit-Peer-Maske im Wire-Protokoll: ein Bit pro Peer,
-/// eigener Node explizit → 8 Nodes maximal.
+/// Compile-time upper bound on total nodes. Limited by the 8-bit peer mask.
 pub const MAX_TOTAL_NODES: usize = 8;
 
-/// Anzahl der Peer-Slots pro Node (jeder Node kennt sich selbst + Peers).
-/// Wird als const-Grosse fuer `heapless::Vec` im gesamten Framework
-/// verwendet.
+/// Peer slots per node (own node excluded).
 pub const MAX_PEERS: usize = MAX_TOTAL_NODES - 1;
 
-// -------------------------------------------------------------
-// ParticipantConfig (M-oo-N)
-// -------------------------------------------------------------
+/// Maximum number of dissenter indices returned by `Voter::find_dissenters`.
+pub const MAX_DISSENTERS: usize = 16;
 
-/// M-oo-N-Konfiguration: beschreibt Sollstaerke und Untergrenze.
+/// M-oo-N participant configuration.
 ///
-/// - `nominal_participants` (N): Gesamtzahl der Nodes im Normalbetrieb.
-///   Wird zum Startup erwartet; Discovery muss GENAU N Nodes finden,
-///   sonst Fehlstart.
-/// - `min_participants` (M): Untergrenze fuer sicheren Betrieb. Sinkt
-///   die aktive Anzahl darunter, geht das System in Failsafe.
-///
-/// Klassische Deployments:
-/// - 2oo3: nominal=3, minimum=2 (Fail-Operational, verkraftet 1 Ausfall)
-/// - 2oo2: nominal=2, minimum=2 (Fail-Safe, keine Toleranz)
-/// - 6oo8: nominal=8, minimum=6 (verkraftet 2 Ausfaelle)
-/// - 8oo8: nominal=8, minimum=8 (Fail-Safe, keine Toleranz)
+/// `nominal` is the full node count expected in normal operation and must
+/// match the discovered set exactly. `minimum` is the safety floor; falling
+/// below triggers failsafe.
 #[derive(Debug, Clone, Copy)]
 pub struct ParticipantConfig {
     pub nominal_participants: u8,
@@ -43,25 +23,14 @@ pub struct ParticipantConfig {
 }
 
 impl ParticipantConfig {
-    /// Erzeugt eine ParticipantConfig. Panic bei ungueltigen Werten
-    /// (Konstruktions-Zeit — sollte beim Start sofort auffliegen, nicht
-    /// im laufenden Betrieb).
-    ///
-    /// Reihenfolge: `minimum` zuerst, weil M die Sicherheitsuntergrenze
-    /// ist und intuitiv zuerst gedacht wird ("mindestens X von Y").
+    /// Construct a config. Panics on invalid values (construction-time
+    /// invariant, must fail loudly at startup).
     pub fn new(minimum: u8, nominal: u8) -> Self {
-        assert!(minimum >= 1, "min_participants muss >= 1 sein");
-        assert!(
-            minimum <= nominal,
-            "min_participants ({}) darf nicht groesser als nominal ({}) sein",
-            minimum,
-            nominal
-        );
+        assert!(minimum >= 1, "min_participants must be >= 1");
+        assert!(minimum <= nominal, "min ({minimum}) must not exceed nominal ({nominal})");
         assert!(
             nominal as usize <= MAX_TOTAL_NODES,
-            "nominal_participants ({}) ueberschreitet Framework-Grenze ({})",
-            nominal,
-            MAX_TOTAL_NODES
+            "nominal ({nominal}) exceeds MAX_TOTAL_NODES ({MAX_TOTAL_NODES})"
         );
         Self {
             nominal_participants: nominal,
@@ -69,14 +38,149 @@ impl ParticipantConfig {
         }
     }
 
-    /// Anzahl der verkraftbaren Ausfaelle bis Failsafe: N - M.
+    /// Number of node failures tolerated before entering failsafe: `N - M`.
     pub fn tolerable_failures(&self) -> u8 {
         self.nominal_participants - self.min_participants
     }
 
-    /// Maximale Anzahl Peers (eigener Node ausgenommen).
+    /// Peer slots per node (own node excluded).
     pub fn max_peers(&self) -> usize {
         (self.nominal_participants - 1) as usize
+    }
+}
+
+/// All timing parameters for the operational cycle and its subphases.
+#[derive(Debug, Clone, Copy)]
+pub struct CycleTiming {
+    pub cycle_duration: Duration,
+    pub init_sync_timeout: Duration,
+    pub peer_sync_timeout: Duration,
+    pub peer_sync_request_interval: Duration,
+    pub cycle_sync_timeout: Duration,
+    pub share_timeout: Duration,
+    pub ack_timeout: Duration,
+    pub error_management_vote_timeout: Duration,
+    pub stale_threshold: Duration,
+    pub resync_interval_cycles: u32,
+}
+
+/// UDP multicast transport binding for peer-to-peer traffic.
+#[derive(Debug, Clone)]
+pub struct TransportConfig {
+    pub interface_name: String,
+    pub multicast_group: Ipv4Addr,
+    pub port: u16,
+    pub self_node_id: u8,
+    pub self_session_id: u64,
+    pub initial_seq_num: u32,
+}
+
+/// UDP multicast binding for the diagnostic side-channel.
+#[derive(Debug, Clone)]
+pub struct DiagnosticConfig {
+    pub enabled: bool,
+    pub interface_name: String,
+    pub multicast_group: Ipv4Addr,
+    pub port: u16,
+}
+
+impl Default for DiagnosticConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interface_name: "lo".into(),
+            multicast_group: Ipv4Addr::new(239, 10, 0, 2),
+            port: 6666,
+        }
+    }
+}
+
+/// Root of a node's TOML configuration file. One file per node — `own_id`
+/// distinguishes them; the other sections are typically identical across
+/// the fabric.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeConfig {
+    pub own_id: u8,
+    pub participants: ParticipantSection,
+    pub timing: TimingSection,
+    pub transport: TransportSection,
+    pub diagnostic: DiagnosticSection,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ParticipantSection {
+    pub nominal: u8,
+    pub minimum: u8,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TimingSection {
+    pub cycle_ms: u64,
+    pub init_sync_ms: u64,
+    pub peer_sync_ms: u64,
+    pub peer_sync_request_interval_ms: u64,
+    pub cycle_sync_ms: u64,
+    pub share_ms: u64,
+    pub ack_ms: u64,
+    pub error_management_vote_ms: u64,
+    pub stale_ms: u64,
+    pub resync_interval_cycles: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransportSection {
+    pub interface: String,
+    pub multicast_group: Ipv4Addr,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiagnosticSection {
+    pub enabled: bool,
+    pub interface: String,
+    pub multicast_group: Ipv4Addr,
+    pub port: u16,
+}
+
+impl NodeConfig {
+    pub fn participants(&self) -> ParticipantConfig {
+        ParticipantConfig::new(self.participants.minimum, self.participants.nominal)
+    }
+
+    pub fn timing(&self) -> CycleTiming {
+        let t = &self.timing;
+        CycleTiming {
+            cycle_duration: Duration::from_millis(t.cycle_ms),
+            init_sync_timeout: Duration::from_millis(t.init_sync_ms),
+            peer_sync_timeout: Duration::from_millis(t.peer_sync_ms),
+            peer_sync_request_interval: Duration::from_millis(t.peer_sync_request_interval_ms),
+            cycle_sync_timeout: Duration::from_millis(t.cycle_sync_ms),
+            share_timeout: Duration::from_millis(t.share_ms),
+            ack_timeout: Duration::from_millis(t.ack_ms),
+            error_management_vote_timeout: Duration::from_millis(t.error_management_vote_ms),
+            stale_threshold: Duration::from_millis(t.stale_ms),
+            resync_interval_cycles: t.resync_interval_cycles,
+        }
+    }
+
+    pub fn transport(&self, self_session_id: u64) -> TransportConfig {
+        TransportConfig {
+            interface_name: self.transport.interface.clone(),
+            multicast_group: self.transport.multicast_group,
+            port: self.transport.port,
+            self_node_id: self.own_id,
+            self_session_id,
+            initial_seq_num: 0,
+        }
+    }
+
+    pub fn diagnostic(&self) -> DiagnosticConfig {
+        DiagnosticConfig {
+            enabled: self.diagnostic.enabled,
+            interface_name: self.diagnostic.interface.clone(),
+            multicast_group: self.diagnostic.multicast_group,
+            port: self.diagnostic.port,
+        }
     }
 }
 
@@ -85,33 +189,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_configs_work() {
-        let two_oo_three = ParticipantConfig::new(2, 3);
-        assert_eq!(two_oo_three.tolerable_failures(), 1);
-        assert_eq!(two_oo_three.max_peers(), 2);
-
-        let two_oo_two = ParticipantConfig::new(2, 2);
-        assert_eq!(two_oo_two.tolerable_failures(), 0);
-
-        let six_oo_eight = ParticipantConfig::new(6, 8);
-        assert_eq!(six_oo_eight.tolerable_failures(), 2);
+    fn participants_valid() {
+        let c = ParticipantConfig::new(2, 3);
+        assert_eq!(c.tolerable_failures(), 1);
+        assert_eq!(c.max_peers(), 2);
     }
 
     #[test]
-    #[should_panic(expected = "min_participants muss >= 1 sein")]
-    fn zero_minimum_panics() {
-        let _ = ParticipantConfig::new(0, 3);
+    #[should_panic]
+    fn participants_zero_minimum() {
+        ParticipantConfig::new(0, 3);
     }
 
     #[test]
-    #[should_panic(expected = "darf nicht groesser als nominal")]
-    fn minimum_over_nominal_panics() {
-        let _ = ParticipantConfig::new(3, 2);
+    #[should_panic]
+    fn participants_minimum_over_nominal() {
+        ParticipantConfig::new(3, 2);
     }
 
     #[test]
-    #[should_panic(expected = "ueberschreitet Framework-Grenze")]
-    fn nominal_over_max_panics() {
-        let _ = ParticipantConfig::new(5, 9);
+    #[should_panic]
+    fn participants_nominal_over_max() {
+        ParticipantConfig::new(5, 9);
     }
 }

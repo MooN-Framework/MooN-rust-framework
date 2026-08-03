@@ -1,24 +1,11 @@
-// Kleine Helfer fuer die Serialisierung von CyclePayload-Werten.
-// Kapseln Bounds-Check und Offset-Tracking, damit Payload-Impls
-// keine rohen Byte-Slices und `.try_into().unwrap()` brauchen.
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadError {
-    /// Puffer zu klein fuer die naechste Leseoperation.
     TooShort,
-    /// Wert liegt ausserhalb des erlaubten Bereichs (z.B. Bool != 0/1).
     Invalid,
 }
 
-// -------------------------------------------------------------
-// Writer
-// -------------------------------------------------------------
-//
-// Panic bei Ueberlauf ist beabsichtigt: der Aufrufer garantiert per
-// Trait-Vertrag `buf.len() >= WIRE_SIZE`. Ein Ueberlauf ist ein Bug in
-// der Payload-Impl (WIRE_SIZE stimmt nicht mit dem to_wire-Verhalten
-// ueberein), kein Laufzeitfehler.
-
+/// Fixed-buffer serialization writer. Overflow panics — callers must ensure
+/// `buf.len() >= WIRE_SIZE` per trait contract.
 pub struct WireWriter<'a> {
     buf: &'a mut [u8],
     pos: usize,
@@ -75,10 +62,8 @@ impl<'a> WireWriter<'a> {
     }
 }
 
-// -------------------------------------------------------------
-// Reader
-// -------------------------------------------------------------
-
+/// Fixed-buffer deserialization reader. Bounds-checked; returns
+/// `PayloadError::TooShort` on underflow.
 pub struct WireReader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -106,8 +91,7 @@ impl<'a> WireReader<'a> {
         Ok(self.take(1)?[0])
     }
 
-    /// Strikte Bool-Codierung: nur 0x00 und 0x01 sind gueltig. Alles andere
-    /// ist eine kaputte Payload — analog zum Argument bei NodeState::from_wire.
+    /// Strict boolean codec: only `0x00` and `0x01` are valid.
     pub fn read_bool(&mut self) -> Result<bool, PayloadError> {
         match self.read_u8()? {
             0 => Ok(false),

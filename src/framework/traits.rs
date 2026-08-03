@@ -1,10 +1,10 @@
-use core::fmt;
-
+use crate::framework::config::MAX_DISSENTERS;
 use crate::framework::wire::{PayloadError, WireReader, WireWriter};
+use core::fmt;
+use heapless::Vec;
 
-/// Nutzwert, den jeder Node pro Zyklus berechnet und mit den Peers teilt.
-/// Fixed-size Wire-Repraesentation ist Pflicht: deterministischer Speicher
-/// im sicherheitsrelevanten Pfad.
+/// Value each node computes and shares per cycle. Wire size is fixed for
+/// deterministic memory use on safety-critical paths.
 pub trait CyclePayload: Copy + PartialEq + core::fmt::Debug {
     const WIRE_SIZE: usize;
 
@@ -19,45 +19,34 @@ pub enum VotingOutcome<D> {
     InsufficientQuorum,
 }
 
-/// Voting-Regel: aus eigenem Ergebnis + Peer-Ergebnissen eine Entscheidung.
+/// Voting rule: reduce own + peer values to a decision.
 pub trait Voter {
     type Payload: CyclePayload;
     type Decision: Copy;
 
-    /// `peers[i] == None`: Peer i hat rechtzeitig nichts geliefert.
+    /// `peers[i] == None` means peer i sent nothing in time.
     fn decide(
         &self,
         own: &Self::Payload,
         peers: &[Option<Self::Payload>],
     ) -> VotingOutcome<Self::Decision>;
 
-    /// Mindestanzahl vorliegender Antworten (inkl. eigener), damit `decide`
-    /// nicht sofort `InsufficientQuorum` liefert. Bei 2oo3: 2.
+    /// Minimum responses (including own) before `decide` short-circuits to
+    /// `InsufficientQuorum`.
     fn required_participants(&self) -> u8;
 
-    /// Nach `decide` mit `Consensus` aufzurufen. Identifiziert Werte, die
-    /// nicht mit der Consensus-Entscheidung uebereinstimmen.
-    ///
-    /// Rueckgabe:
-    /// - `own_dissented`: true wenn der eigene Wert von der Consensus-
-    ///   Entscheidung abwich. In diesem Fall ist der eigene Node der
-    ///   Ausreisser und sollte sich isolieren.
-    /// - `peer_dissenter_indices`: Indizes in den urspruenglichen
-    ///   `peers`-Slice, deren Wert von der Consensus-Entscheidung abwich.
-    ///
-    /// Wird ausschliesslich nach `Consensus` aufgerufen — bei
-    /// `Disagreement` oder `InsufficientQuorum` gibt es keine Referenz
-    /// zum Vergleichen.
+    /// Called after `decide` returned `Consensus`. Returns:
+    /// - `own_dissented`: our value disagreed with the consensus.
+    /// - dissenting peer indices into the original `peers` slice.
     fn find_dissenters(
         &self,
         own: &Self::Payload,
         peers: &[Option<Self::Payload>],
         decision: &Self::Decision,
-    ) -> (bool, heapless::Vec<u8, 16>);
+    ) -> (bool, Vec<u8, MAX_DISSENTERS>);
 }
 
-/// Anwendungsspezifische Berechnung: aus Rohdaten (Input) den Wert
-/// erzeugen, der im Zyklus mit den Peers geteilt wird.
+/// Domain-specific computation: raw inputs -> shareable payload.
 pub trait Computation {
     type Input: Copy;
     type Payload: CyclePayload;
@@ -66,8 +55,7 @@ pub trait Computation {
     fn compute(&mut self, input: Self::Input) -> Result<Self::Payload, Self::Error>;
 }
 
-/// Empfaenger der vom Voter beschlossenen Entscheidung.
-/// Wird pro Zyklus einmal aufgerufen, wenn Consensus erreicht ist.
+/// Recipient of the voting decision. Called once per cycle on consensus.
 pub trait DecisionSink {
     type Decision;
 

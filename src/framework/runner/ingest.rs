@@ -1,0 +1,117 @@
+use crate::framework::state::{AckInfo, PeerHealth};
+use crate::framework::traits::{Computation, DecisionSink, Voter};
+use crate::framework::transport::now_monotonic_ns;
+use crate::framework::types::PeerMask;
+use crate::framework::wire::{Payload, UdpFrame};
+use serde::Deserialize;
+use tracing::{debug, warn};
+
+impl<C, V, S> super::Runner<C, V, S>
+where
+    C: Computation,
+    V: Voter<Payload = C::Payload>,
+    S: DecisionSink<Decision = V::Decision>,
+    C::Input: for<'de> Deserialize<'de>,
+{
+    /// Route a validated frame into `RunState`. Drops frames from unknown
+    /// or lost peers and stale frames (post time-sync).
+    pub(super) fn ingest_frame(&mut self, frame: UdpFrame<V::Payload>) {
+        let peer_id = frame.node_id();
+
+        if self.state.discovery_locked() && self.state.peer_index(peer_id).is_none() {
+            warn!(peer_id, "frame from unknown peer post-discovery, dropped");
+            return;
+        }
+        if let Some(idx) = self.state.peer_index(peer_id) {
+            if self.state.peers()[idx].health == PeerHealth::Lost {
+                debug!(peer_id, "frame from lost peer dropped");
+                return;
+            }
+        }
+        if let Some(age) = self.frame_age_if_stale(&frame) {
+            debug!(peer_id, age_ns = age, "stale frame dropped");
+            return;
+        }
+
+        match frame.payload() {
+            Payload::Result(value) => {
+                if let Err(e) = self.state.record_peer_result(peer_id, value) {
+                    warn!(peer_id, error = ?e, "record_peer_result failed");
+                }
+            }
+            Payload::Ack { received_from, publisher_candidate } => {
+                let ack = AckInfo {
+                    received_from: received_from.as_u8(),
+                    publisher_candidate,
+                };
+                if let Err(e) = self.state.record_peer_ack(peer_id, ack) {
+                    warn!(peer_id, error = ?e, "record_peer_ack failed");
+                }
+            }
+            Payload::ExclusionProposal { propose_exclude } => {
+                if let Err(e) = self.state.record_peer_exclusion_proposal(peer_id, propose_exclude) {
+                    warn!(peer_id, error = ?e, "record_peer_exclusion_proposal failed");
+                }
+            }
+            Payload::State { .. } => {
+                debug!(peer_id, "state frame outside CycleSync, dropped");
+            }
+            Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. } => {
+                debug!(peer_id, "sync frame outside PeerSync, dropped");
+            }
+        }
+    }
+
+    /// True when every non-Lost peer has recorded a result this cycle.
+    pub(super) fn all_peer_results_in(&self) -> bool {
+        for (idx, peer) in self.state.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            if self.state.cycle().peer_results[idx].is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True when every non-Lost peer has recorded an ack this cycle.
+    pub(super) fn all_peer_acks_in(&self) -> bool {
+        for (idx, peer) in self.state.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            if self.state.cycle().peer_acks[idx].is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Bitmask of peers whose result we have this cycle. Attested to peers
+    /// via the ack frame so cross-observed evidence can be aggregated.
+    pub(super) fn received_mask(&self) -> PeerMask {
+        let mut mask = PeerMask::EMPTY;
+        for (idx, slot) in self.state.cycle().peer_results.iter().enumerate() {
+            if slot.is_some() {
+                mask.set(idx);
+            }
+        }
+        mask
+    }
+
+    /// Age of a frame against local time if a translation is available and
+    /// the age exceeds the stale threshold. Returns `None` when either the
+    /// clock offset is unknown or the frame is fresh.
+    fn frame_age_if_stale(&self, frame: &UdpFrame<V::Payload>) -> Option<u64> {
+        if !self.state.sync_valid() {
+            return None;
+        }
+        let peer_id = frame.node_id();
+        let local_send = self.state.peer_ts_to_local(peer_id, frame.timestamp())?;
+        let now = now_monotonic_ns();
+        let age = now.saturating_sub(local_send);
+        let threshold_ns = self.timing.stale_threshold.as_nanos() as u64;
+        if age > threshold_ns { Some(age) } else { None }
+    }
+}

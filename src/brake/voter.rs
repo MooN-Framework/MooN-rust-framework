@@ -1,19 +1,16 @@
 use crate::brake::braking_curve::BrakeResult;
-use crate::framework::config::MAX_TOTAL_NODES;
+use crate::framework::config::{MAX_DISSENTERS, MAX_TOTAL_NODES};
 use crate::framework::traits::{CyclePayload, Voter, VotingOutcome};
 use crate::framework::wire::{PayloadError, WireReader, WireWriter};
 use heapless::Vec;
-use tracing::{debug, error, info, warn};
+use tracing::error;
 
-// -------------------------------------------------------------
-// CyclePayload-Impl fuer BrakeResult
-// -------------------------------------------------------------
-//
-// Layout auf der Leitung (10 Byte, little-endian):
-//   0..8   total_distance   (f64)
-//   8      emergency_brake  (u8: 0x00 | 0x01, strikt)
-//   9      valid_entry      (u8: 0x00 | 0x01, strikt)
-
+/// Wire layout (10 bytes, little-endian):
+/// ```text
+///   0..8   total_distance   (f64)
+///   8      emergency_brake  (u8: 0x00 | 0x01)
+///   9      valid_entry      (u8: 0x00 | 0x01)
+/// ```
 impl CyclePayload for BrakeResult {
     const WIRE_SIZE: usize = 10;
 
@@ -33,16 +30,8 @@ impl CyclePayload for BrakeResult {
     }
 }
 
-// -------------------------------------------------------------
-// Voter
-// -------------------------------------------------------------
-
-/// M-oo-N Voter fuer BrakeResult.
-///
-/// Uebereinstimmung ist definiert als:
-///   - `emergency_brake` exakt gleich,
-///   - `valid_entry` exakt gleich,
-///   - `|a.total_distance - b.total_distance| <= distance_tolerance`.
+/// M-oo-N voter for `BrakeResult`. Two values agree iff booleans match
+/// exactly and total distances are within `distance_tolerance`.
 #[derive(Debug, Clone, Copy)]
 pub struct BrakeVoter {
     pub min_participants: u8,
@@ -51,17 +40,16 @@ pub struct BrakeVoter {
 
 impl BrakeVoter {
     pub fn new(min_participants: u8, distance_tolerance: f64) -> Self {
-        assert!(min_participants >= 1, "min_participants muss >= 1 sein");
+        assert!(min_participants >= 1, "min_participants must be >= 1");
         assert!(
             distance_tolerance >= 0.0 && distance_tolerance.is_finite(),
-            "distance_tolerance muss endlich und nicht-negativ sein"
+            "distance_tolerance must be finite and non-negative"
         );
-        Self {
-            min_participants,
-            distance_tolerance,
-        }
+        Self { min_participants, distance_tolerance }
     }
 
+    /// True when both values match on both flags and their distances are
+    /// within tolerance.
     fn agree(&self, a: &BrakeResult, b: &BrakeResult) -> bool {
         if a.emergency_brake != b.emergency_brake || a.valid_entry != b.valid_entry {
             return false;
@@ -72,16 +60,16 @@ impl BrakeVoter {
         (a.total_distance - b.total_distance).abs() <= self.distance_tolerance
     }
 
+    /// Median-distance representative of a group. Flags are taken from the
+    /// first element (they are equal by construction).
     fn representative(&self, group: &[BrakeResult]) -> BrakeResult {
         let mut distances: Vec<f64, MAX_TOTAL_NODES> = Vec::new();
         for r in group {
             let _ = distances.push(r.total_distance);
         }
         distances.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = distances[distances.len() / 2];
-
         BrakeResult {
-            total_distance: median,
+            total_distance: distances[distances.len() / 2],
             emergency_brake: group[0].emergency_brake,
             valid_entry: group[0].valid_entry,
         }
@@ -101,39 +89,26 @@ impl Voter for BrakeVoter {
         own: &BrakeResult,
         peers: &[Option<BrakeResult>],
     ) -> VotingOutcome<BrakeResult> {
-        // n_expected: alle Nodes von denen wir in diesem Zyklus einen Wert
-        // erwarten (eigener + alle Peer-Slots). Lost-Peers sind bereits
-        // durch RunState::run_vote rausgefiltert, tauchen hier nicht auf.
         let n_expected = 1 + peers.len();
-
-        // Strikte Mehrheit schliesst Ties strukturell aus:
-        //   n=2 -> 2, n=3 -> 2, n=4 -> 3, n=5 -> 3, n=8 -> 5
         let strict_majority = n_expected / 2 + 1;
-
-        // Kombination mit Systemintegrator-Vorgabe: min_participants als
-        // Untergrenze, falls der Systemintegrator ein strengeres Kriterium
-        // als die reine Mehrheit gesetzt hat (z.B. 6oo8).
         let min_agreement = strict_majority.max(self.min_participants as usize);
 
-        // Vorhandene Werte sammeln
         let mut all: Vec<BrakeResult, MAX_TOTAL_NODES> = Vec::new();
         let _ = all.push(*own);
         for p in peers.iter().flatten() {
             let _ = all.push(*p);
         }
 
-        // Reichen die Antworten ueberhaupt aus, um min_agreement zu erreichen?
         if all.len() < min_agreement {
             error!(
-                "insufficient responses: got {} of {} expected, need {} to agree",
-                all.len(),
-                n_expected,
-                min_agreement
+                got = all.len(),
+                expected = n_expected,
+                need = min_agreement,
+                "insufficient responses"
             );
             return VotingOutcome::InsufficientQuorum;
         }
 
-        // Suche eine Gruppe uebereinstimmender Werte
         for candidate in all.iter() {
             let mut group: Vec<BrakeResult, MAX_TOTAL_NODES> = Vec::new();
             for other in all.iter() {
@@ -145,7 +120,6 @@ impl Voter for BrakeVoter {
                 return VotingOutcome::Consensus(self.representative(&group));
             }
         }
-
         VotingOutcome::Disagreement
     }
 
@@ -154,19 +128,16 @@ impl Voter for BrakeVoter {
         own: &BrakeResult,
         peers: &[Option<BrakeResult>],
         decision: &BrakeResult,
-    ) -> (bool, heapless::Vec<u8, 16>) {
+    ) -> (bool, Vec<u8, MAX_DISSENTERS>) {
         let own_dissented = !self.agree(own, decision);
-
-        let mut peer_dissenter_indices = heapless::Vec::<u8, 16>::new();
-
+        let mut dissenters: Vec<u8, MAX_DISSENTERS> = Vec::new();
         for (idx, peer) in peers.iter().enumerate() {
             if let Some(peer_value) = peer {
                 if !self.agree(peer_value, decision) {
-                    let _ = peer_dissenter_indices.push(idx as u8);
+                    let _ = dissenters.push(idx as u8);
                 }
             }
         }
-
-        (own_dissented, peer_dissenter_indices)
+        (own_dissented, dissenters)
     }
 }

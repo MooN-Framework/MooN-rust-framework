@@ -1,42 +1,31 @@
+//! Framed UDP payload for peer-to-peer traffic.
+//!
+//! Wire layout (little-endian):
+//! ```text
+//!   0        node_id           (1)
+//!   1..9     session_id        (8)
+//!   9..13    seq_num           (4)
+//!   13       node_state_wire   (1)
+//!   14..22   timestamp         (8)   sender local monotonic ns
+//!   22       payload_disc      (1)
+//!   23..X    payload_body      variant-dependent
+//!   X..X+4   crc32             (4)
+//! ```
+
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::CyclePayload;
 use crate::framework::types::PeerMask;
-use crate::framework::wire::{PayloadError, WireReader, WireWriter};
+use crate::framework::wire::codec::{PayloadError, WireReader, WireWriter};
 use crc32fast::Hasher;
 
-// -------------------------------------------------------------
-// Byte-Layout (little-endian):
-//   0        node_id           (1)
-//   1..9     session_id        (8)
-//   9..13    seq_num           (4)
-//   13       node_state_wire   (1)
-//   14..22   timestamp         (8)   <-- Sende-Zeitstempel des Absenders (ns)
-//   22       payload_disc      (1)
-//   23..X    payload_body      (1 | P::WIRE_SIZE | 2 | 1 | 8 | 24)
-//   X..X+4   crc32             (4)
-// -------------------------------------------------------------
-// `timestamp` ist der lokale monotone Zeitstempel des Senders zum Zeitpunkt
-// des Absendens. VOR abgeschlossener Zeitsynchronisation ist der Wert nur
-// Rohdaten (jeder Node hat seine eigene Epoche). NACH der Synchronisation
-// kann der Empfaenger ihn ueber die bekannten Offsets in seine lokale Uhr
-// umrechnen und damit Stale-Frame-Erkennung und Cycle-Alignment machen.
-// -------------------------------------------------------------
-// Payload-Bodies:
-//   State                : 1 Byte  (seen_mask)
-//   Result(P)            : P::WIRE_SIZE
-//   Ack                  : 2 Byte  (received_from + publisher_candidate)
-//   ExclusionProposal    : 1 Byte  (propose_exclude)
-//   TimeSyncReq          : 8 Byte  (t1)
-//   TimeSyncResp         : 24 Byte (t1 + t2 + t3)
-// -------------------------------------------------------------
 const HEADER_SIZE: usize = 23;
 const CRC_SIZE: usize = 4;
 
 const STATE_BODY: usize = 1;
 const ACK_BODY: usize = 2;
 const EXCLUSION_PROPOSAL_BODY: usize = 1;
-const TIME_SYNC_REQ_BODY: usize = 8; // t1
-const TIME_SYNC_RESP_BODY: usize = 24; // t1, t2, t3
+const TIME_SYNC_REQ_BODY: usize = 8;
+const TIME_SYNC_RESP_BODY: usize = 24;
 
 const DISC_STATE: u8 = 0x00;
 const DISC_RESULT: u8 = 0x01;
@@ -45,15 +34,8 @@ const DISC_TIMESYNC_REQ: u8 = 0x03;
 const DISC_TIMESYNC_RESP: u8 = 0x04;
 const DISC_EXCLUSION_PROPOSAL: u8 = 0x05;
 
-/// Obere Grenze fuer `CyclePayload::WIRE_SIZE`.
-///
-/// Bestimmt die Groesse des stack-allokierten Staging-Puffers fuer
-/// Serialisierung und CRC-Berechnung. Wird zur Compile-Zeit geprueft:
-/// eine Instantiierung mit `P::WIRE_SIZE > MAX_PAYLOAD_WIRE_SIZE` schlaegt
-/// die Kompilierung ab.
-///
-/// 64 Byte deckt typische Voter-Payloads ab (mehrere `f64` + Flags + Reserve),
-/// bleibt aber klein genug fuer allokationsfreien Betrieb auf Embedded-Targets.
+/// Upper bound on `CyclePayload::WIRE_SIZE`. Sizes the stack-allocated
+/// staging buffer used during serialization and CRC.
 pub const MAX_PAYLOAD_WIRE_SIZE: usize = 64;
 
 const fn max_usize(a: usize, b: usize) -> usize {
@@ -77,62 +59,28 @@ impl From<PayloadError> for FrameError {
     }
 }
 
-// -------------------------------------------------------------
-// Payload
-// -------------------------------------------------------------
+/// Payload variants carried inside a `UdpFrame`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Payload<P: CyclePayload> {
-    /// State-Frame mit angehaengter Beobachtungs-Mask.
-    ///
-    /// `seen_mask` ist eine bitweise Attestation des Senders: welche seiner
-    /// Peers hat er in der aktuellen Phase bereits gesehen? Wird in
-    /// CycleSync piggyback-genutzt, damit MissedCycleSync nicht rein lokal,
-    /// sondern als verteilte Beobachtung entschieden werden kann.
-    ///
-    /// Bit-Interpretation: Bit `k` bezieht sich auf den `k`-ten Peer des
-    /// SENDERS (dessen Peer-Liste = alle Nodes ausser Sender, sortiert
-    /// nach id). Der Empfaenger muss diese Zuordnung mit seinem eigenen
-    /// Wissen ueber das Nodeset rekonstruieren.
-    State {
-        seen_mask: PeerMask,
-    },
+    /// State beacon with attested observation mask. Bit `k` = sender saw
+    /// its k-th peer this phase, indexed against the sender's peer order
+    /// (all nodes except sender, sorted by id).
+    State { seen_mask: PeerMask },
     Result(P),
     Ack {
         received_from: PeerMask,
         publisher_candidate: u8,
     },
-    /// Ausschluss-Vorschlag im ErrorManagement-Voting.
-    ///
-    /// `propose_exclude` = Bitmask der Peers (aus Sender-Perspektive), die
-    /// der Sender im naechsten Health-Uebergang ausschliessen moechte
-    /// (Alive->Suspect oder Suspect->Lost). Der eigentliche Uebergang wird
-    /// nur ausgefuehrt, wenn eine Mehrheit der nicht-angeklagten Nodes
-    /// denselben Peer vorschlaegt.
-    ///
-    /// Bit-Interpretation wie bei `State.seen_mask`.
-    ExclusionProposal {
-        propose_exclude: PeerMask,
-    },
-    /// Cristian-Request. `t1` = Sendezeit auf der Uhr des Anfragers (ns).
-    /// Identisch mit dem Header-`timestamp`, wird zusaetzlich hier gefuehrt,
-    /// damit die Sync-Logik unabhaengig vom Header-Layout bleibt.
-    TimeSyncReq {
-        t1: u64,
-    },
-    /// Cristian-Response. `t1` = Echo aus Request, `t2` = Empfangszeit beim
-    /// Responder, `t3` = Sendezeit der Antwort (beide auf der Responder-Uhr).
-    /// Der Requester misst `t4` lokal beim Empfang und bildet daraus RTT +
-    /// Fehlerband. `t3` ist identisch mit dem Header-`timestamp`.
-    TimeSyncResp {
-        t1: u64,
-        t2: u64,
-        t3: u64,
-    },
+    /// Exclusion vote in ErrorManagement. Bit interpretation as `State`.
+    ExclusionProposal { propose_exclude: PeerMask },
+    /// Cristian request; `t1` is the requester send time (ns) on its
+    /// local clock.
+    TimeSyncReq { t1: u64 },
+    /// Cristian response; `t2`, `t3` on the responder clock.
+    TimeSyncResp { t1: u64, t2: u64, t3: u64 },
 }
 
-// -------------------------------------------------------------
-// Frame
-// -------------------------------------------------------------
+/// A framed UDP message.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UdpFrame<P: CyclePayload> {
     node_id: u8,
@@ -145,16 +93,12 @@ pub struct UdpFrame<P: CyclePayload> {
 }
 
 impl<P: CyclePayload> UdpFrame<P> {
-    /// Compile-time Assertion: post-monomorphization error, sobald jemand
-    /// versucht `UdpFrame<P>` mit `P::WIRE_SIZE > MAX_PAYLOAD_WIRE_SIZE` zu
-    /// instanziieren. Wird in encode/decode referenziert, um die Auswertung
-    /// zu erzwingen.
     const _ASSERT_FITS: () = assert!(
         P::WIRE_SIZE <= MAX_PAYLOAD_WIRE_SIZE,
-        "CyclePayload::WIRE_SIZE ueberschreitet MAX_PAYLOAD_WIRE_SIZE"
+        "CyclePayload::WIRE_SIZE exceeds MAX_PAYLOAD_WIRE_SIZE"
     );
 
-    /// Groesster moeglicher Frame fuer diesen Payload-Typ.
+    /// Largest possible encoded frame for payload type `P`.
     pub const MAX_FRAME_SIZE: usize = {
         let body = max_usize(P::WIRE_SIZE, ACK_BODY);
         let body = max_usize(body, TIME_SYNC_REQ_BODY);
@@ -193,14 +137,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         timestamp: u64,
         seen_mask: PeerMask,
     ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::State { seen_mask },
-        )
+        Self::new(node_id, session_id, seq_num, node_state, timestamp, Payload::State { seen_mask })
     }
 
     pub fn result_frame(
@@ -211,14 +148,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         timestamp: u64,
         result: P,
     ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::Result(result),
-        )
+        Self::new(node_id, session_id, seq_num, node_state, timestamp, Payload::Result(result))
     }
 
     pub fn ack_frame(
@@ -236,10 +166,7 @@ impl<P: CyclePayload> UdpFrame<P> {
             seq_num,
             node_state,
             timestamp,
-            Payload::Ack {
-                received_from,
-                publisher_candidate,
-            },
+            Payload::Ack { received_from, publisher_candidate },
         )
     }
 
@@ -269,14 +196,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         timestamp: u64,
         t1: u64,
     ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::TimeSyncReq { t1 },
-        )
+        Self::new(node_id, session_id, seq_num, node_state, timestamp, Payload::TimeSyncReq { t1 })
     }
 
     pub fn time_sync_resp_frame(
@@ -299,40 +219,24 @@ impl<P: CyclePayload> UdpFrame<P> {
         )
     }
 
-    pub fn node_id(&self) -> u8 {
-        self.node_id
-    }
-    pub fn session_id(&self) -> u64 {
-        self.session_id
-    }
-    pub fn seq_num(&self) -> u32 {
-        self.seq_num
-    }
-    pub fn node_state_wire(&self) -> u8 {
-        self.node_state_wire
-    }
-    pub fn timestamp(&self) -> u64 {
-        self.timestamp
-    }
-    pub fn payload(&self) -> Payload<P> {
-        self.payload
-    }
+    pub fn node_id(&self) -> u8 { self.node_id }
+    pub fn session_id(&self) -> u64 { self.session_id }
+    pub fn seq_num(&self) -> u32 { self.seq_num }
+    pub fn node_state_wire(&self) -> u8 { self.node_state_wire }
+    pub fn timestamp(&self) -> u64 { self.timestamp }
+    pub fn payload(&self) -> Payload<P> { self.payload }
 
     fn compute_crc(&self) -> u32 {
-        // Erzwingt Auswertung der Compile-Time-Assertion.
         let _ = Self::_ASSERT_FITS;
-
         let mut h = Hasher::new();
         h.update(&[self.node_id]);
         h.update(&self.session_id.to_le_bytes());
         h.update(&self.seq_num.to_le_bytes());
         h.update(&[self.node_state_wire]);
         h.update(&self.timestamp.to_le_bytes());
-
         match &self.payload {
             Payload::State { seen_mask } => {
-                h.update(&[DISC_STATE]);
-                h.update(&[seen_mask.as_u8()]);
+                h.update(&[DISC_STATE, seen_mask.as_u8()]);
             }
             Payload::Result(r) => {
                 h.update(&[DISC_RESULT]);
@@ -343,17 +247,11 @@ impl<P: CyclePayload> UdpFrame<P> {
                 }
                 h.update(&staging[..P::WIRE_SIZE]);
             }
-            Payload::Ack {
-                received_from,
-                publisher_candidate,
-            } => {
-                h.update(&[DISC_ACK]);
-                h.update(&[received_from.as_u8()]);
-                h.update(&[*publisher_candidate]);
+            Payload::Ack { received_from, publisher_candidate } => {
+                h.update(&[DISC_ACK, received_from.as_u8(), *publisher_candidate]);
             }
             Payload::ExclusionProposal { propose_exclude } => {
-                h.update(&[DISC_EXCLUSION_PROPOSAL]);
-                h.update(&[propose_exclude.as_u8()]);
+                h.update(&[DISC_EXCLUSION_PROPOSAL, propose_exclude.as_u8()]);
             }
             Payload::TimeSyncReq { t1 } => {
                 h.update(&[DISC_TIMESYNC_REQ]);
@@ -369,11 +267,12 @@ impl<P: CyclePayload> UdpFrame<P> {
         h.finalize()
     }
 
+    /// Recompute the CRC and compare against the stored one.
     pub fn verify(&self) -> bool {
         self.crc32 == self.compute_crc()
     }
 
-    // ---- Serialisierung ----
+    /// Serialize into a fresh byte vector.
     pub fn encode(&self) -> Vec<u8> {
         let _ = Self::_ASSERT_FITS;
 
@@ -385,8 +284,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
         match self.payload {
             Payload::State { seen_mask } => {
-                buf.push(DISC_STATE);
-                buf.push(seen_mask.as_u8());
+                buf.extend_from_slice(&[DISC_STATE, seen_mask.as_u8()]);
             }
             Payload::Result(r) => {
                 buf.push(DISC_RESULT);
@@ -397,17 +295,11 @@ impl<P: CyclePayload> UdpFrame<P> {
                 }
                 buf.extend_from_slice(&staging[..P::WIRE_SIZE]);
             }
-            Payload::Ack {
-                received_from,
-                publisher_candidate,
-            } => {
-                buf.push(DISC_ACK);
-                buf.push(received_from.as_u8());
-                buf.push(publisher_candidate);
+            Payload::Ack { received_from, publisher_candidate } => {
+                buf.extend_from_slice(&[DISC_ACK, received_from.as_u8(), publisher_candidate]);
             }
             Payload::ExclusionProposal { propose_exclude } => {
-                buf.push(DISC_EXCLUSION_PROPOSAL);
-                buf.push(propose_exclude.as_u8());
+                buf.extend_from_slice(&[DISC_EXCLUSION_PROPOSAL, propose_exclude.as_u8()]);
             }
             Payload::TimeSyncReq { t1 } => {
                 buf.push(DISC_TIMESYNC_REQ);
@@ -424,6 +316,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         buf
     }
 
+    /// Parse from raw bytes and verify the CRC.
     pub fn decode(bytes: &[u8]) -> Result<Self, FrameError> {
         let _ = Self::_ASSERT_FITS;
 
@@ -431,16 +324,10 @@ impl<P: CyclePayload> UdpFrame<P> {
             return Err(FrameError::TooShort);
         }
         let node_id = bytes[0];
-        let session_id =
-            u64::from_le_bytes(bytes[1..9].try_into().expect("slice length checked above"));
-        let seq_num =
-            u32::from_le_bytes(bytes[9..13].try_into().expect("slice length checked above"));
+        let session_id = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
+        let seq_num = u32::from_le_bytes(bytes[9..13].try_into().unwrap());
         let node_state_wire = bytes[13];
-        let timestamp = u64::from_le_bytes(
-            bytes[14..22]
-                .try_into()
-                .expect("slice length checked above"),
-        );
+        let timestamp = u64::from_le_bytes(bytes[14..22].try_into().unwrap());
         let disc = bytes[22];
 
         let (payload, body_size) = match disc {
@@ -448,8 +335,7 @@ impl<P: CyclePayload> UdpFrame<P> {
                 if bytes.len() < HEADER_SIZE + STATE_BODY + CRC_SIZE {
                     return Err(FrameError::TooShort);
                 }
-                let mask = PeerMask::from_u8(bytes[HEADER_SIZE]);
-                (Payload::State { seen_mask: mask }, STATE_BODY)
+                (Payload::State { seen_mask: PeerMask::from_u8(bytes[HEADER_SIZE]) }, STATE_BODY)
             }
             DISC_RESULT => {
                 let end = HEADER_SIZE + P::WIRE_SIZE;
@@ -457,19 +343,16 @@ impl<P: CyclePayload> UdpFrame<P> {
                     return Err(FrameError::TooShort);
                 }
                 let mut r = WireReader::new(&bytes[HEADER_SIZE..end]);
-                let value = P::from_wire(&mut r)?;
-                (Payload::Result(value), P::WIRE_SIZE)
+                (Payload::Result(P::from_wire(&mut r)?), P::WIRE_SIZE)
             }
             DISC_ACK => {
                 if bytes.len() < HEADER_SIZE + ACK_BODY + CRC_SIZE {
                     return Err(FrameError::TooShort);
                 }
-                let mask = PeerMask::from_u8(bytes[HEADER_SIZE]);
-                let cand = bytes[HEADER_SIZE + 1];
                 (
                     Payload::Ack {
-                        received_from: mask,
-                        publisher_candidate: cand,
+                        received_from: PeerMask::from_u8(bytes[HEADER_SIZE]),
+                        publisher_candidate: bytes[HEADER_SIZE + 1],
                     },
                     ACK_BODY,
                 )
@@ -478,10 +361,9 @@ impl<P: CyclePayload> UdpFrame<P> {
                 if bytes.len() < HEADER_SIZE + EXCLUSION_PROPOSAL_BODY + CRC_SIZE {
                     return Err(FrameError::TooShort);
                 }
-                let mask = PeerMask::from_u8(bytes[HEADER_SIZE]);
                 (
                     Payload::ExclusionProposal {
-                        propose_exclude: mask,
+                        propose_exclude: PeerMask::from_u8(bytes[HEADER_SIZE]),
                     },
                     EXCLUSION_PROPOSAL_BODY,
                 )
@@ -491,11 +373,7 @@ impl<P: CyclePayload> UdpFrame<P> {
                 if bytes.len() < end + CRC_SIZE {
                     return Err(FrameError::TooShort);
                 }
-                let t1 = u64::from_le_bytes(
-                    bytes[HEADER_SIZE..HEADER_SIZE + 8]
-                        .try_into()
-                        .expect("slice length checked above"),
-                );
+                let t1 = u64::from_le_bytes(bytes[HEADER_SIZE..end].try_into().unwrap());
                 (Payload::TimeSyncReq { t1 }, TIME_SYNC_REQ_BODY)
             }
             DISC_TIMESYNC_RESP => {
@@ -503,21 +381,9 @@ impl<P: CyclePayload> UdpFrame<P> {
                 if bytes.len() < end + CRC_SIZE {
                     return Err(FrameError::TooShort);
                 }
-                let t1 = u64::from_le_bytes(
-                    bytes[HEADER_SIZE..HEADER_SIZE + 8]
-                        .try_into()
-                        .expect("slice length checked above"),
-                );
-                let t2 = u64::from_le_bytes(
-                    bytes[HEADER_SIZE + 8..HEADER_SIZE + 16]
-                        .try_into()
-                        .expect("slice length checked above"),
-                );
-                let t3 = u64::from_le_bytes(
-                    bytes[HEADER_SIZE + 16..HEADER_SIZE + 24]
-                        .try_into()
-                        .expect("slice length checked above"),
-                );
+                let t1 = u64::from_le_bytes(bytes[HEADER_SIZE..HEADER_SIZE + 8].try_into().unwrap());
+                let t2 = u64::from_le_bytes(bytes[HEADER_SIZE + 8..HEADER_SIZE + 16].try_into().unwrap());
+                let t3 = u64::from_le_bytes(bytes[HEADER_SIZE + 16..HEADER_SIZE + 24].try_into().unwrap());
                 (Payload::TimeSyncResp { t1, t2, t3 }, TIME_SYNC_RESP_BODY)
             }
             _ => return Err(FrameError::UnknownDiscriminator),
@@ -527,11 +393,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         if bytes.len() < crc_off + CRC_SIZE {
             return Err(FrameError::TooShort);
         }
-        let crc32 = u32::from_le_bytes(
-            bytes[crc_off..crc_off + CRC_SIZE]
-                .try_into()
-                .expect("slice length checked above"),
-        );
+        let crc32 = u32::from_le_bytes(bytes[crc_off..crc_off + CRC_SIZE].try_into().unwrap());
 
         let frame = UdpFrame {
             node_id,
@@ -542,7 +404,6 @@ impl<P: CyclePayload> UdpFrame<P> {
             payload,
             crc32,
         };
-
         if !frame.verify() {
             return Err(FrameError::CrcMismatch);
         }
