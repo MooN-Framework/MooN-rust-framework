@@ -1,0 +1,53 @@
+use crate::framework::config::MAX_PEERS;
+use crate::framework::traits::CyclePayload;
+use heapless::Vec;
+
+/// Peer ack payload: what the peer received this round + who it thinks
+/// should publish.
+#[derive(Debug, Clone, Copy)]
+pub struct AckInfo {
+    pub received_from: u8,
+    pub publisher_candidate: u8,
+}
+
+/// Buffers cleared and reused each cycle.
+///
+/// Sizes are set once at discovery finalize via `resize`; slots stay
+/// allocated for the process lifetime.
+pub struct CycleState<P: CyclePayload> {
+    pub own_result: Option<P>,
+    pub peer_results: Vec<Option<P>, MAX_PEERS>,
+    pub peer_acks: Vec<Option<AckInfo>, MAX_PEERS>,
+    pub phase_deadline: u64,
+}
+
+impl<P: CyclePayload> CycleState<P> {
+    pub const fn empty() -> Self {
+        Self {
+            own_result: None,
+            peer_results: Vec::new(),
+            peer_acks: Vec::new(),
+            phase_deadline: 0,
+        }
+    }
+
+    /// Set the per-peer slot count. Called once at discovery finalize.
+    pub fn resize(&mut self, n: usize) {
+        for _ in 0..n {
+            let _ = self.peer_results.push(None);
+            let _ = self.peer_acks.push(None);
+        }
+    }
+
+    /// Clear all per-peer slots for a new cycle.
+    pub fn reset(&mut self, deadline: u64) {
+        self.own_result = None;
+        for slot in self.peer_results.iter_mut() {
+            *slot = None;
+        }
+        for slot in self.peer_acks.iter_mut() {
+            *slot = None;
+        }
+        self.phase_deadline = deadline;
+    }
+}

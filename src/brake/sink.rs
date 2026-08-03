@@ -1,8 +1,8 @@
 use crate::brake::braking_curve::BrakeResult;
 use crate::framework::traits::DecisionSink;
 
-/// Empfaenger der Voting-Entscheidung. Konkrete Anbindung an
-/// Aktuator/Diagnose/Log hier ergaenzen.
+/// Recipient of the voted brake decision. Placeholder for the actual
+/// actuator/log/diagnostic wiring.
 pub struct BrakeSink;
 
 impl BrakeSink {
@@ -21,11 +21,6 @@ impl DecisionSink for BrakeSink {
     type Decision = BrakeResult;
 
     fn publish(&mut self, decision: &BrakeResult) {
-        // Hier: BrakeResult an die naechste Stufe weiterreichen.
-        // Beispiele:
-        //   - GPIO/CAN-Nachricht an den Bremsaktuator
-        //   - Log-Eintrag
-        //   - UDP-Broadcast an Diagnose-Tool
         let _ = decision;
     }
 }

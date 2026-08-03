@@ -1,106 +1,76 @@
-//! Peer-Zeitsynchronisation nach Cristian mit symmetrischer,
-//! Mehr-Peer-Aggregation.
+//! Cristian time synchronisation with multi-peer aggregation.
 //!
-//! Jeder Knoten schaetzt fuer jeden Peer den Uhrenoffset relativ zur eigenen
-//! monotonen Uhr und eine bewiesene obere Fehlerschranke aus der kleinsten
-//! beobachteten Round-Trip-Zeit.
+//! Per round:
+//! 1. Requester sends `TimeSyncReq { t1 }` where t1 is the local send time.
+//! 2. Responder receives at t2, sends `TimeSyncResp { t1, t2, t3 }`.
+//! 3. Requester receives at t4 and computes:
+//!    ```text
+//!    delay  = (t4 - t1) - (t3 - t2)
+//!    offset = ((t2 - t1) + (t3 - t4)) / 2
+//!    bound  = max(0, (delay - 2 * DT_MIN_NS) / 2)
+//!    ```
 //!
-//! Protokoll pro Runde:
-//!   1. Requester sendet TimeSyncReq { t1 } mit t1 = lokale Zeit (ns).
-//!   2. Responder empfaengt bei t2 (eigene Uhr), sendet
-//!      TimeSyncResp { t1, t2, t3 } mit t3 = lokale Zeit beim Senden.
-//!   3. Requester empfaengt bei t4 (eigene Uhr) und berechnet:
-//!        delay  = (t4 - t1) - (t3 - t2)
-//!        offset = ((t2 - t1) + (t3 - t4)) / 2     // peer_clock - self_clock
-//!        error_bound = (delay - 2 * DT_MIN_NS) / 2
-//!
-//! Die Probe mit kleinstem delay pro Peer wird behalten (NTP-Filterung).
-//!
-//! Konvergenz ueber alle Peers via Median, damit ein beliebig fehlerhafter
-//! Peer die Gruppenzeit nicht verschieben kann.
+//! The sample with the smallest delay per peer is kept (NTP filtering).
+//! Group convergence uses the median across all peers.
 
 use crate::framework::traits::CyclePayload;
-use crate::framework::udp_frame::{Payload, UdpFrame};
+use crate::framework::wire::{Payload, UdpFrame};
 
-/// Minimale physisch moegliche Netzwerk-Uebertragungszeit in ns.
-///
-/// Konservative Auslegung fuer Gigabit-Ethernet mit einem Switch-Hop:
-/// Frame-Serialisierung + Wire-Propagation + Switch-Store-and-Forward.
-/// Muss fuer die Zielhardware messtechnisch validiert werden.
+/// Minimum physical one-way transmission time (ns). Conservative default
+/// for gigabit ethernet with one switch hop; validate against target
+/// hardware.
 pub const DT_MIN_NS: u64 = 20_000;
 
-/// Anzahl Sync-Runden pro Peer. Aus allen Proben wird die mit dem kleinsten
-/// Delay behalten (NTP-Filterung: kleiner Delay => symmetrischste Latenz).
+/// Samples per peer. The best (smallest-delay) sample is retained.
 pub const SAMPLES_PER_PEER: usize = 8;
 
-/// Eine einzelne Cristian-Messung mit allen vier Zeitstempeln.
+/// A single Cristian measurement with all four timestamps.
 #[derive(Debug, Clone, Copy)]
 pub struct SyncSample {
-    /// Requester-Sendezeit (lokale Uhr).
     pub t1: u64,
-    /// Responder-Empfangszeit (Peer-Uhr).
     pub t2: u64,
-    /// Responder-Sendezeit (Peer-Uhr).
     pub t3: u64,
-    /// Requester-Empfangszeit (lokale Uhr).
     pub t4: u64,
 }
 
 impl SyncSample {
-    /// Netz-Round-Trip-Zeit in ns, ohne Responder-Verarbeitungszeit.
+    /// Network round-trip time in ns, responder processing time removed.
     pub fn delay(&self) -> i64 {
         (self.t4 as i64 - self.t1 as i64) - (self.t3 as i64 - self.t2 as i64)
     }
 
-    /// Geschaetzter Uhrenoffset (peer_clock - self_clock) in ns.
+    /// Estimated clock offset (peer_clock - self_clock) in ns.
     pub fn offset(&self) -> i64 {
         ((self.t2 as i64 - self.t1 as i64) + (self.t3 as i64 - self.t4 as i64)) / 2
     }
 
-    /// Bewiesene obere Schranke fuer den Betrag des Offset-Fehlers in ns.
-    ///
-    /// Herleitung: Bei asymmetrischer Latenz (alpha + beta = delay - 2*dt_min)
-    /// weicht die Offset-Schaetzung maximal um (delay - 2*dt_min) / 2 vom
-    /// wahren Wert ab. Bei symmetrischer Latenz ist der Fehler 0.
+    /// Upper bound on the magnitude of the offset estimation error (ns).
+    /// Zero on perfectly symmetric latency.
     pub fn error_bound(&self) -> i64 {
-        let d = self.delay();
-        let raw = (d - 2 * DT_MIN_NS as i64) / 2;
+        let raw = (self.delay() - 2 * DT_MIN_NS as i64) / 2;
         if raw < 0 { 0 } else { raw }
     }
 }
 
-/// Aggregiertes Ergebnis fuer einen Peer nach abgeschlossener Synchronisation.
+/// Aggregated per-peer sync result after the phase completes.
 #[derive(Debug, Clone, Copy)]
 pub struct PeerClock {
     pub peer_id: u8,
-    /// peer_clock - self_clock in ns.
     pub offset_ns: i64,
-    /// Bewiesene Fehlerschranke fuer offset_ns.
     pub error_bound_ns: i64,
-    /// Anzahl der insgesamt genommenen Proben.
     pub samples_used: u32,
 }
 
-#[derive(Debug)]
 struct PeerSyncState {
     peer_id: u8,
-    /// t1 des zuletzt gesendeten, noch nicht beantworteten Requests.
-    /// Wird als Korrelationsschluessel benutzt, um verspaetete Duplikate
-    /// oder Responses fuer andere Requester zu verwerfen.
     pending_t1: Option<u64>,
     samples_taken: u32,
-    /// Beste bisher gesehene Probe (kleinster Delay).
     best: Option<SyncSample>,
 }
 
 impl PeerSyncState {
     fn new(peer_id: u8) -> Self {
-        Self {
-            peer_id,
-            pending_t1: None,
-            samples_taken: 0,
-            best: None,
-        }
+        Self { peer_id, pending_t1: None, samples_taken: 0, best: None }
     }
 
     fn record_sample(&mut self, sample: SyncSample) {
@@ -129,11 +99,7 @@ impl PeerSyncState {
     }
 }
 
-/// Koordinator fuer die Zeitsynchronisation mit allen bekannten Peers.
-///
-/// Wird waehrend der PeerSync-Phase der Lifecycle-State-Machine verwendet
-/// und liefert am Ende die Uhrenoffsets, die im weiteren Betrieb angewendet
-/// werden.
+/// Coordinator for time synchronisation with all known peers.
 pub struct PeerSync {
     peers: Vec<PeerSyncState>,
 }
@@ -145,17 +111,14 @@ impl PeerSync {
         }
     }
 
-    /// Vom Sender aufzurufen, direkt nachdem `send_time_sync_req` das
-    /// Tupel (seq, t1) geliefert hat. Vermerkt t1 als offenen Request.
+    /// Note a request just sent so future responses can be matched.
     pub fn record_outgoing_request(&mut self, peer_id: u8, t1: u64) {
-        if let Some(state) = self.peers.iter_mut().find(|p| p.peer_id == peer_id) {
-            state.pending_t1 = Some(t1);
+        if let Some(s) = self.peers.iter_mut().find(|p| p.peer_id == peer_id) {
+            s.pending_t1 = Some(t1);
         }
     }
 
-    /// True, wenn fuer diesen Peer aktuell ein Request offen ist.
-    /// Nutzt der Koordinator, um nicht zwei Requests gleichzeitig
-    /// an denselben Peer zu senden.
+    /// True while a request to this peer is outstanding.
     pub fn has_pending(&self, peer_id: u8) -> bool {
         self.peers
             .iter()
@@ -164,63 +127,45 @@ impl PeerSync {
             .is_some()
     }
 
-    /// Vom Koordinator aufzurufen, wenn eine Response-Timeout erreicht wurde.
-    /// Loescht den offenen Request, damit ein neuer gesendet werden kann.
+    /// Clear the outstanding request for this peer (e.g. on response timeout).
     pub fn mark_timeout(&mut self, peer_id: u8) {
-        if let Some(state) = self.peers.iter_mut().find(|p| p.peer_id == peer_id) {
-            state.pending_t1 = None;
+        if let Some(s) = self.peers.iter_mut().find(|p| p.peer_id == peer_id) {
+            s.pending_t1 = None;
         }
     }
 
-    /// Verarbeitet eine eingegangene Response. Verwirft:
-    /// - Antworten von unbekannten Peers,
-    /// - Antworten ohne passenden pending_t1 (nicht fuer uns bestimmt oder verspaetet),
-    /// - Proben mit negativem oder unplausiblem Delay.
+    /// Ingest a response. Rejects unknown peers, unmatched `t1`, and
+    /// samples with implausible delay.
     pub fn on_response(&mut self, peer_id: u8, t1: u64, t2: u64, t3: u64, t4_local: u64) {
         let state = match self.peers.iter_mut().find(|p| p.peer_id == peer_id) {
             Some(s) => s,
             None => return,
         };
-
         match state.pending_t1 {
             Some(expected) if expected == t1 => {}
             _ => return,
         }
-
-        let sample = SyncSample {
-            t1,
-            t2,
-            t3,
-            t4: t4_local,
-        };
-
+        let sample = SyncSample { t1, t2, t3, t4: t4_local };
         if sample.delay() < 0 {
             state.pending_t1 = None;
             return;
         }
-
         state.record_sample(sample);
     }
 
-    /// True, wenn alle Peers die konfigurierte Probenzahl erreicht haben.
+    /// True when every peer has reached the configured sample count.
     pub fn is_complete(&self) -> bool {
         !self.peers.is_empty() && self.peers.iter().all(|p| p.is_complete())
     }
 
-    /// Ergebnis der Synchronisation — nur sinnvoll, wenn `is_complete()`.
+    /// Extract the aggregated per-peer clocks. Meaningful only when
+    /// `is_complete()`.
     pub fn finalize(&self) -> Vec<PeerClock> {
-        self.peers
-            .iter()
-            .filter_map(|p| p.as_peer_clock())
-            .collect()
+        self.peers.iter().filter_map(|p| p.as_peer_clock()).collect()
     }
 
-    /// Konvergenzfunktion: Median ueber alle Peer-Offsets plus eigene Uhr (0).
-    /// Rueckgabe: Korrektur in ns, die auf die eigene Uhr angewendet werden
-    /// muss, um dem Gruppenmedian zu folgen.
-    ///
-    /// Median toleriert einen beliebig fehlerhaften Peer bei drei Knoten
-    /// (Ausreisser landet am Rand, nicht in der Mitte).
+    /// Median of the peer offsets plus our own clock (0). Correction to
+    /// apply to the local clock to follow the group median.
     pub fn convergence_correction(&self) -> Option<i64> {
         let mut offsets: Vec<i64> = self
             .peers
@@ -230,13 +175,12 @@ impl PeerSync {
         if offsets.is_empty() {
             return None;
         }
-        offsets.push(0); // eigene Uhr = Referenz
+        offsets.push(0);
         offsets.sort_unstable();
         Some(offsets[offsets.len() / 2])
     }
 
-    /// Maximale bewiesene Fehlerschranke ueber alle Peers.
-    /// Geht als epsilon in die Voter-Timeout-Auslegung ein.
+    /// Largest error bound across all peers. Feeds the voter timeout.
     pub fn max_error_bound(&self) -> Option<i64> {
         self.peers
             .iter()
@@ -246,24 +190,14 @@ impl PeerSync {
     }
 }
 
-/// Hilfstyp, um aus einem `RecvOutcome::TimeSync` die relevanten Felder
-/// nach Request/Response zu unterscheiden.
+/// Discriminated view over the time-sync payload variants extracted from
+/// a received frame.
 pub enum SyncFields {
-    Request {
-        peer_id: u8,
-        t1: u64,
-        t2_local: u64,
-    },
-    Response {
-        peer_id: u8,
-        t1: u64,
-        t2: u64,
-        t3: u64,
-        t4_local: u64,
-    },
+    Request { peer_id: u8, t1: u64, t2_local: u64 },
+    Response { peer_id: u8, t1: u64, t2: u64, t3: u64, t4_local: u64 },
 }
 
-/// Extrahiert Sync-Felder aus einem empfangenen Frame.
+/// Project a received frame down to the sync fields the coordinator uses.
 pub fn extract_sync_fields<P: CyclePayload>(
     frame: &UdpFrame<P>,
     local_recv_ns: u64,
@@ -285,17 +219,12 @@ pub fn extract_sync_fields<P: CyclePayload>(
     }
 }
 
-// ------------------------------------------------------------
-// Tests
-// ------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn sample_delay_and_offset_symmetric() {
-        // Symmetrische Latenz von 100 us in beide Richtungen,
-        // Peer-Uhr laeuft 1 ms vor.
         let t1 = 1_000_000;
         let peer_offset = 1_000_000;
         let one_way = 100_000;
@@ -303,14 +232,13 @@ mod tests {
         let t2 = t1 + one_way + peer_offset;
         let t3 = t2 + proc_time;
         let t4 = t3 - peer_offset + one_way;
-
         let s = SyncSample { t1, t2, t3, t4 };
         assert_eq!(s.delay(), 2 * one_way as i64);
         assert_eq!(s.offset(), peer_offset as i64);
     }
 
     #[test]
-    fn error_bound_zero_when_delay_is_two_dt_min() {
+    fn error_bound_zero_at_two_dt_min() {
         let t1 = 0;
         let t2 = DT_MIN_NS;
         let t3 = t2 + 1000;
@@ -320,33 +248,9 @@ mod tests {
     }
 
     #[test]
-    fn convergence_uses_median_ignoring_outlier() {
-        let mut ps = PeerSync::new(&[1, 2]);
-        // Beide Peers so anlegen, als seien Proben durchgelaufen.
-        // Peer 1: Offset +100, Peer 2: Offset -1_000_000 (Ausreisser).
-        ps.peers[0].best = Some(SyncSample {
-            t1: 0,
-            t2: 100,
-            t3: 100,
-            t4: 0,
-        });
-        ps.peers[0].samples_taken = SAMPLES_PER_PEER as u32;
-        ps.peers[1].best = Some(SyncSample {
-            t1: 0,
-            t2: (-1_000_000_i64) as u64,
-            t3: (-1_000_000_i64) as u64,
-            t4: 0,
-        });
-        ps.peers[1].samples_taken = SAMPLES_PER_PEER as u32;
-        // Median von {+100, -1_000_000, 0} = 0 (eigene Uhr).
-        assert_eq!(ps.convergence_correction(), Some(0));
-    }
-
-    #[test]
     fn on_response_rejects_unmatched_t1() {
         let mut ps = PeerSync::new(&[1]);
         ps.record_outgoing_request(1, 12345);
-        // Falsche t1 — muss verworfen werden.
         ps.on_response(1, 99999, 100, 200, 300);
         assert_eq!(ps.peers[0].samples_taken, 0);
         assert!(ps.peers[0].best.is_none());

@@ -1,0 +1,33 @@
+own_id = 1
+
+[participants]
+nominal = 3
+minimum = 2
+
+[health]
+suspect_threshold = 3
+lost_threshold = 10
+recovery_threshold = 20
+
+[timing]
+cycle_ms = 2000
+init_sync_ms = 10000
+peer_sync_ms = 500
+peer_sync_request_interval_ms = 1
+cycle_sync_ms = 50
+share_ms = 100
+ack_ms = 50
+error_management_vote_ms = 50
+stale_ms = 50
+resync_interval_cycles = 30
+
+[transport]
+interface = "lo"
+multicast_group = "239.10.0.1"
+port = 5555
+
+[diagnostic]
+enabled = true
+interface = "lo"
+multicast_group = "239.10.0.2"
+port = 6666

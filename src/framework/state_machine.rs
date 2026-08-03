@@ -1,3 +1,5 @@
+/// System-wide operational mode. Set by the runner as the fault-tolerance
+/// buffer of the fabric changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemState {
     Startup,
@@ -6,6 +8,7 @@ pub enum SystemState {
     Failsafe,
 }
 
+/// Per-node lifecycle state. Wire values are stable — protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NodeState {
@@ -14,7 +17,7 @@ pub enum NodeState {
     CycleSync = 0x03,
     ReadInputs = 0x04,
     ShareResult = 0x05,
-    SendACK = 0x06,
+    SendAck = 0x06,
     PublishResult = 0x07,
     ErrorManagement = 0x08,
     Isolation = 0x09,
@@ -22,106 +25,73 @@ pub enum NodeState {
     Failsafe = 0xFF,
 }
 
+/// Events emitted by the phase handlers, consumed by `NodeState::next`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateEvent {
-    /* SelfTest */
-    SelfTestOK,
+    SelfTestOk,
     SelfTestErr,
-    /* InitSync */
     InitialSyncOk,
     InitialSyncTimeout,
-    /* PeerSync */
     PeerSyncOk,
     PeerSyncTimeout,
-    /* CycleSync */
     CycleSyncOk,
     CycleSyncTimeout,
-    /* Operational cycle */
     InputsRead,
-    /* Result Events */
     ResultShared,
     ShareResultTimeout,
-    /* Ack Events */
     AckReceived,
     AckTimeout,
-    /* Publish Events */
     ResultPublished,
     ResyncDue,
-    /// Consensus erreicht, aber mindestens ein Peer wich vom Consensus ab.
-    /// Fuehrt nach ErrorManagement, damit die Health-Transition zentral
-    /// angestossen und Peer ggf. isoliert werden kann.
+    /// Consensus reached but at least one peer diverged. Routed through
+    /// ErrorManagement so the divergent peer can be reconfigured centrally.
     DissenterDetected,
-    /* Error Management */
     StateOk,
     StateDiverged,
-    /// Voting-Timeout in ErrorManagement: mindestens ein Peer, den WIR
-    /// nicht ausschliessen wollen (also fuer uns "gesund"), hat seinen
-    /// ExclusionProposal-Vote nicht rechtzeitig geliefert. Regel 2 (b):
-    /// wenn gesunde Nodes untereinander die Kommunikation verlieren,
-    /// ist das System nicht mehr verlaesslich → Failsafe.
-    ///
-    /// Silence eines Peers, den WIR selbst ausschliessen wollen, triggert
-    /// diesen Event NICHT — die Aggregation im RunState behandelt das
-    /// als bestaetigende Evidenz.
+    /// Exclusion vote timed out: at least one peer we did NOT propose to
+    /// exclude failed to reply (Rule 2b) — failsafe.
     StateTimeout,
     TooFewNodes,
-    /* Generisch */
     Fault,
 }
 
 impl NodeState {
+    /// Pure transition function. Unmapped `(state, event)` pairs fall
+    /// through to `Failsafe` (fail-stop on unexpected events).
     pub fn next(self, event: StateEvent) -> NodeState {
         use NodeState::*;
         use StateEvent::*;
 
         match (self, event) {
-            // --- Startup ---
-            (Startup, SelfTestOK) => InitSync,
+            (Startup, SelfTestOk) => InitSync,
             (Startup, SelfTestErr) => Failsafe,
 
-            // --- InitSync -> PeerSync ---
             (InitSync, InitialSyncOk) => PeerSync,
             (InitSync, InitialSyncTimeout) => Failsafe,
 
-            // --- PeerSync -> ReadInputs ---
             (PeerSync, PeerSyncOk) => ReadInputs,
             (PeerSync, PeerSyncTimeout) => Failsafe,
 
-            // --- CycleSync ---
             (CycleSync, CycleSyncOk) => ReadInputs,
             (CycleSync, CycleSyncTimeout) => ErrorManagement,
 
-            // --- Operational cycle ---
             (ReadInputs, InputsRead) => ShareResult,
+            (ShareResult, ResultShared) => SendAck,
             (ShareResult, ShareResultTimeout) => ErrorManagement,
-            (ShareResult, ResultShared) => SendACK,
-            (SendACK, AckTimeout) => ErrorManagement,
-            (SendACK, AckReceived) => PublishResult,
+            (SendAck, AckReceived) => PublishResult,
+            (SendAck, AckTimeout) => ErrorManagement,
 
-            // --- Publish: normal weiter, oder periodischer Resync, oder
-            //     Dissenter erkannt (Rekonfiguration ueber ErrorManagement),
-            //     oder keine Mehrheit moeglich (direkt Failsafe) ---
             (PublishResult, ResultPublished) => CycleSync,
             (PublishResult, ResyncDue) => PeerSync,
             (PublishResult, DissenterDetected) => ErrorManagement,
             (PublishResult, StateDiverged) => Failsafe,
 
-            // --- Error management ---
-            // Nach jeder Rekonfiguration zurueck ueber CycleSync — Barrier,
-            // damit alle Nodes wieder am selben Zyklus-Tick aufsetzen.
-            //
-            // StateTimeout: Voting-Phase konnte nicht mit Konsens
-            // abgeschlossen werden, weil ein von uns fuer gesund gehaltener
-            // Peer nicht geantwortet hat → Failsafe (Regel 2b).
             (ErrorManagement, StateOk) => CycleSync,
             (ErrorManagement, StateDiverged) => Failsafe,
             (ErrorManagement, StateTimeout) => Failsafe,
             (ErrorManagement, TooFewNodes) => Failsafe,
 
-            // --- Failsafe ist terminal ---
             (Failsafe, _) => Failsafe,
-
-            // --- Fail-stop: alles Unerwartete ---
             (_, Fault) => Failsafe,
             _ => Failsafe,
         }
@@ -132,6 +102,7 @@ impl NodeState {
         self as u8
     }
 
+    /// Decode from wire byte. Rejects unknown discriminants.
     #[inline]
     pub fn from_wire(v: u8) -> Result<Self, InvalidNodeState> {
         use NodeState::*;
@@ -141,7 +112,7 @@ impl NodeState {
             0x03 => CycleSync,
             0x04 => ReadInputs,
             0x05 => ShareResult,
-            0x06 => SendACK,
+            0x06 => SendAck,
             0x07 => PublishResult,
             0x08 => ErrorManagement,
             0x09 => Isolation,
