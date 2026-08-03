@@ -4,20 +4,15 @@ own_id = 0
 nominal = 3
 minimum = 2
 
-[health]
-suspect_threshold = 3
-lost_threshold = 10
-recovery_threshold = 20
-
 [timing]
 cycle_ms = 2000
 init_sync_ms = 10000
 peer_sync_ms = 500
 peer_sync_request_interval_ms = 1
 cycle_sync_ms = 50
-share_ms = 100
+share_ms = 50
 ack_ms = 50
-error_management_vote_ms = 50
+error_management_vote_ms = 2000
 stale_ms = 50
 resync_interval_cycles = 30
 

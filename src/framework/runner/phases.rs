@@ -1,5 +1,5 @@
 use crate::framework::peer_sync::{PeerSync, SAMPLES_PER_PEER, SyncFields, extract_sync_fields};
-use crate::framework::state::{FaultKind, PeerHealth};
+use crate::framework::state::PeerHealth;
 use crate::framework::state_machine::{StateEvent, SystemState};
 use crate::framework::traits::{Computation, DecisionSink, Voter, VotingOutcome};
 use crate::framework::transport::RecvOutcome;
@@ -202,7 +202,7 @@ where
             },
         );
 
-        self.state.aggregate_cycle_sync_evidence();
+        self.state.attribute_cycle_sync_missing();
 
         match outcome {
             PhaseOutcome::Complete => {
@@ -290,7 +290,7 @@ where
         match outcome {
             PhaseOutcome::Complete => StateEvent::ResultShared,
             PhaseOutcome::Timeout => {
-                self.state.aggregate_result_evidence();
+                self.state.attribute_result_missing();
                 StateEvent::ShareResultTimeout
             }
             PhaseOutcome::Fault => StateEvent::Fault,
@@ -333,11 +333,11 @@ where
 
         match outcome {
             PhaseOutcome::Complete => {
-                self.state.aggregate_result_evidence();
+                self.state.attribute_result_missing();
                 StateEvent::AckReceived
             }
             PhaseOutcome::Timeout => {
-                self.state.aggregate_result_evidence();
+                self.state.attribute_result_missing();
                 self.fault_peers_missing_ack_unilateral();
                 StateEvent::AckTimeout
             }
@@ -378,9 +378,7 @@ where
                         }
                         for peer_id in dissenter_ids {
                             warn!(peer_id, "peer value diverged from consensus");
-                            let _ = self
-                                .state
-                                .record_peer_fault(peer_id, FaultKind::ValueDivergence);
+                            let _ = self.state.propose_exclude(peer_id);
                         }
                         return StateEvent::DissenterDetected;
                     }
@@ -395,7 +393,6 @@ where
                     debug!(publisher, own_id, "consensus reached, peer publishes");
                 }
 
-                self.state.credit_majority_delivered_peers();
                 self.cycles_since_last_sync = self.cycles_since_last_sync.saturating_add(1);
 
                 if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
@@ -455,6 +452,8 @@ where
 
         match outcome {
             PhaseOutcome::Complete => {
+                let no_buffer_before_vote = self.state.tolerable_failures_remaining() == 0;
+
                 let confirmed = self.state.aggregate_exclusion_votes();
                 let transitions = self.state.apply_confirmed_exclusions(confirmed);
                 if transitions > 0 {
@@ -477,12 +476,12 @@ where
                     return StateEvent::TooFewNodes;
                 }
 
-                if self.state.tolerable_failures_remaining() == 0 {
+                if no_buffer_before_vote {
                     error!(
                         active_peers = self.state.active_peer_count(),
                         nominal = self.state.participants().nominal_participants,
                         minimum = self.state.participants().min_participants,
-                        "no tolerance buffer, error unrecoverable, failsafe"
+                        "error in no-tolerance mode, failsafe"
                     );
                     return StateEvent::TooFewNodes;
                 }
@@ -527,7 +526,7 @@ where
             })
             .collect();
         for peer_id in missing_ids {
-            let _ = self.state.record_peer_fault(peer_id, FaultKind::MissedAck);
+            let _ = self.state.propose_exclude(peer_id);
         }
     }
 

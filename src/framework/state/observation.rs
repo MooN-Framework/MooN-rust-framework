@@ -4,17 +4,6 @@ use crate::framework::state::peers::{PeerHealth, PeerRoster};
 use crate::framework::traits::CyclePayload;
 use crate::framework::types::PeerMask;
 use heapless::Vec;
-use tracing::warn;
-
-/// Fault categories tracked per peer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FaultKind {
-    MissedShareResult,
-    MissedAck,
-    MissedCycleSync,
-    ValueDivergence,
-    StaleFrame,
-}
 
 /// Cross-observation buffers used across CycleSync and Result phases.
 ///
@@ -27,10 +16,7 @@ pub struct ObservationKind {
 
 impl ObservationKind {
     pub const fn empty() -> Self {
-        Self {
-            own_seen: PeerMask::EMPTY,
-            peer_seen: Vec::new(),
-        }
+        Self { own_seen: PeerMask::EMPTY, peer_seen: Vec::new() }
     }
 
     pub fn resize(&mut self, n: usize) {
@@ -59,67 +45,39 @@ pub enum View<'a, P: CyclePayload> {
     },
 }
 
-/// Distributed-observation aggregation.
+/// Compute the mask of peers this node currently attributes as missing
+/// from the phase, using the strict-majority rule across reporters.
 ///
-/// For each non-Lost peer target, count how many reporters (own node +
-/// non-Lost non-target peers) observed the target this phase. If observers
-/// meet or exceed the strict majority of reporters:
-/// - `credit == true`: record a healthy cycle for the target.
-/// - `credit == false`: no action.
+/// For each non-Lost peer target, count observers (own node + non-Lost
+/// non-target peers) that reported seeing the target. If observers fall
+/// below the strict majority of reporters, the target is attributed.
 ///
-/// Otherwise:
-/// - `credit == false`: record a fault of kind `fault_kind`.
-/// - `credit == true`: no action.
-///
-/// A self-diagnostic guard skips attribution entirely when we saw no
-/// evidence at all (own inbound possibly broken).
-pub fn aggregate<P: CyclePayload>(
-    roster: &mut PeerRoster,
+/// Returns `None` when no evidence was collected — the local inbound may
+/// be at fault, so we refuse to attribute anyone.
+pub fn attribute_missing<P: CyclePayload>(
+    roster: &PeerRoster,
     view: View<'_, P>,
     own_id: u8,
-    fault_kind: FaultKind,
-    credit: bool,
-) {
+) -> Option<PeerMask> {
     if !any_evidence(&view) {
-        if !credit {
-            warn!(view = view.name(), "no evidence, skipping fault attribution");
-        }
-        return;
+        return None;
     }
-
-    let peer_count = roster.peers().len();
-    let mut targets: Vec<u8, MAX_PEERS> = Vec::new();
-    for idx in 0..peer_count {
+    let mut mask = PeerMask::EMPTY;
+    for idx in 0..roster.peers().len() {
         let target = &roster.peers()[idx];
         if target.health == PeerHealth::Lost {
             continue;
         }
-        let target_id = target.id;
-        let (observers, reporters) = count_observations(roster, own_id, idx, target_id, &view);
+        let (observers, reporters) = count_observations(roster, own_id, idx, target.id, &view);
         let threshold = reporters / 2 + 1;
-        let hit = if credit { observers >= threshold } else { observers < threshold };
-        if hit {
-            let _ = targets.push(target_id);
+        if observers < threshold {
+            mask.set(idx);
         }
     }
-
-    for id in targets {
-        let _ = if credit {
-            roster.record_healthy(id)
-        } else {
-            roster.record_fault(id, fault_kind)
-        };
-    }
+    Some(mask)
 }
 
 impl<'a, P: CyclePayload> View<'a, P> {
-    fn name(&self) -> &'static str {
-        match self {
-            View::CycleSync { .. } => "cycle_sync",
-            View::Result { .. } => "result",
-        }
-    }
-
     fn own_observed(&self, target_idx: usize) -> bool {
         match self {
             View::CycleSync { own_seen, .. } => own_seen.contains(target_idx),

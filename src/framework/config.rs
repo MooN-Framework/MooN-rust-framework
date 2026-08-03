@@ -49,25 +49,6 @@ impl ParticipantConfig {
     }
 }
 
-/// Health-transition thresholds. Applied by `PeerRoster` on fault-counter
-/// changes; actual transitions are gated by majority vote in ErrorManagement.
-#[derive(Debug, Clone, Copy)]
-pub struct HealthConfig {
-    pub suspect_threshold: u32,
-    pub lost_threshold: u32,
-    pub recovery_threshold: u32,
-}
-
-impl Default for HealthConfig {
-    fn default() -> Self {
-        Self {
-            suspect_threshold: 3,
-            lost_threshold: 10,
-            recovery_threshold: 20,
-        }
-    }
-}
-
 /// All timing parameters for the operational cycle and its subphases.
 #[derive(Debug, Clone, Copy)]
 pub struct CycleTiming {
@@ -121,7 +102,6 @@ impl Default for DiagnosticConfig {
 pub struct NodeConfig {
     pub own_id: u8,
     pub participants: ParticipantSection,
-    pub health: HealthSection,
     pub timing: TimingSection,
     pub transport: TransportSection,
     pub diagnostic: DiagnosticSection,
@@ -131,13 +111,6 @@ pub struct NodeConfig {
 pub struct ParticipantSection {
     pub nominal: u8,
     pub minimum: u8,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct HealthSection {
-    pub suspect_threshold: u32,
-    pub lost_threshold: u32,
-    pub recovery_threshold: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,14 +145,6 @@ pub struct DiagnosticSection {
 impl NodeConfig {
     pub fn participants(&self) -> ParticipantConfig {
         ParticipantConfig::new(self.participants.minimum, self.participants.nominal)
-    }
-
-    pub fn health(&self) -> HealthConfig {
-        HealthConfig {
-            suspect_threshold: self.health.suspect_threshold,
-            lost_threshold: self.health.lost_threshold,
-            recovery_threshold: self.health.recovery_threshold,
-        }
     }
 
     pub fn timing(&self) -> CycleTiming {

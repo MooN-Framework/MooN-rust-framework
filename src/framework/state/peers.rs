@@ -1,14 +1,13 @@
-use crate::framework::config::{HealthConfig, MAX_PEERS};
-use crate::framework::state::observation::FaultKind;
+use crate::framework::config::MAX_PEERS;
 use crate::framework::types::PeerMask;
 use heapless::Vec;
 use tracing::{debug, warn};
 
-/// Health of a peer as seen from this node.
+/// Peer status. Peers start `Alive` and transition to `Lost` on the first
+/// vote-confirmed exclusion. `Lost` is terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerHealth {
     Alive,
-    Suspect,
     Lost,
 }
 
@@ -17,8 +16,6 @@ pub enum PeerHealth {
 pub struct PeerInfo {
     pub id: u8,
     pub health: PeerHealth,
-    pub consecutive_faults: u32,
-    pub consecutive_healthy_cycles: u32,
 }
 
 /// Discovery and management errors.
@@ -28,32 +25,19 @@ pub enum DiscoveryError {
     UnknownPeer,
 }
 
-/// The set of known peers plus their per-peer health accounting.
+/// The set of known peers plus their exclusion status.
 ///
 /// Discovery is a two-step process: peers are added one by one via
 /// `discover`, then `finalize` locks the set. After that the peer list is
 /// frozen — foreign nodes are rejected upstream.
 pub struct PeerRoster {
     peers: Vec<PeerInfo, MAX_PEERS>,
-    health_cfg: HealthConfig,
     discovery_locked: bool,
 }
 
 impl PeerRoster {
-    pub fn new(health_cfg: HealthConfig) -> Self {
-        Self {
-            peers: Vec::new(),
-            health_cfg,
-            discovery_locked: false,
-        }
-    }
-
-    pub fn set_health_config(&mut self, cfg: HealthConfig) {
-        self.health_cfg = cfg;
-    }
-
-    pub fn health_config(&self) -> &HealthConfig {
-        &self.health_cfg
+    pub fn new() -> Self {
+        Self { peers: Vec::new(), discovery_locked: false }
     }
 
     pub fn peers(&self) -> &[PeerInfo] {
@@ -83,12 +67,7 @@ impl PeerRoster {
             return Ok(());
         }
         self.peers
-            .push(PeerInfo {
-                id,
-                health: PeerHealth::Alive,
-                consecutive_faults: 0,
-                consecutive_healthy_cycles: 0,
-            })
+            .push(PeerInfo { id, health: PeerHealth::Alive })
             .expect("push failed despite capacity check");
         Ok(())
     }
@@ -106,28 +85,18 @@ impl PeerRoster {
         Ok(())
     }
 
-    /// Increment the fault counter for a peer and reset its healthy streak.
-    pub fn record_fault(&mut self, peer_id: u8, kind: FaultKind) -> Result<(), DiscoveryError> {
-        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
-        let p = &mut self.peers[idx];
-        p.consecutive_faults = p.consecutive_faults.saturating_add(1);
-        p.consecutive_healthy_cycles = 0;
-        debug!(
-            peer_id,
-            fault_kind = ?kind,
-            consecutive_faults = p.consecutive_faults,
-            "fault"
-        );
-        Ok(())
-    }
-
-    /// Increment the healthy streak and reset the fault counter.
-    pub fn record_healthy(&mut self, peer_id: u8) -> Result<(), DiscoveryError> {
-        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
-        let p = &mut self.peers[idx];
-        p.consecutive_healthy_cycles = p.consecutive_healthy_cycles.saturating_add(1);
-        p.consecutive_faults = 0;
-        Ok(())
+    /// Mark the peers in `confirmed` as `Lost`. Returns the number of
+    /// transitions applied.
+    pub fn exclude(&mut self, confirmed: PeerMask) -> usize {
+        let mut transitions = 0usize;
+        for (idx, peer) in self.peers.iter_mut().enumerate() {
+            if confirmed.contains(idx) && peer.health != PeerHealth::Lost {
+                warn!(peer_id = peer.id, "peer excluded");
+                peer.health = PeerHealth::Lost;
+                transitions += 1;
+            }
+        }
+        transitions
     }
 
     pub fn active_count(&self) -> usize {
@@ -145,124 +114,39 @@ impl PeerRoster {
         }
         min_id
     }
-
-    /// Build the local exclusion proposal: peers whose counters cross the
-    /// next escalation threshold. Recoveries are unilateral and not
-    /// proposed here.
-    pub fn proposed_exclusions(&self) -> PeerMask {
-        let cfg = self.health_cfg;
-        let mut mask = PeerMask::EMPTY;
-        for (idx, peer) in self.peers.iter().enumerate() {
-            match peer.health {
-                PeerHealth::Alive => {
-                    if peer.consecutive_faults >= cfg.suspect_threshold {
-                        mask.set(idx);
-                    }
-                }
-                PeerHealth::Suspect => {
-                    if peer.consecutive_faults >= cfg.lost_threshold {
-                        mask.set(idx);
-                    }
-                }
-                PeerHealth::Lost => {}
-            }
-        }
-        mask
-    }
-
-    /// Apply vote-confirmed escalations (Alive->Suspect, Suspect->Lost) and
-    /// unconditional recoveries (Suspect->Alive). Returns the number of
-    /// transitions applied.
-    pub fn apply_transitions(&mut self, confirmed: PeerMask) -> usize {
-        let cfg = self.health_cfg;
-        let mut transitions = 0usize;
-        for (idx, peer) in self.peers.iter_mut().enumerate() {
-            let old = peer.health;
-            let new = match old {
-                PeerHealth::Alive => {
-                    if confirmed.contains(idx) && peer.consecutive_faults >= cfg.suspect_threshold {
-                        PeerHealth::Suspect
-                    } else {
-                        PeerHealth::Alive
-                    }
-                }
-                PeerHealth::Suspect => {
-                    if peer.consecutive_healthy_cycles >= cfg.recovery_threshold {
-                        PeerHealth::Alive
-                    } else if confirmed.contains(idx) && peer.consecutive_faults >= cfg.lost_threshold {
-                        PeerHealth::Lost
-                    } else {
-                        PeerHealth::Suspect
-                    }
-                }
-                PeerHealth::Lost => PeerHealth::Lost,
-            };
-            if new != old {
-                warn!(
-                    peer_id = peer.id,
-                    from = ?old,
-                    to = ?new,
-                    consecutive_faults = peer.consecutive_faults,
-                    consecutive_healthy = peer.consecutive_healthy_cycles,
-                    vote_confirmed = confirmed.contains(idx),
-                    "health transition"
-                );
-                peer.health = new;
-                transitions += 1;
-            }
-        }
-        transitions
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn roster_with_one_peer(faults: u32, healthy: u32, health: PeerHealth) -> PeerRoster {
-        let mut r = PeerRoster::new(HealthConfig::default());
-        r.peers.push(PeerInfo { id: 1, health, consecutive_faults: faults, consecutive_healthy_cycles: healthy }).unwrap();
+    fn roster_with_one_peer(health: PeerHealth) -> PeerRoster {
+        let mut r = PeerRoster::new();
+        r.peers.push(PeerInfo { id: 1, health }).unwrap();
         r
     }
 
     #[test]
-    fn alive_stays_alive_without_confirmed_bit() {
-        let mut r = roster_with_one_peer(5, 0, PeerHealth::Alive);
-        assert_eq!(r.apply_transitions(PeerMask::EMPTY), 0);
+    fn exclude_ignores_empty_mask() {
+        let mut r = roster_with_one_peer(PeerHealth::Alive);
+        assert_eq!(r.exclude(PeerMask::EMPTY), 0);
         assert_eq!(r.peers()[0].health, PeerHealth::Alive);
     }
 
     #[test]
-    fn alive_escalates_when_confirmed_and_over_threshold() {
-        let mut r = roster_with_one_peer(3, 0, PeerHealth::Alive);
+    fn exclude_sets_alive_to_lost() {
+        let mut r = roster_with_one_peer(PeerHealth::Alive);
         let mut mask = PeerMask::EMPTY;
         mask.set(0);
-        assert_eq!(r.apply_transitions(mask), 1);
-        assert_eq!(r.peers()[0].health, PeerHealth::Suspect);
-    }
-
-    #[test]
-    fn suspect_recovers_unconditionally() {
-        let mut r = roster_with_one_peer(0, 20, PeerHealth::Suspect);
-        assert_eq!(r.apply_transitions(PeerMask::EMPTY), 1);
-        assert_eq!(r.peers()[0].health, PeerHealth::Alive);
-    }
-
-    #[test]
-    fn suspect_escalates_when_confirmed_and_over_threshold() {
-        let mut r = roster_with_one_peer(10, 0, PeerHealth::Suspect);
-        let mut mask = PeerMask::EMPTY;
-        mask.set(0);
-        assert_eq!(r.apply_transitions(mask), 1);
+        assert_eq!(r.exclude(mask), 1);
         assert_eq!(r.peers()[0].health, PeerHealth::Lost);
     }
 
     #[test]
-    fn lost_is_terminal() {
-        let mut r = roster_with_one_peer(0, 100, PeerHealth::Lost);
+    fn exclude_is_idempotent() {
+        let mut r = roster_with_one_peer(PeerHealth::Lost);
         let mut mask = PeerMask::EMPTY;
         mask.set(0);
-        assert_eq!(r.apply_transitions(mask), 0);
-        assert_eq!(r.peers()[0].health, PeerHealth::Lost);
+        assert_eq!(r.exclude(mask), 0);
     }
 }

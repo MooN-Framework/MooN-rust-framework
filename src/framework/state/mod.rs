@@ -4,11 +4,11 @@ mod peers;
 mod voting;
 
 pub use cycle::{AckInfo, CycleState};
-pub use observation::{FaultKind, ObservationKind};
+pub use observation::ObservationKind;
 pub use peers::{DiscoveryError, PeerHealth, PeerInfo, PeerRoster};
 pub use voting::ExclusionVotes;
 
-use crate::framework::config::{HealthConfig, MAX_PEERS, ParticipantConfig};
+use crate::framework::config::{MAX_PEERS, ParticipantConfig};
 use crate::framework::peer_sync::PeerClock;
 use crate::framework::state_machine::{NodeState, SystemState};
 use crate::framework::traits::{Voter, VotingOutcome};
@@ -34,6 +34,8 @@ pub struct RunState<V: Voter> {
     obs: ObservationKind,
     votes: ExclusionVotes,
 
+    pending_exclusion_proposal: PeerMask,
+
     peer_clocks: Vec<PeerClock, MAX_PEERS>,
     sync_epsilon_ns: i64,
     sync_valid: bool,
@@ -42,12 +44,7 @@ pub struct RunState<V: Voter> {
 }
 
 impl<V: Voter> RunState<V> {
-    pub fn new(
-        own_id: u8,
-        session_id: u64,
-        voter: V,
-        participants: ParticipantConfig,
-    ) -> Self {
+    pub fn new(own_id: u8, session_id: u64, voter: V, participants: ParticipantConfig) -> Self {
         Self {
             own_id,
             session_id,
@@ -56,19 +53,16 @@ impl<V: Voter> RunState<V> {
             node_state: NodeState::Startup,
             system_state: SystemState::Startup,
             current_seq: 0,
-            roster: PeerRoster::new(HealthConfig::default()),
+            roster: PeerRoster::new(),
             cycle: CycleState::empty(),
             obs: ObservationKind::empty(),
             votes: ExclusionVotes::empty(),
+            pending_exclusion_proposal: PeerMask::EMPTY,
             peer_clocks: Vec::new(),
             sync_epsilon_ns: 0,
             sync_valid: false,
             last_decision: None,
         }
-    }
-
-    pub fn set_health_config(&mut self, cfg: HealthConfig) {
-        self.roster.set_health_config(cfg);
     }
 
     pub fn participants(&self) -> &ParticipantConfig {
@@ -102,16 +96,20 @@ impl<V: Voter> RunState<V> {
         self.cycle.own_result = Some(payload);
     }
 
-    /// Record a peer's shared result for this cycle.
     pub fn record_peer_result(&mut self, peer_id: u8, payload: V::Payload) -> Result<(), DiscoveryError> {
         let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+        if self.roster.peers()[idx].health == PeerHealth::Lost {
+            return Ok(());
+        }
         self.cycle.peer_results[idx] = Some(payload);
         Ok(())
     }
 
-    /// Record a peer's ack (with its `received_from` attestation).
     pub fn record_peer_ack(&mut self, peer_id: u8, ack: AckInfo) -> Result<(), DiscoveryError> {
         let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+        if self.roster.peers()[idx].health == PeerHealth::Lost {
+            return Ok(());
+        }
         self.cycle.peer_acks[idx] = Some(ack);
         Ok(())
     }
@@ -133,10 +131,12 @@ impl<V: Voter> RunState<V> {
         outcome
     }
 
-    /// Reset all per-cycle buffers to start a fresh cycle.
+    /// Reset all per-cycle buffers to start a fresh cycle. Also clears the
+    /// pending exclusion proposal.
     pub fn start_new_cycle(&mut self, deadline: u64) {
         self.current_seq = self.current_seq.wrapping_add(1);
         self.cycle.reset(deadline);
+        self.pending_exclusion_proposal = PeerMask::EMPTY;
         self.last_decision = None;
     }
 
@@ -156,7 +156,8 @@ impl<V: Voter> RunState<V> {
     }
 
     pub fn set_own_seen_bit(&mut self, peer_idx: usize) {
-        if peer_idx < self.roster.peers().len() {
+        let peers = self.roster.peers();
+        if peer_idx < peers.len() && peers[peer_idx].health != PeerHealth::Lost {
             self.obs.own_seen.set(peer_idx);
         }
     }
@@ -165,53 +166,52 @@ impl<V: Voter> RunState<V> {
         self.obs.own_seen
     }
 
-    /// Record a peer's `State.seen_mask` piggybacked observation.
     pub fn record_peer_seen_mask(&mut self, peer_id: u8, mask: PeerMask) -> Result<(), DiscoveryError> {
         let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+        if self.roster.peers()[idx].health == PeerHealth::Lost {
+            return Ok(());
+        }
         self.obs.peer_seen[idx] = Some(mask);
         Ok(())
     }
 
-    /// Cross-observed fault attribution for the CycleSync phase.
-    pub fn aggregate_cycle_sync_evidence(&mut self) {
-        observation::aggregate::<V::Payload>(
-            &mut self.roster,
+    /// Update the pending exclusion proposal with peers attributed as
+    /// missing this CycleSync phase. Majority rule; the proposal is the
+    /// union of all attributions collected during the cycle.
+    pub fn attribute_cycle_sync_missing(&mut self) {
+        if let Some(mask) = observation::attribute_missing::<V::Payload>(
+            &self.roster,
             observation::View::CycleSync {
                 own_seen: self.obs.own_seen,
                 peer_seen: &self.obs.peer_seen,
             },
             self.own_id,
-            FaultKind::MissedCycleSync,
-            false,
-        );
+        ) {
+            self.pending_exclusion_proposal.0 |= mask.0;
+        }
     }
 
-    /// Cross-observed fault attribution for the Result-sharing phase.
-    pub fn aggregate_result_evidence(&mut self) {
-        observation::aggregate(
-            &mut self.roster,
+    /// Update the pending exclusion proposal with peers attributed as
+    /// missing this Result phase.
+    pub fn attribute_result_missing(&mut self) {
+        if let Some(mask) = observation::attribute_missing(
+            &self.roster,
             observation::View::Result {
                 peer_results: &self.cycle.peer_results,
                 peer_acks: &self.cycle.peer_acks,
             },
             self.own_id,
-            FaultKind::MissedShareResult,
-            false,
-        );
+        ) {
+            self.pending_exclusion_proposal.0 |= mask.0;
+        }
     }
 
-    /// Credit peers observed as result-delivering by the majority.
-    pub fn credit_majority_delivered_peers(&mut self) {
-        observation::aggregate(
-            &mut self.roster,
-            observation::View::Result {
-                peer_results: &self.cycle.peer_results,
-                peer_acks: &self.cycle.peer_acks,
-            },
-            self.own_id,
-            FaultKind::MissedShareResult,
-            true,
-        );
+    /// Add a peer to the local exclusion proposal explicitly (e.g. after
+    /// a value-divergence detection in Publish).
+    pub fn propose_exclude(&mut self, peer_id: u8) -> Result<(), DiscoveryError> {
+        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+        self.pending_exclusion_proposal.set(idx);
+        Ok(())
     }
 
     pub fn reset_exclusion_proposals(&mut self) {
@@ -220,17 +220,21 @@ impl<V: Voter> RunState<V> {
 
     pub fn record_peer_exclusion_proposal(&mut self, peer_id: u8, mask: PeerMask) -> Result<(), DiscoveryError> {
         let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+        if self.roster.peers()[idx].health == PeerHealth::Lost {
+            return Ok(());
+        }
         self.votes.proposals[idx] = Some(mask);
         Ok(())
     }
 
-    /// Local exclusion proposal derived from current fault counters.
+    /// The local exclusion proposal accumulated over this cycle.
     pub fn proposed_exclusions(&self) -> PeerMask {
-        self.roster.proposed_exclusions()
+        self.pending_exclusion_proposal
     }
 
-    /// Peers whose vote is expected this round but has not arrived. Empty
-    /// return means the vote may complete.
+    /// Peers whose vote is expected this round but has not arrived. A peer
+    /// that is being proposed for exclusion, or that has been silent all
+    /// cycle, is not expected to reply.
     pub fn healthy_peers_missing_vote(&self) -> Vec<u8, MAX_PEERS> {
         let own_proposal = self.proposed_exclusions();
         let mut missing: Vec<u8, MAX_PEERS> = Vec::new();
@@ -259,18 +263,9 @@ impl<V: Voter> RunState<V> {
         self.votes.aggregate(&self.roster, self.own_id, self.proposed_exclusions())
     }
 
-    /// Apply confirmed exclusions and unconditional recoveries. Returns
-    /// number of transitions applied.
+    /// Apply confirmed exclusions. Returns number of transitions applied.
     pub fn apply_confirmed_exclusions(&mut self, confirmed: PeerMask) -> usize {
-        self.roster.apply_transitions(confirmed)
-    }
-
-    pub fn record_peer_fault(&mut self, peer_id: u8, kind: FaultKind) -> Result<(), DiscoveryError> {
-        self.roster.record_fault(peer_id, kind)
-    }
-
-    pub fn record_peer_healthy_cycle(&mut self, peer_id: u8) -> Result<(), DiscoveryError> {
-        self.roster.record_healthy(peer_id)
+        self.roster.exclude(confirmed)
     }
 
     pub fn active_peer_count(&self) -> usize {
@@ -296,16 +291,8 @@ impl<V: Voter> RunState<V> {
         strict_majority.max(self.participants.min_participants as usize)
     }
 
-    /// True when the fabric can no longer tolerate any further failure
-    /// (degraded mode).
-    pub fn in_fail_safe_mode(&self) -> bool {
-        let active_total = 1 + self.active_peer_count();
-        active_total <= self.required_agreement()
-    }
-
-    /// How many further node failures the fabric can currently tolerate
-    /// without losing majority voting. Zero means the next fault is
-    /// unrecoverable and must trigger failsafe.
+    /// How many further node failures the fabric can tolerate without
+    /// losing majority voting. Zero means the next fault is unrecoverable.
     pub fn tolerable_failures_remaining(&self) -> usize {
         let active_total = 1 + self.active_peer_count();
         active_total.saturating_sub(self.participants.min_participants as usize)

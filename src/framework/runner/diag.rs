@@ -70,8 +70,8 @@ where
                 .map(|p| PeerStatus {
                     id: p.id,
                     health: format!("{:?}", p.health),
-                    consecutive_faults: p.consecutive_faults,
-                    consecutive_healthy_cycles: p.consecutive_healthy_cycles,
+                    consecutive_faults: 0,
+                    consecutive_healthy_cycles: 0,
                 })
                 .collect(),
             injection: InjectionSnapshot {
