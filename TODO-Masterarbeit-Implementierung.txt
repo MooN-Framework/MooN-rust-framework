@@ -1,0 +1,39 @@
+|================|
+|  TO-DO	     |
+|================|
+- ResyncLostPeer timeouts in Config einarbeiten
+- GUI-Diagnosetool
+- Dokumentation + Refactoring
+
+|================|
+|Voter Impl  	 |
+|================|
+- Anzahl übereinstimmender Ergebnisse darf niemals gleichstand haben! (z.B. bei 2-oo-4 darf niemals 2 vs 2 gleiche haben) => zählen der vorkommen verschiedener Ergebnisse und wenn keine mehrheit => Failsafe!
+
+|================|
+|SW-Ausfälle	 |
+|================|
+- Node sendet Nachricht ohne zu empfangen (Geht in Failsafe, weil anderen Nodes nicht antworten => Sicherer Systemzustand)
+- Node empfängt Nachrichten ohne zu senden (Wird ausgeschlossen, von den anderen Nodes durch seperate Message?)
+- Node rechnet falsche Ergebnis / Verfälschtes Ergebnis durch bitflip (Voting setzt Suspect erst auf Suspect und dann Isolation)
+- Node wählt falschen Voter (Voting setzt Suspect erst auf Suspect und dann Isolation)
+
+|================|
+|Done	 		 |
+|================|
+- Konfigurationsmanagement + Refactoring [X]
+- Fehlermanagement (Suspect) Synchronisierung von Fehlerzustandswechsel [X]
+- Resynchronisierung von Knoten [X]
+- Probation von Resynchroniserten Knoten für konfigurierbare zyklen zeit [X]
+
+|================|
+|Fehlermanagement|
+|================|
+- Jeder darf Suspect/Isolation proposen
+- Es erfordert explizite Zustimmung
+- Weiterlaufen vs Failsafe (Noch zu bestimmen) bei uneinigkeit
+- Wird immer im ErrorManagement umgesetzt
+- Maybe send to Isolation mit ACK, das die nodes bestätigen können der Node ist weg sonst failsafe.
+
+[Wenn Zeit]
+- Sync crossvalidation der offsets

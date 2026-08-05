@@ -1,6 +1,6 @@
 use crate::framework::peer_sync::{PeerSync, SAMPLES_PER_PEER, SyncFields, extract_sync_fields};
 use crate::framework::state::PeerHealth;
-use crate::framework::state_machine::{StateEvent, SystemState};
+use crate::framework::state_machine::{StateEvent, SystemState, NodeState};
 use crate::framework::traits::{Computation, DecisionSink, Voter, VotingOutcome};
 use crate::framework::transport::RecvOutcome;
 use crate::framework::types::PeerMask;
@@ -9,6 +9,7 @@ use serde::Deserialize;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+use std::cell::Cell;
 
 use super::PhaseOutcome;
 
@@ -34,6 +35,110 @@ where
         }
     }
 
+pub(super) fn handle_resync_lost_node(&mut self) -> StateEvent {
+    let is_returning = self.state.was_lost();
+    info!(is_returning, "resync entered");
+
+    let node_state = self.state.node_state();
+
+    // Healthy peer: expected size = current active + peers we're readmitting.
+    // Lost peer: unknown until we hear from someone.
+    let expected_size: Cell<Option<u8>> = Cell::new(if is_returning {
+        None
+    } else {
+        let pending = self.state.pending_rejoin().as_u8().count_ones() as u8;
+        Some(self.state.active_count_including_self() + pending)
+    });
+
+    let deadline = Instant::now() + if is_returning {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(5)
+    };
+
+let outcome = self.collect_phase(
+    "resync",
+    deadline,
+    Duration::from_millis(10),
+    |this| {
+        // send closure — unchanged
+        let mask = if is_returning {
+            PeerMask::EMPTY
+        } else {
+            this.state.own_seen_mask()
+        };
+        let ac = if is_returning {
+            0
+        } else {
+            let pending = this.state.pending_rejoin().as_u8().count_ones() as u8;
+            this.state.active_count_including_self() + pending
+        };
+        if let Err(e) = this.transport.send_state(node_state, mask, ac) {
+            error!(error = ?e, "send_state failed in resync");
+            return Err(());
+        }
+        Ok(())
+    },
+    |this| match expected_size.get() {
+        Some(n) => {
+            let present = if is_returning {
+                this.state.peers().len() as u8 + 1
+            } else {
+                this.state.active_count_including_self()
+            };
+            present >= n
+        }
+        None => false,
+    },
+    |this, frame| {
+        if frame.node_state_wire() != NodeState::ResyncLostPeer.to_wire() {
+            warn!(peer_id = frame.node_id(), "non-resync frame in resync phase, ignoring");
+            return;
+        }
+        let peer_id = frame.node_id();
+
+        if is_returning {
+            let _ = this.state.on_peer_discovered(peer_id);
+        } else if this.state.readmit_peer(peer_id) {
+            info!(peer_id, "peer readmitted");
+        }
+
+        if let Payload::State { active_count, .. } = frame.payload() {
+            if active_count > 0 && expected_size.get().is_none() {
+                expected_size.set(Some(active_count));
+                info!(size = active_count, "learned expected system size");
+            }
+        }
+    },
+);
+
+    match outcome {
+        PhaseOutcome::Complete => {
+            if is_returning {
+                if let Err(e) = self.state.finalize_discovery() {
+                    error!(error = ?e, "finalize_discovery failed");
+                    return StateEvent::SelfTestErr;
+                }
+                self.state.set_was_lost(false);
+                self.state.enter_self_probation();
+                info!("entering self probation");
+            }
+            self.state.start_new_cycle(self.next_cycle_tick());
+            self.state.set_system_state(SystemState::Operational);
+            StateEvent::ResyncLostPeerOk
+        }
+        PhaseOutcome::Timeout => {
+            self.state.clear_pending_rejoin();
+            warn!(is_returning, expected = ?expected_size.get(), "resync deadline exceeded");
+            StateEvent::ResyncLostPeerTimeout
+        }
+        PhaseOutcome::Fault => {
+            self.state.clear_pending_rejoin();
+            StateEvent::Fault
+        }
+    }
+}
+
     /// InitSync: broadcast state until the nominal peer set is discovered
     /// or the discovery window elapses.
     pub(super) fn handle_init_sync(&mut self) -> StateEvent {
@@ -47,7 +152,7 @@ where
             deadline,
             Duration::from_millis(10),
             |this| {
-                if let Err(e) = this.transport.send_state(node_state, PeerMask::EMPTY) {
+                if let Err(e) = this.transport.send_state(node_state, PeerMask::EMPTY, 0) {
                     error!(error = ?e, "send_state failed in init sync");
                     return Err(());
                 }
@@ -55,17 +160,29 @@ where
             },
             |this| this.discovery_complete(),
             |this, frame| {
-                debug!(peer_id = frame.node_id(), "init sync frame received");
-                let _ = this.state.on_peer_discovered(frame.node_id());
+                if frame.node_state_wire() == NodeState::InitSync.to_wire() {
+                    debug!(peer_id = frame.node_id(), "init sync frame received");
+                    let _ = this.state.on_peer_discovered(frame.node_id());
+                } else
+                {
+                    warn!("Non init sync frame received, i was lost, going into resync state.");
+                    this.state.set_was_lost(true);
+                }
             },
         );
 
         match outcome {
             PhaseOutcome::Complete => {
+                if self.state.was_lost() {
+                    warn!("I was lost, going into resync state.");
+                    return StateEvent::GoResyncLostPeer;
+                }
+
                 if let Err(e) = self.state.finalize_discovery() {
                     error!(error = ?e, "finalize_discovery failed");
                     return StateEvent::SelfTestErr;
                 }
+
                 self.state.start_new_cycle(self.next_cycle_tick());
                 self.state.set_system_state(SystemState::Operational);
                 StateEvent::InitialSyncOk
@@ -168,7 +285,7 @@ where
         }
     }
 
-    /// CycleSync: peers exchange State beacons with attested seen-masks
+/// CycleSync: peers exchange State beacons with attested seen-masks
     /// until each side has observed all non-Lost peers, or the phase times
     /// out.
     pub(super) fn handle_cycle_sync(&mut self) -> StateEvent {
@@ -184,7 +301,7 @@ where
             Duration::from_millis(1),
             |this| {
                 let mask = this.state.own_seen_mask();
-                if let Err(e) = this.transport.send_state(node_state, mask) {
+                if let Err(e) = this.transport.send_state(node_state, mask, this.state.active_count_including_self()) {
                     error!(error = ?e, "send_state failed in cycle sync");
                     return Err(());
                 }
@@ -192,8 +309,12 @@ where
             },
             |this| this.state.own_seen_mask().as_u8() == expected_mask,
             |this, frame| {
+                if frame.node_state_wire() == NodeState::ResyncLostPeer.to_wire() {
+                    this.state.set_rejoin_seen(frame.node_id());
+                }
+
                 let peer_id = frame.node_id();
-                if let Payload::State { seen_mask } = frame.payload() {
+                if let Payload::State { seen_mask, .. } = frame.payload() {
                     if let Some(idx) = this.state.peer_index(peer_id) {
                         this.state.set_own_seen_bit(idx);
                         let _ = this.state.record_peer_seen_mask(peer_id, seen_mask);
@@ -247,7 +368,7 @@ where
         }
     }
 
-    /// ShareResult: broadcast our result until every non-Lost peer has
+/// ShareResult: broadcast our result until every non-Lost peer has
     /// delivered theirs.
     pub(super) fn handle_share_result(&mut self) -> StateEvent {
         let suppress_send = self
@@ -284,7 +405,13 @@ where
                 Ok(())
             },
             |this| this.all_peer_results_in(),
-            |this, frame| this.ingest_frame(frame),
+            |this, frame| {
+                if frame.node_state_wire() == NodeState::ResyncLostPeer.to_wire() {
+                    this.state.set_rejoin_seen(frame.node_id());
+                } else {
+                    this.ingest_frame(frame);
+                }
+            },
         );
 
         match outcome {
@@ -297,8 +424,8 @@ where
         }
     }
 
-    /// SendAck: broadcast our attested received-mask and publisher pick
-    /// until every non-Lost peer has done the same.
+    /// SendAck: broadcast our attested received-mask, publisher pick, and
+    /// rejoin vote until every non-Lost peer has done the same.
     pub(super) fn handle_send_ack(&mut self) -> StateEvent {
         let suppress_send = self
             .diagnostic
@@ -311,6 +438,7 @@ where
 
         let mask = self.received_mask();
         let candidate = self.pick_publisher_candidate();
+        let rejoin_vote = self.state.own_rejoin_vote();
         let node_state = self.state.node_state();
         let deadline = Instant::now() + self.timing.ack_timeout;
 
@@ -322,13 +450,18 @@ where
                 if suppress_send {
                     return Ok(());
                 }
-                if let Err(e) = this.transport.send_ack(node_state, mask, candidate) {
+                if let Err(e) = this.transport.send_ack(node_state, mask, candidate, rejoin_vote) {
                     error!(error = ?e, "send_ack failed");
                 }
                 Ok(())
             },
             |this| this.all_peer_acks_in(),
-            |this, frame| this.ingest_frame(frame),
+            |this, frame| {
+                if let Payload::Ack { rejoin_vote, .. } = frame.payload() {
+                    let _ = this.state.record_peer_rejoin_vote(frame.node_id(), rejoin_vote);
+                }
+                this.ingest_frame(frame);
+            },
         );
 
         match outcome {
@@ -350,62 +483,99 @@ where
     pub(super) fn handle_publish(&mut self) -> StateEvent {
         let outcome = self.state.run_vote();
         match outcome {
-            VotingOutcome::Consensus(decision) => {
-                let own_result = self.state.cycle().own_result;
-                let dissenter_analysis = own_result.map(|own| {
-                    self.state
-                        .voter()
-                        .find_dissenters(&own, &self.state.cycle().peer_results, &decision)
-                });
-
-                if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
-                    if own_dissented {
-                        error!(own_id = self.state.own_id(), "own value dissented, failsafe");
-                        return StateEvent::Fault;
+VotingOutcome::Consensus(decision) => {
+    let own_pick = self.pick_publisher_candidate();
+    let publisher = match self.state.publisher_consensus(own_pick) {
+        Some(id) => id,
+        None => {
+            let picks: Vec<(u8, u8)> = self
+                .state
+                .peers()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, p)| {
+                    if p.health == PeerHealth::Lost {
+                        return None;
                     }
-                    if !peer_dissenter_indices.is_empty() {
-                        let dissenter_ids: Vec<u8> = peer_dissenter_indices
-                            .iter()
-                            .filter_map(|idx| {
-                                self.state.peers().get(*idx as usize).map(|p| p.id)
-                            })
-                            .collect();
+                    self.state.cycle().peer_acks[idx]
+                        .map(|a| (p.id, a.publisher_candidate))
+                })
+                .collect();
+            error!(
+                own_id = self.state.own_id(),
+                own_pick,
+                peer_picks = ?picks,
+                "publisher pick divergence, failsafe"
+            );
+            return StateEvent::Fault;
+        }
+    };
+    let own_id = self.state.own_id();
 
-                        let publisher = self.pick_publisher_candidate();
-                        if publisher == self.state.own_id() {
-                            warn!(publisher, "consensus with dissenters, publishing then reconfig");
-                            self.sink.publish(&decision);
-                        }
-                        for peer_id in dissenter_ids {
-                            warn!(peer_id, "peer value diverged from consensus");
-                            let _ = self.state.propose_exclude(peer_id);
-                        }
-                        return StateEvent::DissenterDetected;
-                    }
-                }
+    let own_result = self.state.cycle().own_result;
+    let dissenter_analysis = own_result.map(|own| {
+        self.state
+            .voter()
+            .find_dissenters(&own, &self.state.cycle().peer_results, &decision)
+    });
 
-                let publisher = self.pick_publisher_candidate();
-                let own_id = self.state.own_id();
-                if publisher == own_id {
-                    info!(publisher, "consensus reached, publishing");
-                    self.sink.publish(&decision);
-                } else {
-                    debug!(publisher, own_id, "consensus reached, peer publishes");
-                }
+    if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
+        if own_dissented {
+            error!(own_id, "own value dissented, failsafe");
+            return StateEvent::Fault;
+        }
+        if !peer_dissenter_indices.is_empty() {
+            let dissenter_ids: Vec<u8> = peer_dissenter_indices
+                .iter()
+                .filter_map(|idx| self.state.peers().get(*idx as usize).map(|p| p.id))
+                .collect();
 
-                self.cycles_since_last_sync = self.cycles_since_last_sync.saturating_add(1);
-
-                if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
-                    info!(
-                        cycles = self.cycles_since_last_sync,
-                        interval = self.timing.resync_interval_cycles,
-                        "resync interval reached"
-                    );
-                    StateEvent::ResyncDue
-                } else {
-                    StateEvent::ResultPublished
-                }
+            if publisher == own_id {
+                warn!(publisher, "consensus with dissenters, publishing then reconfig");
+                self.sink.publish(&decision);
             }
+            for peer_id in dissenter_ids {
+                warn!(peer_id, "peer value diverged from consensus");
+                let _ = self.state.propose_exclude(peer_id);
+            }
+            return StateEvent::DissenterDetected;
+        }
+    }
+
+    if publisher == own_id {
+        info!(publisher, "consensus reached, publishing");
+        self.sink.publish(&decision);
+    } else {
+        debug!(publisher, own_id, "consensus reached, peer publishes");
+    }
+
+    let promoted = self.state.tick_probation();
+    if promoted > 0 {
+        info!(promoted, "peers promoted from Probation to Alive");
+    }
+
+    let confirmed_rejoin = self.state.aggregate_rejoin_votes();
+    if confirmed_rejoin.as_u8() != 0 {
+        warn!(
+            rejoin_mask = confirmed_rejoin.as_u8(),
+            "rejoin confirmed by all healthy peers, going into resync"
+        );
+        self.state.set_pending_rejoin(confirmed_rejoin);
+        return StateEvent::GoResyncLostPeer;
+    }
+
+    self.cycles_since_last_sync = self.cycles_since_last_sync.saturating_add(1);
+    if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
+        info!(
+            cycles = self.cycles_since_last_sync,
+            interval = self.timing.resync_interval_cycles,
+            "resync interval reached"
+        );
+        StateEvent::ResyncDue
+    } else {
+        StateEvent::ResultPublished
+    }
+}
             VotingOutcome::Disagreement => {
                 warn!("vote disagreement");
                 StateEvent::StateDiverged
@@ -530,8 +700,11 @@ where
         }
     }
 
-    /// True when discovery has found the nominal total node count.
+    /// True when discovery has found the nominal total node count or we going to resync because of received frames.
     fn discovery_complete(&self) -> bool {
+        if self.state.was_lost() {
+            return true;
+        }
         let found = self.state.peers().len() as u8 + 1;
         found == self.state.participants().nominal_participants
     }
@@ -557,7 +730,16 @@ where
 
     /// Publisher pick: lowest-id Alive node, defaulting to self.
     fn pick_publisher_candidate(&self) -> u8 {
-        self.state.lowest_alive_id()
+        if self.state.self_in_probation() {
+            // Self in probation must not pick itself. Fall back to the
+            // lowest-id Alive peer. If none exists we return self anyway —
+            // publisher_consensus will then flag divergence and we'll fault.
+            self.state
+                .lowest_alive_peer_id()
+                .unwrap_or_else(|| self.state.own_id())
+        } else {
+            self.state.lowest_alive_id()
+        }
     }
 
     /// Placeholder for the next-cycle epoch; the barrier is at the

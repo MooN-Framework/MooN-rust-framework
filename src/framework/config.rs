@@ -20,12 +20,13 @@ pub const MAX_DISSENTERS: usize = 16;
 pub struct ParticipantConfig {
     pub nominal_participants: u8,
     pub min_participants: u8,
+    pub probation_cycles: u32,
 }
 
 impl ParticipantConfig {
     /// Construct a config. Panics on invalid values (construction-time
     /// invariant, must fail loudly at startup).
-    pub fn new(minimum: u8, nominal: u8) -> Self {
+    pub fn new(minimum: u8, nominal: u8, probation_cycles: u32) -> Self {
         assert!(minimum >= 1, "min_participants must be >= 1");
         assert!(minimum <= nominal, "min ({minimum}) must not exceed nominal ({nominal})");
         assert!(
@@ -35,6 +36,7 @@ impl ParticipantConfig {
         Self {
             nominal_participants: nominal,
             min_participants: minimum,
+            probation_cycles: probation_cycles,
         }
     }
 
@@ -111,6 +113,7 @@ pub struct NodeConfig {
 pub struct ParticipantSection {
     pub nominal: u8,
     pub minimum: u8,
+    pub probation_cycles: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -144,7 +147,7 @@ pub struct DiagnosticSection {
 
 impl NodeConfig {
     pub fn participants(&self) -> ParticipantConfig {
-        ParticipantConfig::new(self.participants.minimum, self.participants.nominal)
+        ParticipantConfig::new(self.participants.minimum, self.participants.nominal, self.participants.probation_cycles)
     }
 
     pub fn timing(&self) -> CycleTiming {

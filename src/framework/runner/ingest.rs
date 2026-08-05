@@ -39,7 +39,7 @@ where
                     warn!(peer_id, error = ?e, "record_peer_result failed");
                 }
             }
-            Payload::Ack { received_from, publisher_candidate } => {
+            Payload::Ack { received_from, publisher_candidate, .. } => {
                 let ack = AckInfo {
                     received_from: received_from.as_u8(),
                     publisher_candidate,

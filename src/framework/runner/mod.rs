@@ -104,6 +104,7 @@ where
                 NodeState::PublishResult => self.handle_publish(),
                 NodeState::ErrorManagement => self.handle_error_management(),
                 NodeState::Isolation => self.handle_isolation(),
+                NodeState::ResyncLostPeer => self.handle_resync_lost_node(),
                 NodeState::Failsafe => {
                     self.enter_failsafe();
                     return;

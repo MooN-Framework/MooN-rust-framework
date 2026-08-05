@@ -22,6 +22,7 @@ pub enum NodeState {
     ErrorManagement = 0x08,
     Isolation = 0x09,
     PeerSync = 0x0A,
+    ResyncLostPeer = 0x0B,
     Failsafe = 0xFF,
 }
 
@@ -43,6 +44,10 @@ pub enum StateEvent {
     AckTimeout,
     ResultPublished,
     ResyncDue,
+
+    GoResyncLostPeer,
+    ResyncLostPeerTimeout,
+    ResyncLostPeerOk,
     /// Consensus reached but at least one peer diverged. Routed through
     /// ErrorManagement so the divergent peer can be reconfigured centrally.
     DissenterDetected,
@@ -67,6 +72,7 @@ impl NodeState {
             (Startup, SelfTestErr) => Failsafe,
 
             (InitSync, InitialSyncOk) => PeerSync,
+            (InitSync, GoResyncLostPeer) => ResyncLostPeer,
             (InitSync, InitialSyncTimeout) => Failsafe,
 
             (PeerSync, PeerSyncOk) => ReadInputs,
@@ -83,8 +89,12 @@ impl NodeState {
 
             (PublishResult, ResultPublished) => CycleSync,
             (PublishResult, ResyncDue) => PeerSync,
+            (PublishResult, GoResyncLostPeer) => ResyncLostPeer,
             (PublishResult, DissenterDetected) => ErrorManagement,
             (PublishResult, StateDiverged) => Failsafe,
+
+            (ResyncLostPeer, ResyncLostPeerTimeout) => ErrorManagement,
+            (ResyncLostPeer, ResyncLostPeerOk) => PeerSync,
 
             (ErrorManagement, StateOk) => CycleSync,
             (ErrorManagement, StateDiverged) => Failsafe,
@@ -117,6 +127,7 @@ impl NodeState {
             0x08 => ErrorManagement,
             0x09 => Isolation,
             0x0A => PeerSync,
+            0x0B => ResyncLostPeer,
             0xFF => Failsafe,
             other => return Err(InvalidNodeState(other)),
         })

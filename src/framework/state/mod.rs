@@ -7,7 +7,6 @@ pub use cycle::{AckInfo, CycleState};
 pub use observation::ObservationKind;
 pub use peers::{DiscoveryError, PeerHealth, PeerInfo, PeerRoster};
 pub use voting::ExclusionVotes;
-
 use crate::framework::config::{MAX_PEERS, ParticipantConfig};
 use crate::framework::peer_sync::PeerClock;
 use crate::framework::state_machine::{NodeState, SystemState};
@@ -40,6 +39,12 @@ pub struct RunState<V: Voter> {
     sync_epsilon_ns: i64,
     sync_valid: bool,
 
+    was_lost : bool,
+    rejoin_seen: PeerMask,
+    peer_rejoin_votes: Vec<Option<PeerMask>, MAX_PEERS>,
+    pending_rejoin: PeerMask,
+    self_probation_remaining: u32,
+
     last_decision: Option<VotingOutcome<V::Decision>>,
 }
 
@@ -61,6 +66,11 @@ impl<V: Voter> RunState<V> {
             peer_clocks: Vec::new(),
             sync_epsilon_ns: 0,
             sync_valid: false,
+            was_lost: false,
+            rejoin_seen: PeerMask::EMPTY,
+            peer_rejoin_votes: Vec::new(),
+            pending_rejoin: PeerMask::EMPTY,
+            self_probation_remaining: 0,
             last_decision: None,
         }
     }
@@ -85,6 +95,11 @@ impl<V: Voter> RunState<V> {
         self.cycle.resize(n);
         self.obs.resize(n);
         self.votes.resize(n);
+        // NEU: peer_rejoin_votes auf n füllen
+        self.peer_rejoin_votes.clear();
+        for _ in 0..n {
+            let _ = self.peer_rejoin_votes.push(None);
+        }
         Ok(())
     }
 
@@ -120,13 +135,48 @@ impl<V: Voter> RunState<V> {
             Some(v) => v,
             None => return VotingOutcome::InsufficientQuorum,
         };
-        let mut active: Vec<Option<V::Payload>, MAX_PEERS> = Vec::new();
+
+        // Collect Alive peer values only. Probation peer values don't count.
+        let mut peer_values: Vec<Option<V::Payload>, MAX_PEERS> = Vec::new();
         for (idx, peer) in self.roster.peers().iter().enumerate() {
-            if peer.health != PeerHealth::Lost {
-                let _ = active.push(self.cycle.peer_results[idx]);
+            if peer.health == PeerHealth::Alive {
+                let _ = peer_values.push(self.cycle.peer_results[idx]);
             }
         }
-        let outcome = self.voter.decide(&own, &active);
+
+        let outcome = if self.self_in_probation() {
+            // Self is in probation: own value must not influence the vote.
+            // Pick the first present Alive peer value as the "own" anchor
+            // that the voter operates on; contribute nothing extra.
+            let anchor = peer_values.iter().flatten().copied().next();
+            match anchor {
+                Some(a) => {
+                    // Remove the anchor from the peer set so it isn't counted
+                    // twice, then hand the remainder to the voter as peers.
+                    let mut anchor_removed = false;
+                    let mut remainder: Vec<Option<V::Payload>, MAX_PEERS> = Vec::new();
+                    for slot in peer_values.iter() {
+                        if !anchor_removed {
+                            if let Some(v) = slot {
+                                if *v == a {
+                                    anchor_removed = true;
+                                    continue;
+                                }
+                            }
+                        }
+                        let _ = remainder.push(*slot);
+                    }
+                    self.voter.decide(&a, &remainder)
+                }
+                None => {
+                    // No peer value at all — we can't vote without ourselves.
+                    return VotingOutcome::InsufficientQuorum;
+                }
+            }
+        } else {
+            self.voter.decide(&own, &peer_values)
+        };
+
         self.last_decision = Some(outcome);
         outcome
     }
@@ -138,6 +188,10 @@ impl<V: Voter> RunState<V> {
         self.cycle.reset(deadline);
         self.pending_exclusion_proposal = PeerMask::EMPTY;
         self.last_decision = None;
+        self.rejoin_seen = PeerMask::EMPTY;
+        for slot in self.peer_rejoin_votes.iter_mut() {
+            *slot = None;
+        }
     }
 
     /// Bitmask of peers currently expected to attend CycleSync (non-Lost).
@@ -232,6 +286,61 @@ impl<V: Voter> RunState<V> {
         self.pending_exclusion_proposal
     }
 
+    /// Note that we've observed a ResyncLostPeer frame from `peer_id` —
+    /// this contributes a bit to our own rejoin vote for this cycle.
+    pub fn set_rejoin_seen(&mut self, peer_id: u8) {
+        if (peer_id as usize) < 8 { self.rejoin_seen.set(peer_id as usize); }
+    }
+
+    /// The rejoin mask we'll attest to peers in send_ack.
+    pub fn own_rejoin_vote(&self) -> PeerMask {
+        self.rejoin_seen
+    }
+
+    pub fn set_pending_rejoin(&mut self, mask: PeerMask) {
+    self.pending_rejoin = mask;
+}
+
+    pub fn pending_rejoin(&self) -> PeerMask {
+        self.pending_rejoin
+    }
+
+    pub fn clear_pending_rejoin(&mut self) {
+        self.pending_rejoin = PeerMask::EMPTY;
+    }
+
+    /// Record a peer's rejoin-vote mask received in an ack frame.
+    pub fn record_peer_rejoin_vote(
+        &mut self,
+        peer_id: u8,
+        vote: PeerMask,
+    ) -> Result<(), DiscoveryError> {
+        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+        if self.roster.peers()[idx].health == PeerHealth::Lost {
+            return Ok(());
+        }
+        self.peer_rejoin_votes[idx] = Some(vote);
+        Ok(())
+    }
+
+    /// AND-reduce own vote with every healthy peer's vote. Any healthy
+    /// peer that didn't attest → return EMPTY (no rejoin this cycle).
+    /// Called after send_ack completes; a missing attestation means the
+    /// unanimity requirement isn't met.
+    pub fn aggregate_rejoin_votes(&self) -> PeerMask {
+        let mut agg = self.rejoin_seen.as_u8();
+        for (idx, peer) in self.roster.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            match self.peer_rejoin_votes[idx] {
+                Some(m) => agg &= m.as_u8(),
+                None => return PeerMask::EMPTY,
+            }
+        }
+        PeerMask::from_u8(agg)
+    }
+
     /// Peers whose vote is expected this round but has not arrived. A peer
     /// that is being proposed for exclusion, or that has been silent all
     /// cycle, is not expected to reply.
@@ -279,23 +388,23 @@ impl<V: Voter> RunState<V> {
     /// True as long as the active node count stays at or above the safety
     /// floor.
     pub fn quorum_available(&self) -> bool {
-        let active_total = 1 + self.active_peer_count();
-        active_total >= self.participants.min_participants as usize
+        let voting_total = 1 + self.roster.voting_peer_count();
+        voting_total >= self.participants.min_participants as usize
     }
 
     /// Number of agreeing values needed for a decision this cycle.
     /// `max(floor(N_active/2)+1, min_participants)`.
     pub fn required_agreement(&self) -> usize {
-        let active_total = 1 + self.active_peer_count();
-        let strict_majority = active_total / 2 + 1;
+        let voting_total = 1 + self.roster.voting_peer_count();
+        let strict_majority = voting_total / 2 + 1;
         strict_majority.max(self.participants.min_participants as usize)
     }
 
     /// How many further node failures the fabric can tolerate without
     /// losing majority voting. Zero means the next fault is unrecoverable.
     pub fn tolerable_failures_remaining(&self) -> usize {
-        let active_total = 1 + self.active_peer_count();
-        active_total.saturating_sub(self.participants.min_participants as usize)
+        let voting_total = 1 + self.roster.voting_peer_count();
+        voting_total.saturating_sub(self.participants.min_participants as usize)
     }
 
     pub fn set_peer_clocks(&mut self, clocks: &[PeerClock]) {
@@ -348,6 +457,60 @@ impl<V: Voter> RunState<V> {
         if local < 0 { None } else { Some(local as u64) }
     }
 
+    /// Readmit a peer that came back via resync. Returns true on transition.
+    pub fn readmit_peer(&mut self, peer_id: u8) -> bool {
+        self.roster.readmit(peer_id)
+    }
+
+    pub fn active_count_including_self(&self) -> u8 {
+        (1 + self.active_peer_count()) as u8
+    }
+
+    pub fn tick_probation(&mut self) -> usize {
+        if self.self_probation_remaining > 0 {
+            self.self_probation_remaining -= 1;
+            if self.self_probation_remaining == 0 {
+                info!("self promoted from Probation to Alive");
+            }
+        }
+        self.roster.tick_probation(self.participants.probation_cycles)
+    }
+
+    pub fn enter_self_probation(&mut self) {
+    self.self_probation_remaining = self.participants.probation_cycles;
+}
+
+    pub fn self_in_probation(&self) -> bool {
+    self.self_probation_remaining > 0
+}
+
+    pub fn lowest_alive_peer_id(&self) -> Option<u8> {
+    self.roster
+        .peers()
+        .iter()
+        .filter(|p| p.health == PeerHealth::Alive)
+        .map(|p| p.id)
+        .min()
+}
+
+    pub fn publisher_consensus(&self, own_pick: u8) -> Option<u8> {
+        for (idx, peer) in self.roster.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            match self.cycle.peer_acks[idx] {
+                Some(ack) => {
+                    if ack.publisher_candidate != own_pick {
+                        return None;
+                    }
+                }
+                None => return None,
+            }
+        }
+        Some(own_pick)
+    }
+
+
     pub fn own_id(&self) -> u8 { self.own_id }
     pub fn session_id(&self) -> u64 { self.session_id }
     pub fn node_state(&self) -> NodeState { self.node_state }
@@ -359,4 +522,6 @@ impl<V: Voter> RunState<V> {
     pub fn cycle(&self) -> &CycleState<V::Payload> { &self.cycle }
     pub fn last_decision(&self) -> Option<VotingOutcome<V::Decision>> { self.last_decision }
     pub fn voter(&self) -> &V { &self.voter }
+    pub fn was_lost(&self) -> bool { self.was_lost }
+    pub fn set_was_lost(&mut self, lost: bool) { self.was_lost = lost; }
 }
