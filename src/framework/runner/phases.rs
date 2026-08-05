@@ -289,7 +289,6 @@ let outcome = self.collect_phase(
     /// out.
     pub(super) fn handle_cycle_sync(&mut self) -> StateEvent {
         self.state.reset_cycle_sync_evidence();
-        self.state.reset_rejoin_evidence();
 
         let node_state = self.state.node_state();
         let expected_mask = self.state.expected_sync_mask();

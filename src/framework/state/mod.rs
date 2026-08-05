@@ -151,6 +151,10 @@ impl<V: Voter> RunState<V> {
         self.cycle.reset(deadline);
         self.pending_exclusion_proposal = PeerMask::EMPTY;
         self.last_decision = None;
+        self.rejoin_seen = PeerMask::EMPTY;
+        for slot in self.peer_rejoin_votes.iter_mut() {
+            *slot = None;
+        }
     }
 
     /// Bitmask of peers currently expected to attend CycleSync (non-Lost).
@@ -245,20 +249,10 @@ impl<V: Voter> RunState<V> {
         self.pending_exclusion_proposal
     }
 
-    /// Reset the rejoin-vote evidence at the start of a new cycle.
-    pub fn reset_rejoin_evidence(&mut self) {
-        self.rejoin_seen = PeerMask::EMPTY;
-        for slot in self.peer_rejoin_votes.iter_mut() {
-            *slot = None;
-        }
-    }
-
     /// Note that we've observed a ResyncLostPeer frame from `peer_id` —
     /// this contributes a bit to our own rejoin vote for this cycle.
     pub fn set_rejoin_seen(&mut self, peer_id: u8) {
-        if let Some(idx) = self.peer_index(peer_id) {
-            self.rejoin_seen.set(idx);
-        }
+        if (peer_id as usize) < 8 { self.rejoin_seen.set(peer_id as usize); }
     }
 
     /// The rejoin mask we'll attest to peers in send_ack.
