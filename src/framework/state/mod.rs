@@ -43,6 +43,7 @@ pub struct RunState<V: Voter> {
     rejoin_seen: PeerMask,
     peer_rejoin_votes: Vec<Option<PeerMask>, MAX_PEERS>,
     pending_rejoin: PeerMask,
+    self_probation_remaining: u32,
 
     last_decision: Option<VotingOutcome<V::Decision>>,
 }
@@ -69,6 +70,7 @@ impl<V: Voter> RunState<V> {
             rejoin_seen: PeerMask::EMPTY,
             peer_rejoin_votes: Vec::new(),
             pending_rejoin: PeerMask::EMPTY,
+            self_probation_remaining: 0,
             last_decision: None,
         }
     }
@@ -133,13 +135,48 @@ impl<V: Voter> RunState<V> {
             Some(v) => v,
             None => return VotingOutcome::InsufficientQuorum,
         };
-        let mut active: Vec<Option<V::Payload>, MAX_PEERS> = Vec::new();
+
+        // Collect Alive peer values only. Probation peer values don't count.
+        let mut peer_values: Vec<Option<V::Payload>, MAX_PEERS> = Vec::new();
         for (idx, peer) in self.roster.peers().iter().enumerate() {
-            if peer.health != PeerHealth::Lost {
-                let _ = active.push(self.cycle.peer_results[idx]);
+            if peer.health == PeerHealth::Alive {
+                let _ = peer_values.push(self.cycle.peer_results[idx]);
             }
         }
-        let outcome = self.voter.decide(&own, &active);
+
+        let outcome = if self.self_in_probation() {
+            // Self is in probation: own value must not influence the vote.
+            // Pick the first present Alive peer value as the "own" anchor
+            // that the voter operates on; contribute nothing extra.
+            let anchor = peer_values.iter().flatten().copied().next();
+            match anchor {
+                Some(a) => {
+                    // Remove the anchor from the peer set so it isn't counted
+                    // twice, then hand the remainder to the voter as peers.
+                    let mut anchor_removed = false;
+                    let mut remainder: Vec<Option<V::Payload>, MAX_PEERS> = Vec::new();
+                    for slot in peer_values.iter() {
+                        if !anchor_removed {
+                            if let Some(v) = slot {
+                                if *v == a {
+                                    anchor_removed = true;
+                                    continue;
+                                }
+                            }
+                        }
+                        let _ = remainder.push(*slot);
+                    }
+                    self.voter.decide(&a, &remainder)
+                }
+                None => {
+                    // No peer value at all — we can't vote without ourselves.
+                    return VotingOutcome::InsufficientQuorum;
+                }
+            }
+        } else {
+            self.voter.decide(&own, &peer_values)
+        };
+
         self.last_decision = Some(outcome);
         outcome
     }
@@ -351,23 +388,23 @@ impl<V: Voter> RunState<V> {
     /// True as long as the active node count stays at or above the safety
     /// floor.
     pub fn quorum_available(&self) -> bool {
-        let active_total = 1 + self.active_peer_count();
-        active_total >= self.participants.min_participants as usize
+        let voting_total = 1 + self.roster.voting_peer_count();
+        voting_total >= self.participants.min_participants as usize
     }
 
     /// Number of agreeing values needed for a decision this cycle.
     /// `max(floor(N_active/2)+1, min_participants)`.
     pub fn required_agreement(&self) -> usize {
-        let active_total = 1 + self.active_peer_count();
-        let strict_majority = active_total / 2 + 1;
+        let voting_total = 1 + self.roster.voting_peer_count();
+        let strict_majority = voting_total / 2 + 1;
         strict_majority.max(self.participants.min_participants as usize)
     }
 
     /// How many further node failures the fabric can tolerate without
     /// losing majority voting. Zero means the next fault is unrecoverable.
     pub fn tolerable_failures_remaining(&self) -> usize {
-        let active_total = 1 + self.active_peer_count();
-        active_total.saturating_sub(self.participants.min_participants as usize)
+        let voting_total = 1 + self.roster.voting_peer_count();
+        voting_total.saturating_sub(self.participants.min_participants as usize)
     }
 
     pub fn set_peer_clocks(&mut self, clocks: &[PeerClock]) {
@@ -428,6 +465,51 @@ impl<V: Voter> RunState<V> {
     pub fn active_count_including_self(&self) -> u8 {
         (1 + self.active_peer_count()) as u8
     }
+
+    pub fn tick_probation(&mut self) -> usize {
+        if self.self_probation_remaining > 0 {
+            self.self_probation_remaining -= 1;
+            if self.self_probation_remaining == 0 {
+                info!("self promoted from Probation to Alive");
+            }
+        }
+        self.roster.tick_probation(self.participants.probation_cycles)
+    }
+
+    pub fn enter_self_probation(&mut self) {
+    self.self_probation_remaining = self.participants.probation_cycles;
+}
+
+    pub fn self_in_probation(&self) -> bool {
+    self.self_probation_remaining > 0
+}
+
+    pub fn lowest_alive_peer_id(&self) -> Option<u8> {
+    self.roster
+        .peers()
+        .iter()
+        .filter(|p| p.health == PeerHealth::Alive)
+        .map(|p| p.id)
+        .min()
+}
+
+    pub fn publisher_consensus(&self, own_pick: u8) -> Option<u8> {
+        for (idx, peer) in self.roster.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            match self.cycle.peer_acks[idx] {
+                Some(ack) => {
+                    if ack.publisher_candidate != own_pick {
+                        return None;
+                    }
+                }
+                None => return None,
+            }
+        }
+        Some(own_pick)
+    }
+
 
     pub fn own_id(&self) -> u8 { self.own_id }
     pub fn session_id(&self) -> u64 { self.session_id }

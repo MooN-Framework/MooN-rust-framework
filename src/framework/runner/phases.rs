@@ -120,8 +120,9 @@ let outcome = self.collect_phase(
                     return StateEvent::SelfTestErr;
                 }
                 self.state.set_was_lost(false);
+                self.state.enter_self_probation();
+                info!("entering self probation");
             }
-            self.state.clear_pending_rejoin();
             self.state.start_new_cycle(self.next_cycle_tick());
             self.state.set_system_state(SystemState::Operational);
             StateEvent::ResyncLostPeerOk
@@ -482,71 +483,99 @@ let outcome = self.collect_phase(
     pub(super) fn handle_publish(&mut self) -> StateEvent {
         let outcome = self.state.run_vote();
         match outcome {
-            VotingOutcome::Consensus(decision) => {
-                let own_result = self.state.cycle().own_result;
-                let dissenter_analysis = own_result.map(|own| {
-                    self.state
-                        .voter()
-                        .find_dissenters(&own, &self.state.cycle().peer_results, &decision)
-                });
-
-                if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
-                    if own_dissented {
-                        error!(own_id = self.state.own_id(), "own value dissented, failsafe");
-                        return StateEvent::Fault;
+VotingOutcome::Consensus(decision) => {
+    let own_pick = self.pick_publisher_candidate();
+    let publisher = match self.state.publisher_consensus(own_pick) {
+        Some(id) => id,
+        None => {
+            let picks: Vec<(u8, u8)> = self
+                .state
+                .peers()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, p)| {
+                    if p.health == PeerHealth::Lost {
+                        return None;
                     }
-                    if !peer_dissenter_indices.is_empty() {
-                        let dissenter_ids: Vec<u8> = peer_dissenter_indices
-                            .iter()
-                            .filter_map(|idx| {
-                                self.state.peers().get(*idx as usize).map(|p| p.id)
-                            })
-                            .collect();
+                    self.state.cycle().peer_acks[idx]
+                        .map(|a| (p.id, a.publisher_candidate))
+                })
+                .collect();
+            error!(
+                own_id = self.state.own_id(),
+                own_pick,
+                peer_picks = ?picks,
+                "publisher pick divergence, failsafe"
+            );
+            return StateEvent::Fault;
+        }
+    };
+    let own_id = self.state.own_id();
 
-                        let publisher = self.pick_publisher_candidate();
-                        if publisher == self.state.own_id() {
-                            warn!(publisher, "consensus with dissenters, publishing then reconfig");
-                            self.sink.publish(&decision);
-                        }
-                        for peer_id in dissenter_ids {
-                            warn!(peer_id, "peer value diverged from consensus");
-                            let _ = self.state.propose_exclude(peer_id);
-                        }
-                        return StateEvent::DissenterDetected;
-                    }
-                }
+    let own_result = self.state.cycle().own_result;
+    let dissenter_analysis = own_result.map(|own| {
+        self.state
+            .voter()
+            .find_dissenters(&own, &self.state.cycle().peer_results, &decision)
+    });
 
-                let publisher = self.pick_publisher_candidate();
-                let own_id = self.state.own_id();
-                if publisher == own_id {
-                    info!(publisher, "consensus reached, publishing");
-                    self.sink.publish(&decision);
-                } else {
-                    debug!(publisher, own_id, "consensus reached, peer publishes");
-                }
+    if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
+        if own_dissented {
+            error!(own_id, "own value dissented, failsafe");
+            return StateEvent::Fault;
+        }
+        if !peer_dissenter_indices.is_empty() {
+            let dissenter_ids: Vec<u8> = peer_dissenter_indices
+                .iter()
+                .filter_map(|idx| self.state.peers().get(*idx as usize).map(|p| p.id))
+                .collect();
 
-                let confirmed_rejoin = self.state.aggregate_rejoin_votes();
-                if confirmed_rejoin.as_u8() != 0 {
-                    warn!(
-                        rejoin_mask = confirmed_rejoin.as_u8(),
-                        "rejoin confirmed by all healthy peers, going into resync"
-                    );
-                    self.state.set_pending_rejoin(confirmed_rejoin);
-                    return StateEvent::GoResyncLostPeer;
-                }
-
-                self.cycles_since_last_sync = self.cycles_since_last_sync.saturating_add(1);
-                if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
-                    info!(
-                        cycles = self.cycles_since_last_sync,
-                        interval = self.timing.resync_interval_cycles,
-                        "resync interval reached"
-                    );
-                    StateEvent::ResyncDue
-                } else {
-                    StateEvent::ResultPublished
-                }
+            if publisher == own_id {
+                warn!(publisher, "consensus with dissenters, publishing then reconfig");
+                self.sink.publish(&decision);
             }
+            for peer_id in dissenter_ids {
+                warn!(peer_id, "peer value diverged from consensus");
+                let _ = self.state.propose_exclude(peer_id);
+            }
+            return StateEvent::DissenterDetected;
+        }
+    }
+
+    if publisher == own_id {
+        info!(publisher, "consensus reached, publishing");
+        self.sink.publish(&decision);
+    } else {
+        debug!(publisher, own_id, "consensus reached, peer publishes");
+    }
+
+    let promoted = self.state.tick_probation();
+    if promoted > 0 {
+        info!(promoted, "peers promoted from Probation to Alive");
+    }
+
+    let confirmed_rejoin = self.state.aggregate_rejoin_votes();
+    if confirmed_rejoin.as_u8() != 0 {
+        warn!(
+            rejoin_mask = confirmed_rejoin.as_u8(),
+            "rejoin confirmed by all healthy peers, going into resync"
+        );
+        self.state.set_pending_rejoin(confirmed_rejoin);
+        return StateEvent::GoResyncLostPeer;
+    }
+
+    self.cycles_since_last_sync = self.cycles_since_last_sync.saturating_add(1);
+    if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
+        info!(
+            cycles = self.cycles_since_last_sync,
+            interval = self.timing.resync_interval_cycles,
+            "resync interval reached"
+        );
+        StateEvent::ResyncDue
+    } else {
+        StateEvent::ResultPublished
+    }
+}
             VotingOutcome::Disagreement => {
                 warn!("vote disagreement");
                 StateEvent::StateDiverged
@@ -701,7 +730,16 @@ let outcome = self.collect_phase(
 
     /// Publisher pick: lowest-id Alive node, defaulting to self.
     fn pick_publisher_candidate(&self) -> u8 {
-        self.state.lowest_alive_id()
+        if self.state.self_in_probation() {
+            // Self in probation must not pick itself. Fall back to the
+            // lowest-id Alive peer. If none exists we return self anyway —
+            // publisher_consensus will then flag divergence and we'll fault.
+            self.state
+                .lowest_alive_peer_id()
+                .unwrap_or_else(|| self.state.own_id())
+        } else {
+            self.state.lowest_alive_id()
+        }
     }
 
     /// Placeholder for the next-cycle epoch; the barrier is at the

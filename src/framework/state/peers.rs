@@ -17,6 +17,7 @@ pub enum PeerHealth {
 pub struct PeerInfo {
     pub id: u8,
     pub health: PeerHealth,
+    pub probation_cycles_ok: u32,
 }
 
 /// Discovery and management errors.
@@ -68,7 +69,7 @@ impl PeerRoster {
             return Ok(());
         }
         self.peers
-            .push(PeerInfo { id, health: PeerHealth::Alive })
+            .push(PeerInfo { id, health: PeerHealth::Alive, probation_cycles_ok: 0 })
             .expect("push failed despite capacity check");
         Ok(())
     }
@@ -100,15 +101,35 @@ impl PeerRoster {
         transitions
     }
 
-    pub fn readmit(&mut self, peer_id: u8) -> bool {
+pub fn readmit(&mut self, peer_id: u8) -> bool {
     for peer in self.peers.iter_mut() {
         if peer.id == peer_id && peer.health == PeerHealth::Lost {
-            peer.health = PeerHealth::Alive;
+            peer.health = PeerHealth::Probation;
+            peer.probation_cycles_ok = 0;
             return true;
         }
     }
     false
+}
+
+    pub fn voting_peer_count(&self) -> usize {
+        self.peers.iter().filter(|p| p.health == PeerHealth::Alive).count()
     }
+
+    pub fn tick_probation(&mut self, threshold: u32) -> usize {
+    let mut promoted = 0;
+    for peer in self.peers.iter_mut() {
+        if peer.health == PeerHealth::Probation {
+            peer.probation_cycles_ok = peer.probation_cycles_ok.saturating_add(1);
+            if peer.probation_cycles_ok >= threshold {
+                peer.health = PeerHealth::Alive;
+                peer.probation_cycles_ok = 0;
+                promoted += 1;
+            }
+        }
+    }
+    promoted
+}
 
     pub fn active_count(&self) -> usize {
         self.peers.iter().filter(|p| p.health != PeerHealth::Lost).count()

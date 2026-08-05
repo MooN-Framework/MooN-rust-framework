@@ -3,6 +3,7 @@ own_id = 1
 [participants]
 nominal = 3
 minimum = 2
+probation_cycles = 10
 
 [timing]
 cycle_ms = 2000
