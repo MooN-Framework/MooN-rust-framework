@@ -76,11 +76,11 @@ where
                         .map(|idx| self.state.peers()[idx].health == PeerHealth::Lost)
                         .unwrap_or(false);
                     if was_lost {
-                        warn!(peer_id, previous_session, new_session, "rejoin from lost peer ignored");
-                    } else {
-                        warn!(peer_id, previous_session, new_session, "peer rebooted mid-phase");
+                        warn!(peer_id, previous_session, new_session, "Rejoin request from Lost peer, accepting and continuing phase");
                         self.transport.accept(&frame);
-                        ingest(self, frame);
+                        ingest(self, frame);                     
+                    } else {
+                        warn!(peer_id, previous_session, new_session, "Peer either rebooted mid phase or wasn't in peer list, ignoring");
                     }
                 }
                 RecvOutcome::TimeSync { frame, local_recv_ns, .. } => {

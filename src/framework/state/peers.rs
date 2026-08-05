@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerHealth {
     Alive,
+    Probation,
     Lost,
 }
 
@@ -97,6 +98,16 @@ impl PeerRoster {
             }
         }
         transitions
+    }
+
+    pub fn readmit(&mut self, peer_id: u8) -> bool {
+    for peer in self.peers.iter_mut() {
+        if peer.id == peer_id && peer.health == PeerHealth::Lost {
+            peer.health = PeerHealth::Alive;
+            return true;
+        }
+    }
+    false
     }
 
     pub fn active_count(&self) -> usize {

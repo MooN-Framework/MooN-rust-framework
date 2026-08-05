@@ -7,7 +7,6 @@ pub use cycle::{AckInfo, CycleState};
 pub use observation::ObservationKind;
 pub use peers::{DiscoveryError, PeerHealth, PeerInfo, PeerRoster};
 pub use voting::ExclusionVotes;
-
 use crate::framework::config::{MAX_PEERS, ParticipantConfig};
 use crate::framework::peer_sync::PeerClock;
 use crate::framework::state_machine::{NodeState, SystemState};
@@ -40,6 +39,11 @@ pub struct RunState<V: Voter> {
     sync_epsilon_ns: i64,
     sync_valid: bool,
 
+    was_lost : bool,
+    rejoin_seen: PeerMask,
+    peer_rejoin_votes: Vec<Option<PeerMask>, MAX_PEERS>,
+    pending_rejoin: PeerMask,
+
     last_decision: Option<VotingOutcome<V::Decision>>,
 }
 
@@ -61,6 +65,10 @@ impl<V: Voter> RunState<V> {
             peer_clocks: Vec::new(),
             sync_epsilon_ns: 0,
             sync_valid: false,
+            was_lost: false,
+            rejoin_seen: PeerMask::EMPTY,
+            peer_rejoin_votes: Vec::new(),
+            pending_rejoin: PeerMask::EMPTY,
             last_decision: None,
         }
     }
@@ -85,6 +93,11 @@ impl<V: Voter> RunState<V> {
         self.cycle.resize(n);
         self.obs.resize(n);
         self.votes.resize(n);
+        // NEU: peer_rejoin_votes auf n füllen
+        self.peer_rejoin_votes.clear();
+        for _ in 0..n {
+            let _ = self.peer_rejoin_votes.push(None);
+        }
         Ok(())
     }
 
@@ -232,6 +245,71 @@ impl<V: Voter> RunState<V> {
         self.pending_exclusion_proposal
     }
 
+    /// Reset the rejoin-vote evidence at the start of a new cycle.
+    pub fn reset_rejoin_evidence(&mut self) {
+        self.rejoin_seen = PeerMask::EMPTY;
+        for slot in self.peer_rejoin_votes.iter_mut() {
+            *slot = None;
+        }
+    }
+
+    /// Note that we've observed a ResyncLostPeer frame from `peer_id` —
+    /// this contributes a bit to our own rejoin vote for this cycle.
+    pub fn set_rejoin_seen(&mut self, peer_id: u8) {
+        if let Some(idx) = self.peer_index(peer_id) {
+            self.rejoin_seen.set(idx);
+        }
+    }
+
+    /// The rejoin mask we'll attest to peers in send_ack.
+    pub fn own_rejoin_vote(&self) -> PeerMask {
+        self.rejoin_seen
+    }
+
+    pub fn set_pending_rejoin(&mut self, mask: PeerMask) {
+    self.pending_rejoin = mask;
+}
+
+    pub fn pending_rejoin(&self) -> PeerMask {
+        self.pending_rejoin
+    }
+
+    pub fn clear_pending_rejoin(&mut self) {
+        self.pending_rejoin = PeerMask::EMPTY;
+    }
+
+    /// Record a peer's rejoin-vote mask received in an ack frame.
+    pub fn record_peer_rejoin_vote(
+        &mut self,
+        peer_id: u8,
+        vote: PeerMask,
+    ) -> Result<(), DiscoveryError> {
+        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+        if self.roster.peers()[idx].health == PeerHealth::Lost {
+            return Ok(());
+        }
+        self.peer_rejoin_votes[idx] = Some(vote);
+        Ok(())
+    }
+
+    /// AND-reduce own vote with every healthy peer's vote. Any healthy
+    /// peer that didn't attest → return EMPTY (no rejoin this cycle).
+    /// Called after send_ack completes; a missing attestation means the
+    /// unanimity requirement isn't met.
+    pub fn aggregate_rejoin_votes(&self) -> PeerMask {
+        let mut agg = self.rejoin_seen.as_u8();
+        for (idx, peer) in self.roster.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            match self.peer_rejoin_votes[idx] {
+                Some(m) => agg &= m.as_u8(),
+                None => return PeerMask::EMPTY,
+            }
+        }
+        PeerMask::from_u8(agg)
+    }
+
     /// Peers whose vote is expected this round but has not arrived. A peer
     /// that is being proposed for exclusion, or that has been silent all
     /// cycle, is not expected to reply.
@@ -348,6 +426,15 @@ impl<V: Voter> RunState<V> {
         if local < 0 { None } else { Some(local as u64) }
     }
 
+    /// Readmit a peer that came back via resync. Returns true on transition.
+    pub fn readmit_peer(&mut self, peer_id: u8) -> bool {
+        self.roster.readmit(peer_id)
+    }
+
+    pub fn active_count_including_self(&self) -> u8 {
+        (1 + self.active_peer_count()) as u8
+    }
+
     pub fn own_id(&self) -> u8 { self.own_id }
     pub fn session_id(&self) -> u64 { self.session_id }
     pub fn node_state(&self) -> NodeState { self.node_state }
@@ -359,4 +446,6 @@ impl<V: Voter> RunState<V> {
     pub fn cycle(&self) -> &CycleState<V::Payload> { &self.cycle }
     pub fn last_decision(&self) -> Option<VotingOutcome<V::Decision>> { self.last_decision }
     pub fn voter(&self) -> &V { &self.voter }
+    pub fn was_lost(&self) -> bool { self.was_lost }
+    pub fn set_was_lost(&mut self, lost: bool) { self.was_lost = lost; }
 }

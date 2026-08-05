@@ -21,8 +21,9 @@ use crc32fast::Hasher;
 const HEADER_SIZE: usize = 23;
 const CRC_SIZE: usize = 4;
 
-const STATE_BODY: usize = 1;
-const ACK_BODY: usize = 2;
+const STATE_BODY: usize = 2;
+// received_from(1) + publisher_candidate(1) + rejoin_vote(1) = 3
+const ACK_BODY: usize = 3;
 const EXCLUSION_PROPOSAL_BODY: usize = 1;
 const TIME_SYNC_REQ_BODY: usize = 8;
 const TIME_SYNC_RESP_BODY: usize = 24;
@@ -34,8 +35,6 @@ const DISC_TIMESYNC_REQ: u8 = 0x03;
 const DISC_TIMESYNC_RESP: u8 = 0x04;
 const DISC_EXCLUSION_PROPOSAL: u8 = 0x05;
 
-/// Upper bound on `CyclePayload::WIRE_SIZE`. Sizes the stack-allocated
-/// staging buffer used during serialization and CRC.
 pub const MAX_PAYLOAD_WIRE_SIZE: usize = 64;
 
 const fn max_usize(a: usize, b: usize) -> usize {
@@ -59,28 +58,35 @@ impl From<PayloadError> for FrameError {
     }
 }
 
-/// Payload variants carried inside a `UdpFrame`.
+
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Payload<P: CyclePayload> {
     /// State beacon with attested observation mask. Bit `k` = sender saw
     /// its k-th peer this phase, indexed against the sender's peer order
-    /// (all nodes except sender, sorted by id).
-    State { seen_mask: PeerMask },
+    /// (all nodes except sender, sorted by id). A rejoin request is
+    /// signalled implicitly via `node_state == ResyncLostPeer` in the
+    /// frame header, not in this payload.
+    State {
+        seen_mask: PeerMask,
+        active_count: u8,
+    },
     Result(P),
+    /// Ack beacon. `received_from` attests which peer results this node
+    /// ingested this cycle. `publisher_candidate` is the sender's pick.
+    /// `rejoin_vote` carries the sender's vote to admit lost peers back:
+    /// bit `k` set = sender confirms rejoin for the peer with id `k`.
+    /// Empty mask means no rejoin endorsed this cycle.
     Ack {
         received_from: PeerMask,
         publisher_candidate: u8,
+        rejoin_vote: PeerMask,
     },
-    /// Exclusion vote in ErrorManagement. Bit interpretation as `State`.
     ExclusionProposal { propose_exclude: PeerMask },
-    /// Cristian request; `t1` is the requester send time (ns) on its
-    /// local clock.
     TimeSyncReq { t1: u64 },
-    /// Cristian response; `t2`, `t3` on the responder clock.
     TimeSyncResp { t1: u64, t2: u64, t3: u64 },
 }
 
-/// A framed UDP message.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UdpFrame<P: CyclePayload> {
     node_id: u8,
@@ -98,7 +104,6 @@ impl<P: CyclePayload> UdpFrame<P> {
         "CyclePayload::WIRE_SIZE exceeds MAX_PAYLOAD_WIRE_SIZE"
     );
 
-    /// Largest possible encoded frame for payload type `P`.
     pub const MAX_FRAME_SIZE: usize = {
         let body = max_usize(P::WIRE_SIZE, ACK_BODY);
         let body = max_usize(body, TIME_SYNC_REQ_BODY);
@@ -136,8 +141,16 @@ impl<P: CyclePayload> UdpFrame<P> {
         node_state: NodeState,
         timestamp: u64,
         seen_mask: PeerMask,
+        active_count: u8,
     ) -> Self {
-        Self::new(node_id, session_id, seq_num, node_state, timestamp, Payload::State { seen_mask })
+        Self::new(
+            node_id,
+            session_id,
+            seq_num,
+            node_state,
+            timestamp,
+            Payload::State { seen_mask, active_count },
+        )
     }
 
     pub fn result_frame(
@@ -159,6 +172,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         timestamp: u64,
         received_from: PeerMask,
         publisher_candidate: u8,
+        rejoin_vote: PeerMask,
     ) -> Self {
         Self::new(
             node_id,
@@ -166,7 +180,7 @@ impl<P: CyclePayload> UdpFrame<P> {
             seq_num,
             node_state,
             timestamp,
-            Payload::Ack { received_from, publisher_candidate },
+            Payload::Ack { received_from, publisher_candidate, rejoin_vote },
         )
     }
 
@@ -235,8 +249,8 @@ impl<P: CyclePayload> UdpFrame<P> {
         h.update(&[self.node_state_wire]);
         h.update(&self.timestamp.to_le_bytes());
         match &self.payload {
-            Payload::State { seen_mask } => {
-                h.update(&[DISC_STATE, seen_mask.as_u8()]);
+            Payload::State { seen_mask, active_count } => {
+                h.update(&[DISC_STATE, seen_mask.as_u8(), *active_count]);
             }
             Payload::Result(r) => {
                 h.update(&[DISC_RESULT]);
@@ -247,8 +261,13 @@ impl<P: CyclePayload> UdpFrame<P> {
                 }
                 h.update(&staging[..P::WIRE_SIZE]);
             }
-            Payload::Ack { received_from, publisher_candidate } => {
-                h.update(&[DISC_ACK, received_from.as_u8(), *publisher_candidate]);
+            Payload::Ack { received_from, publisher_candidate, rejoin_vote } => {
+                h.update(&[
+                    DISC_ACK,
+                    received_from.as_u8(),
+                    *publisher_candidate,
+                    rejoin_vote.as_u8(),
+                ]);
             }
             Payload::ExclusionProposal { propose_exclude } => {
                 h.update(&[DISC_EXCLUSION_PROPOSAL, propose_exclude.as_u8()]);
@@ -267,12 +286,10 @@ impl<P: CyclePayload> UdpFrame<P> {
         h.finalize()
     }
 
-    /// Recompute the CRC and compare against the stored one.
     pub fn verify(&self) -> bool {
         self.crc32 == self.compute_crc()
     }
 
-    /// Serialize into a fresh byte vector.
     pub fn encode(&self) -> Vec<u8> {
         let _ = Self::_ASSERT_FITS;
 
@@ -283,8 +300,8 @@ impl<P: CyclePayload> UdpFrame<P> {
         buf.push(self.node_state_wire);
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
         match self.payload {
-            Payload::State { seen_mask } => {
-                buf.extend_from_slice(&[DISC_STATE, seen_mask.as_u8()]);
+            Payload::State { seen_mask, active_count } => {
+                buf.extend_from_slice(&[DISC_STATE, seen_mask.as_u8(), active_count]);
             }
             Payload::Result(r) => {
                 buf.push(DISC_RESULT);
@@ -295,8 +312,13 @@ impl<P: CyclePayload> UdpFrame<P> {
                 }
                 buf.extend_from_slice(&staging[..P::WIRE_SIZE]);
             }
-            Payload::Ack { received_from, publisher_candidate } => {
-                buf.extend_from_slice(&[DISC_ACK, received_from.as_u8(), publisher_candidate]);
+            Payload::Ack { received_from, publisher_candidate, rejoin_vote } => {
+                buf.extend_from_slice(&[
+                    DISC_ACK,
+                    received_from.as_u8(),
+                    publisher_candidate,
+                    rejoin_vote.as_u8(),
+                ]);
             }
             Payload::ExclusionProposal { propose_exclude } => {
                 buf.extend_from_slice(&[DISC_EXCLUSION_PROPOSAL, propose_exclude.as_u8()]);
@@ -316,7 +338,6 @@ impl<P: CyclePayload> UdpFrame<P> {
         buf
     }
 
-    /// Parse from raw bytes and verify the CRC.
     pub fn decode(bytes: &[u8]) -> Result<Self, FrameError> {
         let _ = Self::_ASSERT_FITS;
 
@@ -335,7 +356,9 @@ impl<P: CyclePayload> UdpFrame<P> {
                 if bytes.len() < HEADER_SIZE + STATE_BODY + CRC_SIZE {
                     return Err(FrameError::TooShort);
                 }
-                (Payload::State { seen_mask: PeerMask::from_u8(bytes[HEADER_SIZE]) }, STATE_BODY)
+                let seen_mask = PeerMask::from_u8(bytes[HEADER_SIZE]);
+                let active_count = bytes[HEADER_SIZE + 1];
+                (Payload::State { seen_mask, active_count }, STATE_BODY)
             }
             DISC_RESULT => {
                 let end = HEADER_SIZE + P::WIRE_SIZE;
@@ -353,6 +376,7 @@ impl<P: CyclePayload> UdpFrame<P> {
                     Payload::Ack {
                         received_from: PeerMask::from_u8(bytes[HEADER_SIZE]),
                         publisher_candidate: bytes[HEADER_SIZE + 1],
+                        rejoin_vote: PeerMask::from_u8(bytes[HEADER_SIZE + 2]),
                     },
                     ACK_BODY,
                 )

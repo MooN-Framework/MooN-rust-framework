@@ -1,3 +1,5 @@
+//! Transport layer over multicast UDP.
+
 use crate::framework::config::TransportConfig;
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::CyclePayload;
@@ -100,9 +102,14 @@ impl<P: CyclePayload> UdpTransport<P> {
     }
 
     /// Send a State beacon carrying the current observation mask.
-    pub fn send_state(&mut self, node_state: NodeState, seen_mask: PeerMask) -> Result<u32, TransportError> {
+    pub fn send_state(
+        &mut self,
+        node_state: NodeState,
+        seen_mask: PeerMask,
+        active_count: u8,
+    ) -> Result<u32, TransportError> {
         self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::state_frame(id, sid, seq, ns, ts, seen_mask)
+            UdpFrame::<P>::state_frame(id, sid, seq, ns, ts, seen_mask, active_count)
         })
     }
 
@@ -114,14 +121,17 @@ impl<P: CyclePayload> UdpTransport<P> {
     }
 
     /// Send an ack for received results plus our publisher pick.
+    /// `rejoin_vote` attests which lost peers this node endorses for
+    /// rejoin this cycle; empty mask = no endorsement.
     pub fn send_ack(
         &mut self,
         node_state: NodeState,
         received_from: PeerMask,
         publisher_candidate: u8,
+        rejoin_vote: PeerMask,
     ) -> Result<u32, TransportError> {
         self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::ack_frame(id, sid, seq, ns, ts, received_from, publisher_candidate)
+            UdpFrame::<P>::ack_frame(id, sid, seq, ns, ts, received_from, publisher_candidate, rejoin_vote)
         })
     }
 
@@ -306,6 +316,8 @@ fn interface_ipv4(name: &str) -> Result<Ipv4Addr, TransportError> {
 /// Node-local monotonic clock in nanoseconds. Each node has its own epoch
 /// (first call); time-sync exchanges only differences and offsets, not a
 /// shared wall clock.
+pub fn note_monotonic_ns_placeholder() {}
+
 pub fn now_monotonic_ns() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = EPOCH.get_or_init(Instant::now);
