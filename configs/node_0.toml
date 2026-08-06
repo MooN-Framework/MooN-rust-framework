@@ -16,7 +16,7 @@ ack_ms = 50
 error_management_vote_ms = 2000
 stale_ms = 50
 crc_exchange_timeout_ms = 50
-sync_sys_state_timeout_ms = 50
+sync_sys_state_timeout_ms = 5000
 resync_interval_cycles = 30
 
 [transport]

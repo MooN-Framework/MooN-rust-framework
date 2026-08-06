@@ -44,7 +44,7 @@ const DISC_SYSTEM_STATE_CRC: u8 = 0x06;
 const DISC_SYSTEM_STATE_SNAPSHOT: u8 = 0x07;
 const DISC_SYSTEM_STATE_SNAPSHOT_ACK: u8 = 0x08;
 
-pub const MAX_PAYLOAD_WIRE_SIZE: usize = 64;
+pub const MAX_PAYLOAD_WIRE_SIZE: usize = 128;
 
 const fn max_usize(a: usize, b: usize) -> usize {
     if a > b {
