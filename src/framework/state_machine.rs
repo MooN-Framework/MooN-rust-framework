@@ -24,6 +24,7 @@ pub enum NodeState {
     PeerSync = 0x0A,
     ResyncLostPeer = 0x0B,
     SystemStateCrcExchange = 0x0C,
+    SystemStateSync = 0x0D,
     Failsafe = 0xFF,
 }
 
@@ -57,6 +58,10 @@ pub enum StateEvent {
 
     CrcOk,
     CrcDivergent,
+
+    SystemStateSyncOk,
+    SystemStateSyncTimeout,
+    SystemStateSyncMinority,
     /// Exclusion vote timed out: at least one peer we did NOT propose to
     /// exclude failed to reply (Rule 2b) — failsafe.
     StateTimeout,
@@ -101,7 +106,11 @@ impl NodeState {
             (PublishResult, StateDiverged) => Failsafe,
 
             (ResyncLostPeer, ResyncLostPeerTimeout) => ErrorManagement,
-            (ResyncLostPeer, ResyncLostPeerOk) => PeerSync,
+            (ResyncLostPeer, ResyncLostPeerOk) => SystemStateSync,
+
+            (SystemStateSync, SystemStateSyncOk) => PeerSync,
+            (SystemStateSync, SystemStateSyncTimeout) => Isolation,
+            (SystemStateSync, SystemStateSyncMinority) => Isolation,
 
             (ErrorManagement, StateOk) => CycleSync,
             (ErrorManagement, StateDiverged) => Failsafe,
@@ -136,6 +145,7 @@ impl NodeState {
             0x0A => PeerSync,
             0x0B => ResyncLostPeer,
             0x0C => SystemStateCrcExchange,
+            0x0D => SystemStateSync,
             0xFF => Failsafe,
             other => return Err(InvalidNodeState(other)),
         })

@@ -12,6 +12,7 @@
 //!   X..X+4   crc32             (4)
 //! ```
 
+use crate::framework::config::MAX_TOTAL_NODES;
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::CyclePayload;
 use crate::framework::types::PeerMask;
@@ -28,6 +29,10 @@ const EXCLUSION_PROPOSAL_BODY: usize = 1;
 const TIME_SYNC_REQ_BODY: usize = 8;
 const TIME_SYNC_RESP_BODY: usize = 24;
 const SYSTEM_STATE_CRC_BODY: usize = 4;
+const SNAPSHOT_SCALARS: usize = 1 + 1 + 4 + 4;
+const SNAPSHOT_SLOT_SIZE: usize = 1 + 1 + 1 + 4;
+const SYSTEM_STATE_SNAPSHOT_BODY: usize = SNAPSHOT_SCALARS + SNAPSHOT_SLOT_SIZE * MAX_TOTAL_NODES;
+const SYSTEM_STATE_SNAPSHOT_ACK_BODY: usize = 4;
 
 const DISC_STATE: u8 = 0x00;
 const DISC_RESULT: u8 = 0x01;
@@ -36,6 +41,8 @@ const DISC_TIMESYNC_REQ: u8 = 0x03;
 const DISC_TIMESYNC_RESP: u8 = 0x04;
 const DISC_EXCLUSION_PROPOSAL: u8 = 0x05;
 const DISC_SYSTEM_STATE_CRC: u8 = 0x06;
+const DISC_SYSTEM_STATE_SNAPSHOT: u8 = 0x07;
+const DISC_SYSTEM_STATE_SNAPSHOT_ACK: u8 = 0x08;
 
 pub const MAX_PAYLOAD_WIRE_SIZE: usize = 64;
 
@@ -45,6 +52,14 @@ const fn max_usize(a: usize, b: usize) -> usize {
     } else {
         b
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SnapshotEntry {
+    pub valid: bool,
+    pub id: u8,
+    pub health: u8,
+    pub probation_cycles_ok: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +115,19 @@ pub enum Payload<P: CyclePayload> {
     SystemStateCrc {
         crc: u32,
     },
+    SystemStateSnapshot {
+        nominal_participants: u8,
+        min_participants: u8,
+        probation_cycles: u32,
+        current_seq: u32,
+        entries: [SnapshotEntry; MAX_TOTAL_NODES],
+    },
+    /// Receiver's attestation of the snapshot it adopted. `adopted_crc`
+    /// is the receiver-side CRC over the applied state — allows senders
+    /// to detect if their own snapshot was in the minority.
+    SystemStateSnapshotAck {
+        adopted_crc: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -126,6 +154,8 @@ impl<P: CyclePayload> UdpFrame<P> {
         let body = max_usize(body, STATE_BODY);
         let body = max_usize(body, EXCLUSION_PROPOSAL_BODY);
         let body = max_usize(body, SYSTEM_STATE_CRC_BODY);
+        let body = max_usize(body, SYSTEM_STATE_SNAPSHOT_BODY);
+        let body = max_usize(body, SYSTEM_STATE_SNAPSHOT_ACK_BODY);
         HEADER_SIZE + body + CRC_SIZE
     };
 
@@ -288,6 +318,52 @@ impl<P: CyclePayload> UdpFrame<P> {
         )
     }
 
+    pub fn system_state_snapshot_frame(
+        node_id: u8,
+        session_id: u64,
+        seq_num: u32,
+        node_state: NodeState,
+        timestamp: u64,
+        nominal_participants: u8,
+        min_participants: u8,
+        probation_cycles: u32,
+        current_seq: u32,
+        entries: [SnapshotEntry; MAX_TOTAL_NODES],
+    ) -> Self {
+        Self::new(
+            node_id,
+            session_id,
+            seq_num,
+            node_state,
+            timestamp,
+            Payload::SystemStateSnapshot {
+                nominal_participants,
+                min_participants,
+                probation_cycles,
+                current_seq,
+                entries,
+            },
+        )
+    }
+
+    pub fn system_state_snapshot_ack_frame(
+        node_id: u8,
+        session_id: u64,
+        seq_num: u32,
+        node_state: NodeState,
+        timestamp: u64,
+        adopted_crc: u32,
+    ) -> Self {
+        Self::new(
+            node_id,
+            session_id,
+            seq_num,
+            node_state,
+            timestamp,
+            Payload::SystemStateSnapshotAck { adopted_crc },
+        )
+    }
+
     pub fn node_id(&self) -> u8 {
         self.node_id
     }
@@ -360,6 +436,29 @@ impl<P: CyclePayload> UdpFrame<P> {
                 h.update(&[DISC_SYSTEM_STATE_CRC]);
                 h.update(&crc.to_le_bytes());
             }
+            Payload::SystemStateSnapshot {
+                nominal_participants,
+                min_participants,
+                probation_cycles,
+                current_seq,
+                entries,
+            } => {
+                h.update(&[
+                    DISC_SYSTEM_STATE_SNAPSHOT,
+                    *nominal_participants,
+                    *min_participants,
+                ]);
+                h.update(&probation_cycles.to_le_bytes());
+                h.update(&current_seq.to_le_bytes());
+                for e in entries.iter() {
+                    h.update(&[if e.valid { 1 } else { 0 }, e.id, e.health]);
+                    h.update(&e.probation_cycles_ok.to_le_bytes());
+                }
+            }
+            Payload::SystemStateSnapshotAck { adopted_crc } => {
+                h.update(&[DISC_SYSTEM_STATE_SNAPSHOT_ACK]);
+                h.update(&adopted_crc.to_le_bytes());
+            }
         }
         h.finalize()
     }
@@ -421,6 +520,29 @@ impl<P: CyclePayload> UdpFrame<P> {
             Payload::SystemStateCrc { crc } => {
                 buf.push(DISC_SYSTEM_STATE_CRC);
                 buf.extend_from_slice(&crc.to_le_bytes());
+            }
+            Payload::SystemStateSnapshot {
+                nominal_participants,
+                min_participants,
+                probation_cycles,
+                current_seq,
+                entries,
+            } => {
+                buf.push(DISC_SYSTEM_STATE_SNAPSHOT);
+                buf.push(nominal_participants);
+                buf.push(min_participants);
+                buf.extend_from_slice(&probation_cycles.to_le_bytes());
+                buf.extend_from_slice(&current_seq.to_le_bytes());
+                for e in entries.iter() {
+                    buf.push(if e.valid { 1 } else { 0 });
+                    buf.push(e.id);
+                    buf.push(e.health);
+                    buf.extend_from_slice(&e.probation_cycles_ok.to_le_bytes());
+                }
+            }
+            Payload::SystemStateSnapshotAck { adopted_crc } => {
+                buf.push(DISC_SYSTEM_STATE_SNAPSHOT_ACK);
+                buf.extend_from_slice(&adopted_crc.to_le_bytes());
             }
         }
         buf.extend_from_slice(&self.crc32.to_le_bytes());
@@ -519,6 +641,50 @@ impl<P: CyclePayload> UdpFrame<P> {
                 }
                 let crc = u32::from_le_bytes(bytes[HEADER_SIZE..end].try_into().unwrap());
                 (Payload::SystemStateCrc { crc }, SYSTEM_STATE_CRC_BODY)
+            }
+            DISC_SYSTEM_STATE_SNAPSHOT => {
+                let end = HEADER_SIZE + SYSTEM_STATE_SNAPSHOT_BODY;
+                if bytes.len() < end + CRC_SIZE {
+                    return Err(FrameError::TooShort);
+                }
+                let nominal_participants = bytes[HEADER_SIZE];
+                let min_participants = bytes[HEADER_SIZE + 1];
+                let probation_cycles =
+                    u32::from_le_bytes(bytes[HEADER_SIZE + 2..HEADER_SIZE + 6].try_into().unwrap());
+                let current_seq = u32::from_le_bytes(
+                    bytes[HEADER_SIZE + 6..HEADER_SIZE + 10].try_into().unwrap(),
+                );
+                let mut entries = [SnapshotEntry::default(); MAX_TOTAL_NODES];
+                let mut off = HEADER_SIZE + SNAPSHOT_SCALARS;
+                for e in entries.iter_mut() {
+                    e.valid = bytes[off] != 0;
+                    e.id = bytes[off + 1];
+                    e.health = bytes[off + 2];
+                    e.probation_cycles_ok =
+                        u32::from_le_bytes(bytes[off + 3..off + 7].try_into().unwrap());
+                    off += SNAPSHOT_SLOT_SIZE;
+                }
+                (
+                    Payload::SystemStateSnapshot {
+                        nominal_participants,
+                        min_participants,
+                        probation_cycles,
+                        current_seq,
+                        entries,
+                    },
+                    SYSTEM_STATE_SNAPSHOT_BODY,
+                )
+            }
+            DISC_SYSTEM_STATE_SNAPSHOT_ACK => {
+                let end = HEADER_SIZE + SYSTEM_STATE_SNAPSHOT_ACK_BODY;
+                if bytes.len() < end + CRC_SIZE {
+                    return Err(FrameError::TooShort);
+                }
+                let adopted_crc = u32::from_le_bytes(bytes[HEADER_SIZE..end].try_into().unwrap());
+                (
+                    Payload::SystemStateSnapshotAck { adopted_crc },
+                    SYSTEM_STATE_SNAPSHOT_ACK_BODY,
+                )
             }
             _ => return Err(FrameError::UnknownDiscriminator),
         };

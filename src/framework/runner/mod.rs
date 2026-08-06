@@ -106,6 +106,7 @@ where
                 NodeState::Isolation => self.handle_isolation(),
                 NodeState::ResyncLostPeer => self.handle_resync_lost_node(),
                 NodeState::SystemStateCrcExchange => self.handle_system_state_crc(),
+                NodeState::SystemStateSync => self.handle_system_state_sync(),
                 NodeState::Failsafe => {
                     self.enter_failsafe();
                     return;

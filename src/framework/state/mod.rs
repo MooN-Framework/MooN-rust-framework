@@ -15,6 +15,7 @@ pub use observation::ObservationKind;
 pub use peers::{DiscoveryError, PeerHealth, PeerInfo, PeerRoster};
 use tracing::{info, warn};
 pub use voting::ExclusionVotes;
+use crate::framework::wire::SnapshotEntry;
 
 fn health_wire(h: PeerHealth) -> u8 {
     match h {
@@ -23,6 +24,53 @@ fn health_wire(h: PeerHealth) -> u8 {
         PeerHealth::Lost => 2,
     }
 }
+
+fn health_from_wire(w: u8) -> Result<PeerHealth, SnapshotApplyError> {
+    match w {
+        0 => Ok(PeerHealth::Alive),
+        1 => Ok(PeerHealth::Probation),
+        2 => Ok(PeerHealth::Lost),
+        _ => Err(SnapshotApplyError::InvalidHealthWire),
+    }
+}
+
+pub fn crc_from_snapshot_fields(
+    nominal: u8, min: u8, probation_cycles: u32, current_seq: u32,
+    entries: &[SnapshotEntry],
+) -> u32 {
+    let mut h = Hasher::new();
+    h.update(&[nominal, min]);
+    h.update(&probation_cycles.to_le_bytes());
+    h.update(&current_seq.to_le_bytes());
+    let mut sorted: Vec<(u8, u8, u32), MAX_TOTAL_NODES> = Vec::new();
+    for e in entries.iter().filter(|e| e.valid) {
+        let _ = sorted.push((e.id, e.health, e.probation_cycles_ok));
+    }
+    sorted.sort_unstable_by_key(|(id, _, _)| *id);
+    for (id, hw, cok) in sorted.iter() {
+        h.update(&[*id, *hw]);
+        h.update(&cok.to_le_bytes());
+    }
+    h.finalize()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StoredSnapshot {
+    pub nominal: u8,
+    pub min: u8,
+    pub probation_cycles: u32,
+    pub current_seq: u32,
+    pub entries: [SnapshotEntry; MAX_TOTAL_NODES],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SnapshotApplyError {
+    ConfigMismatch,
+    SelfMarkedLost,
+    UnknownPeerInSnapshot,
+    InvalidHealthWire,
+}
+
 /// Full runtime state of one node. Composed of a peer roster, per-cycle
 /// buffers, a distributed-observation tracker, exclusion-vote tracker,
 /// clock offsets, and a small set of scalar fields.
@@ -55,6 +103,14 @@ pub struct RunState<V: Voter> {
 
     peer_crcs: Vec<Option<u32>, MAX_PEERS>,
 
+    needs_state_sync: bool,
+
+/// Snapshots collected during SystemStateSync, keyed by sender.
+sync_snapshots: Vec<(u8, StoredSnapshot), MAX_TOTAL_NODES>,
+
+/// Snapshot-Acks collected during SystemStateSync, keyed by receiver.
+sync_acks: Vec<(u8, u32), MAX_TOTAL_NODES>,
+
     last_decision: Option<VotingOutcome<V::Decision>>,
 }
 
@@ -81,10 +137,176 @@ impl<V: Voter> RunState<V> {
             peer_rejoin_votes: Vec::new(),
             pending_rejoin: PeerMask::EMPTY,
             self_probation_remaining: 0,
+            needs_state_sync: false,
+sync_snapshots: Vec::new(),
+sync_acks: Vec::new(),
             last_decision: None,
             peer_crcs: Vec::new(),
         }
     }
+
+    pub fn needs_state_sync(&self) -> bool { self.needs_state_sync }
+pub fn set_needs_state_sync(&mut self, v: bool) { self.needs_state_sync = v; }
+
+pub fn reset_state_sync_evidence(&mut self) {
+    self.sync_snapshots.clear();
+    self.sync_acks.clear();
+}
+
+pub fn record_sync_snapshot(&mut self, peer_id: u8, snap: StoredSnapshot) {
+    for entry in self.sync_snapshots.iter_mut() {
+        if entry.0 == peer_id {
+            entry.1 = snap;
+            return;
+        }
+    }
+    let _ = self.sync_snapshots.push((peer_id, snap));
+}
+
+pub fn record_sync_ack(&mut self, peer_id: u8, adopted_crc: u32) {
+    for entry in self.sync_acks.iter_mut() {
+        if entry.0 == peer_id {
+            entry.1 = adopted_crc;
+            return;
+        }
+    }
+    let _ = self.sync_acks.push((peer_id, adopted_crc));
+}
+
+    pub fn compute_system_state_crc(&self) -> u32 {
+        let (nom, min, pc, cs, entries) = self.build_snapshot();
+        crc_from_snapshot_fields(nom, min, pc, cs, &entries)
+    }
+
+pub fn sync_snapshots(&self) -> &[(u8, StoredSnapshot)] { &self.sync_snapshots }
+pub fn sync_acks(&self) -> &[(u8, u32)] { &self.sync_acks }
+
+/// Pick the majority snapshot from what we've collected.
+/// Returns (chosen_snapshot, minority_sender_ids) or None if empty.
+pub fn majority_snapshot(&self) -> Option<(StoredSnapshot, Vec<u8, MAX_TOTAL_NODES>)> {
+    if self.sync_snapshots.is_empty() {
+        return None;
+    }
+    let mut best_count = 0u8;
+    let mut best_snap: Option<StoredSnapshot> = None;
+    for (_, snap) in self.sync_snapshots.iter() {
+        let count = self.sync_snapshots.iter().filter(|(_, s)| s == snap).count() as u8;
+        if count > best_count {
+            best_count = count;
+            best_snap = Some(*snap);
+        }
+    }
+    let winner = best_snap?;
+    let mut minority: Vec<u8, MAX_TOTAL_NODES> = Vec::new();
+    for (sender_id, snap) in self.sync_snapshots.iter() {
+        if *snap != winner {
+            let _ = minority.push(*sender_id);
+        }
+    }
+    Some((winner, minority))
+}
+
+pub fn apply_snapshot(
+    &mut self,
+    nominal: u8, min: u8, probation_cycles: u32, current_seq: u32,
+    entries: &[SnapshotEntry; MAX_TOTAL_NODES],
+) -> Result<(), SnapshotApplyError> {
+    if nominal != self.participants.nominal_participants
+        || min != self.participants.min_participants
+        || probation_cycles != self.participants.probation_cycles
+    {
+        return Err(SnapshotApplyError::ConfigMismatch);
+    }
+    self.current_seq = current_seq;
+    for entry in entries.iter().filter(|e| e.valid) {
+        let health = health_from_wire(entry.health)?;
+        if entry.id == self.own_id {
+            match health {
+                PeerHealth::Probation => {
+                    self.self_probation_remaining =
+                        probation_cycles.saturating_sub(entry.probation_cycles_ok);
+                }
+                PeerHealth::Alive => {
+                    self.self_probation_remaining = 0;
+                }
+                PeerHealth::Lost => return Err(SnapshotApplyError::SelfMarkedLost),
+            }
+        } else {
+            if !self.roster.set_peer_from_snapshot(entry.id, health, entry.probation_cycles_ok) {
+                return Err(SnapshotApplyError::UnknownPeerInSnapshot);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn build_snapshot(&self) -> (u8, u8, u32, u32, [SnapshotEntry; MAX_TOTAL_NODES]) {
+    let mut entries = [SnapshotEntry::default(); MAX_TOTAL_NODES];
+    let own_health = if self.self_probation_remaining > 0 {
+        PeerHealth::Probation
+    } else {
+        PeerHealth::Alive
+    };
+    let own_cycles_ok = if self.self_probation_remaining > 0 {
+        self.participants.probation_cycles.saturating_sub(self.self_probation_remaining)
+    } else {
+        0
+    };
+
+    let mut collected: Vec<(u8, PeerHealth, u32), MAX_TOTAL_NODES> = Vec::new();
+    let _ = collected.push((self.own_id, own_health, own_cycles_ok));
+    for peer in self.roster.peers().iter() {
+        let cok = if peer.health == PeerHealth::Probation { peer.probation_cycles_ok } else { 0 };
+        let _ = collected.push((peer.id, peer.health, cok));
+    }
+    collected.sort_unstable_by_key(|(id, _, _)| *id);
+
+    for (slot, (id, health, cok)) in entries.iter_mut().zip(collected.iter()) {
+        slot.valid = true;
+        slot.id = *id;
+        slot.health = health_wire(*health);
+        slot.probation_cycles_ok = *cok;
+    }
+
+    (self.participants.nominal_participants, self.participants.min_participants,
+     self.participants.probation_cycles, self.current_seq, entries)
+}
+
+/// For senders during SystemStateSync: check that every non-Lost
+/// receiver has ack'd with our own CRC. Returns true when done.
+pub fn all_receivers_acked_with(&self, own_crc: u32, receivers: &[u8]) -> bool {
+    for rid in receivers.iter() {
+        let matched = self.sync_acks.iter().any(|(pid, crc)| pid == rid && *crc == own_crc);
+        if !matched {
+            return false;
+        }
+    }
+    !receivers.is_empty()
+}
+
+/// Peers who have not yet ack'd during SystemStateSync (all non-Lost peers, filtered).
+pub fn peers_missing_sync_ack(&self) -> Vec<u8, MAX_PEERS> {
+    let mut missing: Vec<u8, MAX_PEERS> = Vec::new();
+    for peer in self.roster.peers().iter() {
+        if peer.health == PeerHealth::Lost { continue; }
+        if !self.sync_acks.iter().any(|(pid, _)| *pid == peer.id) {
+            let _ = missing.push(peer.id);
+        }
+    }
+    missing
+}
+
+/// Peers whose snapshot we haven't received (for receivers).
+pub fn peers_missing_snapshot(&self) -> Vec<u8, MAX_PEERS> {
+    let mut missing: Vec<u8, MAX_PEERS> = Vec::new();
+    for peer in self.roster.peers().iter() {
+        if peer.health == PeerHealth::Lost { continue; }
+        if !self.sync_snapshots.iter().any(|(pid, _)| *pid == peer.id) {
+            let _ = missing.push(peer.id);
+        }
+    }
+    missing
+}
 
     /// Log all fields that go into the system state CRC. For debugging
     /// CRC divergence — call on both nodes and diff the output.
@@ -116,44 +338,6 @@ impl<V: Voter> RunState<V> {
             "system state crc contents"
         );
     }
-
-pub fn compute_system_state_crc(&self) -> u32 {
-    let mut h = Hasher::new();
-    h.update(&[self.participants.nominal_participants]);
-    h.update(&[self.participants.min_participants]);
-    h.update(&self.participants.probation_cycles.to_le_bytes());
-    h.update(&self.current_seq.to_le_bytes());
-
-    let own_health = if self.self_probation_remaining > 0 {
-        PeerHealth::Probation
-    } else {
-        PeerHealth::Alive
-    };
-    let own_cycles_ok = if self.self_probation_remaining > 0 {
-        self.participants
-            .probation_cycles
-            .saturating_sub(self.self_probation_remaining)
-    } else {
-        0
-    };
-
-    let mut entries: Vec<(u8, u8, u32), MAX_TOTAL_NODES> = Vec::new();
-    let _ = entries.push((self.own_id, health_wire(own_health), own_cycles_ok));
-    for peer in self.roster.peers().iter() {
-        let cok = if peer.health == PeerHealth::Probation {
-            peer.probation_cycles_ok
-        } else {
-            0
-        };
-        let _ = entries.push((peer.id, health_wire(peer.health), cok));
-    }
-    entries.sort_unstable_by_key(|(id, _, _)| *id);
-    for (id, hw, cok) in entries.iter() {
-        h.update(&[*id, *hw]);
-        h.update(&cok.to_le_bytes());
-    }
-    h.finalize()
-}
 
     pub fn participants(&self) -> &ParticipantConfig {
         &self.participants

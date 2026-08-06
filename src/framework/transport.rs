@@ -1,10 +1,10 @@
 //! Transport layer over multicast UDP.
 
-use crate::framework::config::TransportConfig;
+use crate::framework::config::{TransportConfig, MAX_TOTAL_NODES};
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::CyclePayload;
 use crate::framework::types::PeerMask;
-use crate::framework::wire::{FrameError, Payload, UdpFrame, MAX_PAYLOAD_WIRE_SIZE};
+use crate::framework::wire::{FrameError, Payload, UdpFrame, MAX_PAYLOAD_WIRE_SIZE, SnapshotEntry};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::io;
@@ -222,6 +222,29 @@ impl<P: CyclePayload> UdpTransport<P> {
     ) -> Result<u32, TransportError> {
         self.send_payload(node_state, |id, sid, seq, ns, ts| {
             UdpFrame::<P>::system_state_crc_frame(id, sid, seq, ns, ts, crc)
+        })
+    }
+
+        pub fn send_system_state_snapshot(
+        &mut self,
+        node_state: NodeState,
+        nominal: u8, min: u8, probation_cycles: u32, current_seq: u32,
+        entries: [SnapshotEntry; MAX_TOTAL_NODES],
+    ) -> Result<u32, TransportError> {
+        self.send_payload(node_state, |id, sid, seq, ns, ts| {
+            UdpFrame::<P>::system_state_snapshot_frame(
+                id, sid, seq, ns, ts, nominal, min, probation_cycles, current_seq, entries,
+            )
+        })
+    }
+
+    pub fn send_system_state_snapshot_ack(
+        &mut self,
+        node_state: NodeState,
+        adopted_crc: u32,
+    ) -> Result<u32, TransportError> {
+        self.send_payload(node_state, |id, sid, seq, ns, ts| {
+            UdpFrame::<P>::system_state_snapshot_ack_frame(id, sid, seq, ns, ts, adopted_crc)
         })
     }
 

@@ -1,5 +1,5 @@
 use crate::framework::peer_sync::{extract_sync_fields, PeerSync, SyncFields, SAMPLES_PER_PEER};
-use crate::framework::state::PeerHealth;
+use crate::framework::state::{PeerHealth, StoredSnapshot, crc_from_snapshot_fields};
 use crate::framework::state_machine::{NodeState, StateEvent, SystemState};
 use crate::framework::traits::{Computation, DecisionSink, Voter, VotingOutcome};
 use crate::framework::transport::RecvOutcome;
@@ -10,7 +10,6 @@ use std::cell::Cell;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
-
 use super::PhaseOutcome;
 
 impl<C, V, S> super::Runner<C, V, S>
@@ -124,12 +123,12 @@ where
                         return StateEvent::SelfTestErr;
                     }
                     self.state.set_was_lost(false);
-                    self.state.enter_self_probation();
-                    info!("entering self probation");
+                    self.state.set_needs_state_sync(true);   // NEU: markiere für nächste Phase
+                    // enter_self_probation() ENTFÄLLT — Snapshot setzt self_probation_remaining
                 }
+                self.state.clear_pending_rejoin();
                 self.state.start_new_cycle(self.next_cycle_tick());
-                self.state.set_system_state(SystemState::Operational);
-                StateEvent::ResyncLostPeerOk
+                StateEvent::ResyncLostPeerOk   // statt InitialSyncOk
             }
             PhaseOutcome::Timeout => {
                 self.state.clear_pending_rejoin();
@@ -361,6 +360,143 @@ where
             }
         }
     }
+
+    pub(super) fn handle_system_state_sync(&mut self) -> StateEvent {
+    let is_receiver = self.state.needs_state_sync();
+    info!(is_receiver, "system state sync entered");
+
+    self.state.reset_state_sync_evidence();
+
+    let node_state = self.state.node_state();
+    let deadline = Instant::now() + self.timing.sync_sys_state_timeout_ms;
+
+    // Sender-Rolle: eigener Snapshot bleibt konstant während der Phase.
+    // Receiver-Rolle: eigener Snapshot unbekannt bis Anwendung, nichts zu senden.
+    let (nom, min, pc, cs, entries) = self.state.build_snapshot();
+
+    // Für den Sender: Empfänger-Liste = alle non-Lost Peers (der Receiver
+    // ist einer davon; die anderen Sender ackn nicht, aber schicken auch
+    // keinen Snapshot der ein Ack erwartet, weil sie nicht Empfänger sind).
+    // Vereinfachung: wir warten auf Acks von allen non-Lost, aber
+    // ignorieren fehlende Acks von Sendern (die brauchen wir nicht).
+    // Sauberer: der Sender weiß nicht wer Empfänger ist. Er sendet einfach
+    // und wartet auf mindestens einen Ack. Bei mehreren Empfängern:
+    // Ack von jedem der needs_state_sync=true hat. Aber das weiß der
+    // Sender lokal nicht. Pragmatisch:
+    //   Sender-Abschluss = mindestens ein Ack mit passendem CRC empfangen
+    //                    UND alle non-Lost haben entweder Snapshot ODER Ack gesendet
+    //   Receiver-Abschluss = Snapshot angewandt + Ack gesendet
+    // Für den Rückkehrer-Fall (1 Empfänger, N-1 Sender) reicht: mindestens
+    // 1 Ack mit unserem CRC → wir sind Mehrheit, weiter.
+
+    let outcome = self.collect_phase(
+        "system_state_sync",
+        deadline,
+        Duration::from_millis(5),
+        |this| {
+            if is_receiver {
+                // Receiver: sobald wir Snapshots haben, wenden wir Mehrheit an
+                // und senden Ack. Vorher nichts.
+                if !this.state.sync_snapshots().is_empty() {
+                    if let Some((winner, _minority)) = this.state.majority_snapshot() {
+                        if let Err(e) = this.state.apply_snapshot(
+                            winner.nominal, winner.min, winner.probation_cycles,
+                            winner.current_seq, &winner.entries,
+                        ) {
+                            error!(error = ?e, "apply_snapshot failed");
+                            return Err(());
+                        }
+                        let adopted_crc = this.state.compute_system_state_crc();
+                        if let Err(e) = this.transport.send_system_state_snapshot_ack(
+                            node_state, adopted_crc,
+                        ) {
+                            error!(error = ?e, "send_snapshot_ack failed");
+                            return Err(());
+                        }
+                    }
+                }
+            } else {
+                // Sender: broadcast snapshot.
+                if let Err(e) = this.transport.send_system_state_snapshot(
+                    node_state, nom, min, pc, cs, entries,
+                ) {
+                    error!(error = ?e, "send_snapshot failed");
+                    return Err(());
+                }
+            }
+            Ok(())
+        },
+        |this| {
+            if is_receiver {
+                // Fertig wenn wir Snapshots von allen non-Lost haben und
+                // (den Snapshot bereits angewandt haben, angezeigt durch
+                // needs_state_sync=false in apply-Erfolg — aber das setzen
+                // wir erst nach Handler-Abschluss). Alternative:
+                // Snapshot-Set komplett + kein Ausstand.
+                this.state.peers_missing_snapshot().is_empty()
+            } else {
+                // Sender: Ack von mindestens einem Peer der needs_state_sync
+                // hatte, und CRC stimmt mit unserem überein.
+                let own_crc = crc_from_snapshot_fields(nom, min, pc, cs, &entries);
+                this.state.sync_acks().iter().any(|(_, c)| *c == own_crc)
+            }
+        },
+        |this, frame| {
+            let peer_id = frame.node_id();
+            match frame.payload() {
+                Payload::SystemStateSnapshot {
+                    nominal_participants, min_participants,
+                    probation_cycles, current_seq, entries,
+                } => {
+                    let snap = StoredSnapshot {
+                        nominal: nominal_participants,
+                        min: min_participants,
+                        probation_cycles,
+                        current_seq,
+                        entries,
+                    };
+                    this.state.record_sync_snapshot(peer_id, snap);
+                }
+                Payload::SystemStateSnapshotAck { adopted_crc } => {
+                    this.state.record_sync_ack(peer_id, adopted_crc);
+                }
+                _ => {
+                    debug!(peer_id, "non-sync frame in state sync phase, dropped");
+                }
+            }
+        },
+    );
+
+    match outcome {
+        PhaseOutcome::Complete => {
+            if is_receiver {
+                self.state.set_needs_state_sync(false);
+                info!("state sync complete as receiver");
+            } else {
+                // Prüfen: wurde unser CRC von den Empfängern akzeptiert?
+                let own_crc = crc_from_snapshot_fields(nom, min, pc, cs, &entries);
+                let all_match = self.state.sync_acks().iter().all(|(_, c)| *c == own_crc);
+                if !all_match {
+                    error!(own_crc, "our snapshot was minority, failsafe");
+                    return StateEvent::SystemStateSyncMinority;
+                }
+                info!("state sync complete as sender");
+            }
+            StateEvent::SystemStateSyncOk
+        }
+        PhaseOutcome::Timeout => {
+            let missing_snap = self.state.peers_missing_snapshot();
+            let missing_ack = self.state.peers_missing_sync_ack();
+            error!(
+                missing_snap = ?missing_snap.as_slice(),
+                missing_ack = ?missing_ack.as_slice(),
+                "state sync timeout"
+            );
+            StateEvent::SystemStateSyncTimeout
+        }
+        PhaseOutcome::Fault => StateEvent::Fault,
+    }
+}
 
     /// CycleSync: peers exchange State beacons with attested seen-masks
     /// until each side has observed all non-Lost peers, or the phase times

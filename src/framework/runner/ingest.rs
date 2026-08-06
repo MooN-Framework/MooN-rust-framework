@@ -72,6 +72,12 @@ where
                     "system state crc frame outside CrcExchange, dropped"
                 );
             }
+            Payload::SystemStateSnapshot { .. } => {
+                debug!(peer_id, "snapshot frame outside state sync, dropped");
+            }
+            Payload::SystemStateSnapshotAck { .. } => {
+                debug!(peer_id, "snapshot ack frame outside state sync, dropped");
+            }
         }
     }
 

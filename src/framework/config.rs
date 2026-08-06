@@ -67,6 +67,7 @@ pub struct CycleTiming {
     pub error_management_vote_timeout: Duration,
     pub stale_threshold: Duration,
     pub crc_exchange_timeout_ms: Duration,
+    pub sync_sys_state_timeout_ms : Duration,
     pub resync_interval_cycles: u32,
 }
 
@@ -131,7 +132,8 @@ pub struct TimingSection {
     pub ack_ms: u64,
     pub error_management_vote_ms: u64,
     pub stale_ms: u64,
-    crc_exchange_timeout_ms: u64,
+    pub crc_exchange_timeout_ms: u64,
+    pub sync_sys_state_timeout_ms : u64,
     pub resync_interval_cycles: u32,
 }
 
@@ -172,6 +174,7 @@ impl NodeConfig {
             error_management_vote_timeout: Duration::from_millis(t.error_management_vote_ms),
             stale_threshold: Duration::from_millis(t.stale_ms),
             crc_exchange_timeout_ms: Duration::from_millis(t.crc_exchange_timeout_ms),
+            sync_sys_state_timeout_ms : Duration::from_millis(t.sync_sys_state_timeout_ms),
             resync_interval_cycles: t.resync_interval_cycles,
         }
     }
