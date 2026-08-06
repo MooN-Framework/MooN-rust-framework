@@ -16,7 +16,10 @@ pub struct ObservationKind {
 
 impl ObservationKind {
     pub const fn empty() -> Self {
-        Self { own_seen: PeerMask::EMPTY, peer_seen: Vec::new() }
+        Self {
+            own_seen: PeerMask::EMPTY,
+            peer_seen: Vec::new(),
+        }
     }
 
     pub fn resize(&mut self, n: usize) {
@@ -101,12 +104,14 @@ impl<'a, P: CyclePayload> View<'a, P> {
 /// True when at least one piece of evidence was recorded this phase.
 fn any_evidence<P: CyclePayload>(view: &View<'_, P>) -> bool {
     match view {
-        View::CycleSync { own_seen, peer_seen } => {
-            !own_seen.is_empty() || peer_seen.iter().any(|m| m.is_some())
-        }
-        View::Result { peer_results, peer_acks } => {
-            peer_results.iter().any(|r| r.is_some()) || peer_acks.iter().any(|a| a.is_some())
-        }
+        View::CycleSync {
+            own_seen,
+            peer_seen,
+        } => !own_seen.is_empty() || peer_seen.iter().any(|m| m.is_some()),
+        View::Result {
+            peer_results,
+            peer_acks,
+        } => peer_results.iter().any(|r| r.is_some()) || peer_acks.iter().any(|a| a.is_some()),
     }
 }
 

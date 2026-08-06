@@ -39,7 +39,11 @@ where
                     warn!(peer_id, error = ?e, "record_peer_result failed");
                 }
             }
-            Payload::Ack { received_from, publisher_candidate, .. } => {
+            Payload::Ack {
+                received_from,
+                publisher_candidate,
+                ..
+            } => {
                 let ack = AckInfo {
                     received_from: received_from.as_u8(),
                     publisher_candidate,
@@ -49,7 +53,10 @@ where
                 }
             }
             Payload::ExclusionProposal { propose_exclude } => {
-                if let Err(e) = self.state.record_peer_exclusion_proposal(peer_id, propose_exclude) {
+                if let Err(e) = self
+                    .state
+                    .record_peer_exclusion_proposal(peer_id, propose_exclude)
+                {
                     warn!(peer_id, error = ?e, "record_peer_exclusion_proposal failed");
                 }
             }
@@ -60,7 +67,10 @@ where
                 debug!(peer_id, "sync frame outside PeerSync, dropped");
             }
             Payload::SystemStateCrc { .. } => {
-                debug!(peer_id, "system state crc frame outside CrcExchange, dropped");
+                debug!(
+                    peer_id,
+                    "system state crc frame outside CrcExchange, dropped"
+                );
             }
         }
     }
@@ -115,6 +125,10 @@ where
         let now = now_monotonic_ns();
         let age = now.saturating_sub(local_send);
         let threshold_ns = self.timing.stale_threshold.as_nanos() as u64;
-        if age > threshold_ns { Some(age) } else { None }
+        if age > threshold_ns {
+            Some(age)
+        } else {
+            None
+        }
     }
 }

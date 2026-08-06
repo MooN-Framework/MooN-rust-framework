@@ -4,7 +4,7 @@ use crate::framework::config::TransportConfig;
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::CyclePayload;
 use crate::framework::types::PeerMask;
-use crate::framework::wire::{FrameError, MAX_PAYLOAD_WIRE_SIZE, Payload, UdpFrame};
+use crate::framework::wire::{FrameError, Payload, UdpFrame, MAX_PAYLOAD_WIRE_SIZE};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::io;
@@ -34,12 +34,25 @@ pub enum RecvOutcome<P: CyclePayload> {
     /// Same or older seq than we last saw for this peer/session.
     Duplicate { peer_id: u8, seen: u32, last: u32 },
     /// Peer's session id changed — likely rebooted.
-    NewSession { peer_id: u8, previous_session: u64, new_session: u64, frame: UdpFrame<P> },
+    NewSession {
+        peer_id: u8,
+        previous_session: u64,
+        new_session: u64,
+        frame: UdpFrame<P>,
+    },
     /// Gap detected between last-seen and this seq.
-    SeqGap { peer_id: u8, gap: u32, frame: UdpFrame<P> },
+    SeqGap {
+        peer_id: u8,
+        gap: u32,
+        frame: UdpFrame<P>,
+    },
     /// Time-sync frame; bypasses seq-num classification.
     /// `local_recv_ns` is the receive timestamp (t2 or t4).
-    TimeSync { peer_id: u8, frame: UdpFrame<P>, local_recv_ns: u64 },
+    TimeSync {
+        peer_id: u8,
+        frame: UdpFrame<P>,
+        local_recv_ns: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -82,7 +95,10 @@ impl<P: CyclePayload> UdpTransport<P> {
         #[cfg(target_os = "linux")]
         s.bind_device(Some(cfg.interface_name.as_bytes()))?;
 
-        s.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, cfg.port)))?;
+        s.bind(&SockAddr::from(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            cfg.port,
+        )))?;
         s.join_multicast_v4(&cfg.multicast_group, &iface_ip)?;
         s.set_multicast_loop_v4(true)?;
         s.set_multicast_ttl_v4(1)?;
@@ -131,7 +147,16 @@ impl<P: CyclePayload> UdpTransport<P> {
         rejoin_vote: PeerMask,
     ) -> Result<u32, TransportError> {
         self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::ack_frame(id, sid, seq, ns, ts, received_from, publisher_candidate, rejoin_vote)
+            UdpFrame::<P>::ack_frame(
+                id,
+                sid,
+                seq,
+                ns,
+                ts,
+                received_from,
+                publisher_candidate,
+                rejoin_vote,
+            )
         })
     }
 
@@ -148,7 +173,10 @@ impl<P: CyclePayload> UdpTransport<P> {
 
     /// Send a Cristian request. Returns the sent seq and `t1` for
     /// correlation.
-    pub fn send_time_sync_req(&mut self, node_state: NodeState) -> Result<(u32, u64), TransportError> {
+    pub fn send_time_sync_req(
+        &mut self,
+        node_state: NodeState,
+    ) -> Result<(u32, u64), TransportError> {
         let seq_marker = self.next_seq_num;
         let t1 = now_monotonic_ns();
         let frame = UdpFrame::<P>::time_sync_req_frame(
@@ -188,14 +216,14 @@ impl<P: CyclePayload> UdpTransport<P> {
     }
 
     pub fn send_system_state_crc(
-    &mut self,
-    node_state: NodeState,
-    crc: u32,
-) -> Result<u32, TransportError> {
-    self.send_payload(node_state, |id, sid, seq, ns, ts| {
-        UdpFrame::<P>::system_state_crc_frame(id, sid, seq, ns, ts, crc)
-    })
-}
+        &mut self,
+        node_state: NodeState,
+        crc: u32,
+    ) -> Result<u32, TransportError> {
+        self.send_payload(node_state, |id, sid, seq, ns, ts| {
+            UdpFrame::<P>::system_state_crc_frame(id, sid, seq, ns, ts, crc)
+        })
+    }
 
     /// Blocking receive: waits until a frame arrives or the socket's read
     /// timeout fires.
@@ -203,7 +231,9 @@ impl<P: CyclePayload> UdpTransport<P> {
         let mut buf = [0u8; RECV_BUFFER_SIZE];
         let (n, _) = match self.socket.recv_from(&mut buf) {
             Ok(x) => x,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
                 return RecvOutcome::Timeout;
             }
             Err(_) => return RecvOutcome::Timeout,
@@ -231,7 +261,10 @@ impl<P: CyclePayload> UdpTransport<P> {
     pub fn accept(&mut self, frame: &UdpFrame<P>) {
         self.peers.insert(
             frame.node_id(),
-            PeerCursor { session_id: frame.session_id(), last_seq: frame.seq_num() },
+            PeerCursor {
+                session_id: frame.session_id(),
+                last_seq: frame.seq_num(),
+            },
         );
     }
 
@@ -264,7 +297,10 @@ impl<P: CyclePayload> UdpTransport<P> {
         if frame.node_id() == self.self_node_id {
             return RecvOutcome::SelfLoopback;
         }
-        if matches!(frame.payload(), Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. }) {
+        if matches!(
+            frame.payload(),
+            Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. }
+        ) {
             return RecvOutcome::TimeSync {
                 peer_id: frame.node_id(),
                 frame,
@@ -281,7 +317,10 @@ impl<P: CyclePayload> UdpTransport<P> {
             None => {
                 self.peers.insert(
                     peer_id,
-                    PeerCursor { session_id: frame.session_id(), last_seq: frame.seq_num() },
+                    PeerCursor {
+                        session_id: frame.session_id(),
+                        last_seq: frame.seq_num(),
+                    },
                 );
                 RecvOutcome::Valid(frame)
             }
@@ -299,13 +338,20 @@ impl<P: CyclePayload> UdpTransport<P> {
             Some(cur) if frame.seq_num() == cur.last_seq + 1 => {
                 self.peers.insert(
                     peer_id,
-                    PeerCursor { session_id: frame.session_id(), last_seq: frame.seq_num() },
+                    PeerCursor {
+                        session_id: frame.session_id(),
+                        last_seq: frame.seq_num(),
+                    },
                 );
                 RecvOutcome::Valid(frame)
             }
             Some(cur) => {
                 let gap = frame.seq_num() - cur.last_seq - 1;
-                RecvOutcome::SeqGap { peer_id, gap, frame }
+                RecvOutcome::SeqGap {
+                    peer_id,
+                    gap,
+                    frame,
+                }
             }
         }
     }

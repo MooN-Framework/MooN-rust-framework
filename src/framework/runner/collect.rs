@@ -1,4 +1,4 @@
-use crate::framework::peer_sync::{SyncFields, extract_sync_fields};
+use crate::framework::peer_sync::{extract_sync_fields, SyncFields};
 use crate::framework::state::PeerHealth;
 use crate::framework::traits::{Computation, DecisionSink, Voter};
 use crate::framework::transport::RecvOutcome;
@@ -64,26 +64,49 @@ where
 
             match self.transport.try_recv() {
                 RecvOutcome::Valid(frame) => ingest(self, frame),
-                RecvOutcome::SeqGap { peer_id, gap, frame } => {
+                RecvOutcome::SeqGap {
+                    peer_id,
+                    gap,
+                    frame,
+                } => {
                     warn!(peer_id, gap, "seq gap, advancing cursor");
                     self.transport.accept(&frame);
                     ingest(self, frame);
                 }
-                RecvOutcome::NewSession { peer_id, previous_session, new_session, frame } => {
+                RecvOutcome::NewSession {
+                    peer_id,
+                    previous_session,
+                    new_session,
+                    frame,
+                } => {
                     let was_lost = self
                         .state
                         .peer_index(peer_id)
                         .map(|idx| self.state.peers()[idx].health == PeerHealth::Lost)
                         .unwrap_or(false);
                     if was_lost {
-                        warn!(peer_id, previous_session, new_session, "Rejoin request from Lost peer, accepting and continuing phase");
+                        warn!(
+                            peer_id,
+                            previous_session,
+                            new_session,
+                            "Rejoin request from Lost peer, accepting and continuing phase"
+                        );
                         self.transport.accept(&frame);
-                        ingest(self, frame);                     
+                        ingest(self, frame);
                     } else {
-                        warn!(peer_id, previous_session, new_session, "Peer either rebooted mid phase or wasn't in peer list, ignoring");
+                        warn!(
+                            peer_id,
+                            previous_session,
+                            new_session,
+                            "Peer either rebooted mid phase or wasn't in peer list, ignoring"
+                        );
                     }
                 }
-                RecvOutcome::TimeSync { frame, local_recv_ns, .. } => {
+                RecvOutcome::TimeSync {
+                    frame,
+                    local_recv_ns,
+                    ..
+                } => {
                     if let Some(SyncFields::Request { t1, t2_local, .. }) =
                         extract_sync_fields(&frame, local_recv_ns)
                     {

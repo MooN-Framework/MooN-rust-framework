@@ -28,7 +28,10 @@ impl ParticipantConfig {
     /// invariant, must fail loudly at startup).
     pub fn new(minimum: u8, nominal: u8, probation_cycles: u32) -> Self {
         assert!(minimum >= 1, "min_participants must be >= 1");
-        assert!(minimum <= nominal, "min ({minimum}) must not exceed nominal ({nominal})");
+        assert!(
+            minimum <= nominal,
+            "min ({minimum}) must not exceed nominal ({nominal})"
+        );
         assert!(
             nominal as usize <= MAX_TOTAL_NODES,
             "nominal ({nominal}) exceeds MAX_TOTAL_NODES ({MAX_TOTAL_NODES})"
@@ -63,7 +66,7 @@ pub struct CycleTiming {
     pub ack_timeout: Duration,
     pub error_management_vote_timeout: Duration,
     pub stale_threshold: Duration,
-    pub crc_exchange_timeout_ms : Duration,
+    pub crc_exchange_timeout_ms: Duration,
     pub resync_interval_cycles: u32,
 }
 
@@ -128,7 +131,7 @@ pub struct TimingSection {
     pub ack_ms: u64,
     pub error_management_vote_ms: u64,
     pub stale_ms: u64,
-    crc_exchange_timeout_ms : u64,
+    crc_exchange_timeout_ms: u64,
     pub resync_interval_cycles: u32,
 }
 
@@ -149,7 +152,11 @@ pub struct DiagnosticSection {
 
 impl NodeConfig {
     pub fn participants(&self) -> ParticipantConfig {
-        ParticipantConfig::new(self.participants.minimum, self.participants.nominal, self.participants.probation_cycles)
+        ParticipantConfig::new(
+            self.participants.minimum,
+            self.participants.nominal,
+            self.participants.probation_cycles,
+        )
     }
 
     pub fn timing(&self) -> CycleTiming {
@@ -189,4 +196,3 @@ impl NodeConfig {
         }
     }
 }
-

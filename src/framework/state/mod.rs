@@ -3,18 +3,18 @@ mod observation;
 mod peers;
 mod voting;
 
-pub use cycle::{AckInfo, CycleState};
-pub use observation::ObservationKind;
-pub use peers::{DiscoveryError, PeerHealth, PeerInfo, PeerRoster};
-pub use voting::ExclusionVotes;
-use crate::framework::config::{MAX_PEERS,MAX_TOTAL_NODES, ParticipantConfig};
+use crate::framework::config::{ParticipantConfig, MAX_PEERS, MAX_TOTAL_NODES};
 use crate::framework::peer_sync::PeerClock;
 use crate::framework::state_machine::{NodeState, SystemState};
 use crate::framework::traits::{Voter, VotingOutcome};
 use crate::framework::types::PeerMask;
-use heapless::Vec;
-use tracing::{info, warn};
 use crc32fast::Hasher;
+pub use cycle::{AckInfo, CycleState};
+use heapless::Vec;
+pub use observation::ObservationKind;
+pub use peers::{DiscoveryError, PeerHealth, PeerInfo, PeerRoster};
+use tracing::{info, warn};
+pub use voting::ExclusionVotes;
 
 fn health_wire(h: PeerHealth) -> u8 {
     match h {
@@ -47,7 +47,7 @@ pub struct RunState<V: Voter> {
     sync_epsilon_ns: i64,
     sync_valid: bool,
 
-    was_lost : bool,
+    was_lost: bool,
     rejoin_seen: PeerMask,
     peer_rejoin_votes: Vec<Option<PeerMask>, MAX_PEERS>,
     pending_rejoin: PeerMask,
@@ -86,27 +86,66 @@ impl<V: Voter> RunState<V> {
         }
     }
 
-    pub fn compute_system_state_crc(&self) -> u32 {
+    /// Log all fields that go into the system state CRC. For debugging
+    /// CRC divergence — call on both nodes and diff the output.
+    pub fn log_system_state_crc_contents(&self) {
+        let own_cycles_ok = self
+            .participants
+            .probation_cycles
+            .saturating_sub(self.self_probation_remaining);
+        let own_health = if self.self_probation_remaining > 0 {
+            PeerHealth::Probation
+        } else {
+            PeerHealth::Alive
+        };
+
+        let mut entries: Vec<(u8, PeerHealth, u32), MAX_TOTAL_NODES> = Vec::new();
+        let _ = entries.push((self.own_id, own_health, own_cycles_ok));
+        for peer in self.roster.peers().iter() {
+            let _ = entries.push((peer.id, peer.health, peer.probation_cycles_ok));
+        }
+        entries.sort_unstable_by_key(|(id, _, _)| *id);
+
+        info!(
+            crc = self.compute_system_state_crc(),
+            nominal = self.participants.nominal_participants,
+            min = self.participants.min_participants,
+            probation_cycles = self.participants.probation_cycles,
+            current_seq = self.current_seq,
+            nodes = ?entries.as_slice(),
+            "system state crc contents"
+        );
+    }
+
+pub fn compute_system_state_crc(&self) -> u32 {
     let mut h = Hasher::new();
     h.update(&[self.participants.nominal_participants]);
     h.update(&[self.participants.min_participants]);
     h.update(&self.participants.probation_cycles.to_le_bytes());
     h.update(&self.current_seq.to_le_bytes());
 
-    let own_cycles_ok = self
-        .participants
-        .probation_cycles
-        .saturating_sub(self.self_probation_remaining);
     let own_health = if self.self_probation_remaining > 0 {
         PeerHealth::Probation
     } else {
         PeerHealth::Alive
     };
+    let own_cycles_ok = if self.self_probation_remaining > 0 {
+        self.participants
+            .probation_cycles
+            .saturating_sub(self.self_probation_remaining)
+    } else {
+        0
+    };
 
     let mut entries: Vec<(u8, u8, u32), MAX_TOTAL_NODES> = Vec::new();
     let _ = entries.push((self.own_id, health_wire(own_health), own_cycles_ok));
     for peer in self.roster.peers().iter() {
-        let _ = entries.push((peer.id, health_wire(peer.health), peer.probation_cycles_ok));
+        let cok = if peer.health == PeerHealth::Probation {
+            peer.probation_cycles_ok
+        } else {
+            0
+        };
+        let _ = entries.push((peer.id, health_wire(peer.health), cok));
     }
     entries.sort_unstable_by_key(|(id, _, _)| *id);
     for (id, hw, cok) in entries.iter() {
@@ -126,12 +165,14 @@ impl<V: Voter> RunState<V> {
 
     /// Register a newly discovered peer during InitSync.
     pub fn on_peer_discovered(&mut self, id: u8) -> Result<(), DiscoveryError> {
-        self.roster.discover(id, self.own_id, self.participants.max_peers())
+        self.roster
+            .discover(id, self.own_id, self.participants.max_peers())
     }
 
     /// Close discovery, sort peers by id, size all per-peer buffers.
     pub fn finalize_discovery(&mut self) -> Result<(), DiscoveryError> {
-        self.roster.finalize(self.own_id, self.participants.nominal_participants)?;
+        self.roster
+            .finalize(self.own_id, self.participants.nominal_participants)?;
         let n = self.roster.peers().len();
         self.cycle.resize(n);
         self.obs.resize(n);
@@ -142,55 +183,57 @@ impl<V: Voter> RunState<V> {
             let _ = self.peer_rejoin_votes.push(None);
         }
         self.peer_crcs.clear();
-for _ in 0..n {
-    let _ = self.peer_crcs.push(None);
-}
+        for _ in 0..n {
+            let _ = self.peer_crcs.push(None);
+        }
         Ok(())
     }
 
-pub fn reset_crc_evidence(&mut self) {
-    for slot in self.peer_crcs.iter_mut() {
-        *slot = None;
+    pub fn reset_crc_evidence(&mut self) {
+        for slot in self.peer_crcs.iter_mut() {
+            *slot = None;
+        }
     }
-}
 
-pub fn record_peer_crc(&mut self, peer_id: u8, crc: u32) -> Result<(), DiscoveryError> {
-    let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
-    if self.roster.peers()[idx].health == PeerHealth::Lost {
-        return Ok(());
+    pub fn record_peer_crc(&mut self, peer_id: u8, crc: u32) -> Result<(), DiscoveryError> {
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
+        if self.roster.peers()[idx].health == PeerHealth::Lost {
+            return Ok(());
+        }
+        self.peer_crcs[idx] = Some(crc);
+        Ok(())
     }
-    self.peer_crcs[idx] = Some(crc);
-    Ok(())
-}
 
-pub fn healthy_peers_missing_crc(&self) -> Vec<u8, MAX_PEERS> {
-    let mut missing: Vec<u8, MAX_PEERS> = Vec::new();
-    for (idx, peer) in self.roster.peers().iter().enumerate() {
-        if peer.health == PeerHealth::Lost {
-            continue;
+    pub fn healthy_peers_missing_crc(&self) -> Vec<u8, MAX_PEERS> {
+        let mut missing: Vec<u8, MAX_PEERS> = Vec::new();
+        for (idx, peer) in self.roster.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            if self.peer_crcs[idx].is_none() {
+                let _ = missing.push(peer.id);
+            }
         }
-        if self.peer_crcs[idx].is_none() {
-            let _ = missing.push(peer.id);
-        }
+        missing
     }
-    missing
-}
-pub fn cycle_peer_crc(&self, idx: usize) -> Option<u32> {
-    self.peer_crcs.get(idx).and_then(|s| *s)
-}
-/// True iff own CRC matches every non-Lost peer's attestation.
-pub fn crc_unanimous(&self, own_crc: u32) -> bool {
-    for (idx, peer) in self.roster.peers().iter().enumerate() {
-        if peer.health == PeerHealth::Lost {
-            continue;
-        }
-        match self.peer_crcs[idx] {
-            Some(c) if c == own_crc => continue,
-            _ => return false,
-        }
+    pub fn cycle_peer_crc(&self, idx: usize) -> Option<u32> {
+        self.peer_crcs.get(idx).and_then(|s| *s)
     }
-    true
-}
+    /// True iff own CRC matches every non-Lost peer's attestation.
+    pub fn crc_unanimous(&self, own_crc: u32) -> bool {
+        for (idx, peer) in self.roster.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            match self.peer_crcs[idx] {
+                Some(c) if c == own_crc => continue,
+                _ => return false,
+            }
+        }
+        true
+    }
 
     pub fn peer_index(&self, id: u8) -> Option<usize> {
         self.roster.peer_index(id)
@@ -200,8 +243,14 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
         self.cycle.own_result = Some(payload);
     }
 
-    pub fn record_peer_result(&mut self, peer_id: u8, payload: V::Payload) -> Result<(), DiscoveryError> {
-        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+    pub fn record_peer_result(
+        &mut self,
+        peer_id: u8,
+        payload: V::Payload,
+    ) -> Result<(), DiscoveryError> {
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
         if self.roster.peers()[idx].health == PeerHealth::Lost {
             return Ok(());
         }
@@ -210,7 +259,9 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
     }
 
     pub fn record_peer_ack(&mut self, peer_id: u8, ack: AckInfo) -> Result<(), DiscoveryError> {
-        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
         if self.roster.peers()[idx].health == PeerHealth::Lost {
             return Ok(());
         }
@@ -309,8 +360,14 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
         self.obs.own_seen
     }
 
-    pub fn record_peer_seen_mask(&mut self, peer_id: u8, mask: PeerMask) -> Result<(), DiscoveryError> {
-        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+    pub fn record_peer_seen_mask(
+        &mut self,
+        peer_id: u8,
+        mask: PeerMask,
+    ) -> Result<(), DiscoveryError> {
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
         if self.roster.peers()[idx].health == PeerHealth::Lost {
             return Ok(());
         }
@@ -352,7 +409,9 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
     /// Add a peer to the local exclusion proposal explicitly (e.g. after
     /// a value-divergence detection in Publish).
     pub fn propose_exclude(&mut self, peer_id: u8) -> Result<(), DiscoveryError> {
-        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
         self.pending_exclusion_proposal.set(idx);
         Ok(())
     }
@@ -361,8 +420,14 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
         self.votes.reset();
     }
 
-    pub fn record_peer_exclusion_proposal(&mut self, peer_id: u8, mask: PeerMask) -> Result<(), DiscoveryError> {
-        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+    pub fn record_peer_exclusion_proposal(
+        &mut self,
+        peer_id: u8,
+        mask: PeerMask,
+    ) -> Result<(), DiscoveryError> {
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
         if self.roster.peers()[idx].health == PeerHealth::Lost {
             return Ok(());
         }
@@ -378,7 +443,9 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
     /// Note that we've observed a ResyncLostPeer frame from `peer_id` —
     /// this contributes a bit to our own rejoin vote for this cycle.
     pub fn set_rejoin_seen(&mut self, peer_id: u8) {
-        if (peer_id as usize) < 8 { self.rejoin_seen.set(peer_id as usize); }
+        if (peer_id as usize) < 8 {
+            self.rejoin_seen.set(peer_id as usize);
+        }
     }
 
     /// The rejoin mask we'll attest to peers in send_ack.
@@ -387,8 +454,8 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
     }
 
     pub fn set_pending_rejoin(&mut self, mask: PeerMask) {
-    self.pending_rejoin = mask;
-}
+        self.pending_rejoin = mask;
+    }
 
     pub fn pending_rejoin(&self) -> PeerMask {
         self.pending_rejoin
@@ -404,7 +471,9 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
         peer_id: u8,
         vote: PeerMask,
     ) -> Result<(), DiscoveryError> {
-        let idx = self.peer_index(peer_id).ok_or(DiscoveryError::UnknownPeer)?;
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
         if self.roster.peers()[idx].health == PeerHealth::Lost {
             return Ok(());
         }
@@ -458,7 +527,8 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
     /// Aggregate peer exclusion proposals + own vote into a confirmed mask.
     /// Rule 1a: target's own vote is ignored.
     pub fn aggregate_exclusion_votes(&self) -> PeerMask {
-        self.votes.aggregate(&self.roster, self.own_id, self.proposed_exclusions())
+        self.votes
+            .aggregate(&self.roster, self.own_id, self.proposed_exclusions())
     }
 
     /// Apply confirmed exclusions. Returns number of transitions applied.
@@ -543,7 +613,11 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
             .find(|c| c.peer_id == peer_id)?
             .offset_ns;
         let local = (peer_ts as i128) - (offset as i128);
-        if local < 0 { None } else { Some(local as u64) }
+        if local < 0 {
+            None
+        } else {
+            Some(local as u64)
+        }
     }
 
     /// Readmit a peer that came back via resync. Returns true on transition.
@@ -562,25 +636,26 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
                 info!("self promoted from Probation to Alive");
             }
         }
-        self.roster.tick_probation(self.participants.probation_cycles)
+        self.roster
+            .tick_probation(self.participants.probation_cycles)
     }
 
     pub fn enter_self_probation(&mut self) {
-    self.self_probation_remaining = self.participants.probation_cycles;
-}
+        self.self_probation_remaining = self.participants.probation_cycles;
+    }
 
     pub fn self_in_probation(&self) -> bool {
-    self.self_probation_remaining > 0
-}
+        self.self_probation_remaining > 0
+    }
 
     pub fn lowest_alive_peer_id(&self) -> Option<u8> {
-    self.roster
-        .peers()
-        .iter()
-        .filter(|p| p.health == PeerHealth::Alive)
-        .map(|p| p.id)
-        .min()
-}
+        self.roster
+            .peers()
+            .iter()
+            .filter(|p| p.health == PeerHealth::Alive)
+            .map(|p| p.id)
+            .min()
+    }
 
     pub fn publisher_consensus(&self, own_pick: u8) -> Option<u8> {
         for (idx, peer) in self.roster.peers().iter().enumerate() {
@@ -599,18 +674,43 @@ pub fn crc_unanimous(&self, own_crc: u32) -> bool {
         Some(own_pick)
     }
 
-
-    pub fn own_id(&self) -> u8 { self.own_id }
-    pub fn session_id(&self) -> u64 { self.session_id }
-    pub fn node_state(&self) -> NodeState { self.node_state }
-    pub fn set_node_state(&mut self, s: NodeState) { self.node_state = s; }
-    pub fn system_state(&self) -> SystemState { self.system_state }
-    pub fn set_system_state(&mut self, s: SystemState) { self.system_state = s; }
-    pub fn current_seq(&self) -> u32 { self.current_seq }
-    pub fn peers(&self) -> &[PeerInfo] { self.roster.peers() }
-    pub fn cycle(&self) -> &CycleState<V::Payload> { &self.cycle }
-    pub fn last_decision(&self) -> Option<VotingOutcome<V::Decision>> { self.last_decision }
-    pub fn voter(&self) -> &V { &self.voter }
-    pub fn was_lost(&self) -> bool { self.was_lost }
-    pub fn set_was_lost(&mut self, lost: bool) { self.was_lost = lost; }
+    pub fn own_id(&self) -> u8 {
+        self.own_id
+    }
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+    pub fn node_state(&self) -> NodeState {
+        self.node_state
+    }
+    pub fn set_node_state(&mut self, s: NodeState) {
+        self.node_state = s;
+    }
+    pub fn system_state(&self) -> SystemState {
+        self.system_state
+    }
+    pub fn set_system_state(&mut self, s: SystemState) {
+        self.system_state = s;
+    }
+    pub fn current_seq(&self) -> u32 {
+        self.current_seq
+    }
+    pub fn peers(&self) -> &[PeerInfo] {
+        self.roster.peers()
+    }
+    pub fn cycle(&self) -> &CycleState<V::Payload> {
+        &self.cycle
+    }
+    pub fn last_decision(&self) -> Option<VotingOutcome<V::Decision>> {
+        self.last_decision
+    }
+    pub fn voter(&self) -> &V {
+        &self.voter
+    }
+    pub fn was_lost(&self) -> bool {
+        self.was_lost
+    }
+    pub fn set_was_lost(&mut self, lost: bool) {
+        self.was_lost = lost;
+    }
 }

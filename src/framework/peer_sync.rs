@@ -48,7 +48,11 @@ impl SyncSample {
     /// Zero on perfectly symmetric latency.
     pub fn error_bound(&self) -> i64 {
         let raw = (self.delay() - 2 * DT_MIN_NS as i64) / 2;
-        if raw < 0 { 0 } else { raw }
+        if raw < 0 {
+            0
+        } else {
+            raw
+        }
     }
 }
 
@@ -70,7 +74,12 @@ struct PeerSyncState {
 
 impl PeerSyncState {
     fn new(peer_id: u8) -> Self {
-        Self { peer_id, pending_t1: None, samples_taken: 0, best: None }
+        Self {
+            peer_id,
+            pending_t1: None,
+            samples_taken: 0,
+            best: None,
+        }
     }
 
     fn record_sample(&mut self, sample: SyncSample) {
@@ -145,7 +154,12 @@ impl PeerSync {
             Some(expected) if expected == t1 => {}
             _ => return,
         }
-        let sample = SyncSample { t1, t2, t3, t4: t4_local };
+        let sample = SyncSample {
+            t1,
+            t2,
+            t3,
+            t4: t4_local,
+        };
         if sample.delay() < 0 {
             state.pending_t1 = None;
             return;
@@ -161,7 +175,10 @@ impl PeerSync {
     /// Extract the aggregated per-peer clocks. Meaningful only when
     /// `is_complete()`.
     pub fn finalize(&self) -> Vec<PeerClock> {
-        self.peers.iter().filter_map(|p| p.as_peer_clock()).collect()
+        self.peers
+            .iter()
+            .filter_map(|p| p.as_peer_clock())
+            .collect()
     }
 
     /// Median of the peer offsets plus our own clock (0). Correction to
@@ -193,8 +210,18 @@ impl PeerSync {
 /// Discriminated view over the time-sync payload variants extracted from
 /// a received frame.
 pub enum SyncFields {
-    Request { peer_id: u8, t1: u64, t2_local: u64 },
-    Response { peer_id: u8, t1: u64, t2: u64, t3: u64, t4_local: u64 },
+    Request {
+        peer_id: u8,
+        t1: u64,
+        t2_local: u64,
+    },
+    Response {
+        peer_id: u8,
+        t1: u64,
+        t2: u64,
+        t3: u64,
+        t4_local: u64,
+    },
 }
 
 /// Project a received frame down to the sync fields the coordinator uses.

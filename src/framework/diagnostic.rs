@@ -49,9 +49,18 @@ pub enum Command {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutgoingTelegram<'a> {
-    Staged { source_node_id: u8, staged_kind: &'a str },
-    Status { source_node_id: u8, data: StatusResponse },
-    Error { source_node_id: u8, message: String },
+    Staged {
+        source_node_id: u8,
+        staged_kind: &'a str,
+    },
+    Status {
+        source_node_id: u8,
+        data: StatusResponse,
+    },
+    Error {
+        source_node_id: u8,
+        message: String,
+    },
 }
 
 /// Snapshot of node runtime state returned on `GetStatus`.
@@ -104,7 +113,9 @@ impl PendingChanges {
     }
 
     pub fn has_injection_update(&self) -> bool {
-        self.drop_next_n_results.is_some() || self.drop_next_n_acks.is_some() || self.clear_injection
+        self.drop_next_n_results.is_some()
+            || self.drop_next_n_acks.is_some()
+            || self.clear_injection
     }
 }
 
@@ -279,7 +290,10 @@ impl Diagnostic {
 /// Look up the first IPv4 address of `iface_name` via `ip -4 -o addr show`.
 fn interface_ipv4(iface_name: &str) -> Option<Ipv4Addr> {
     use std::process::Command;
-    let out = Command::new("ip").args(["-4", "-o", "addr", "show", iface_name]).output().ok()?;
+    let out = Command::new("ip")
+        .args(["-4", "-o", "addr", "show", iface_name])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

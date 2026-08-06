@@ -14,12 +14,36 @@ pub struct DecelerationStage {
 }
 
 pub const DECELERATION_STAGES: &[DecelerationStage] = &[
-    DecelerationStage { v_min: 0.0,  v_max: 10.0, a: 1.0 },
-    DecelerationStage { v_min: 10.0, v_max: 20.0, a: 0.9 },
-    DecelerationStage { v_min: 20.0, v_max: 30.0, a: 0.8 },
-    DecelerationStage { v_min: 30.0, v_max: 40.0, a: 0.7 },
-    DecelerationStage { v_min: 40.0, v_max: 50.0, a: 0.6 },
-    DecelerationStage { v_min: 50.0, v_max: f64::INFINITY, a: 0.5 },
+    DecelerationStage {
+        v_min: 0.0,
+        v_max: 10.0,
+        a: 1.0,
+    },
+    DecelerationStage {
+        v_min: 10.0,
+        v_max: 20.0,
+        a: 0.9,
+    },
+    DecelerationStage {
+        v_min: 20.0,
+        v_max: 30.0,
+        a: 0.8,
+    },
+    DecelerationStage {
+        v_min: 30.0,
+        v_max: 40.0,
+        a: 0.7,
+    },
+    DecelerationStage {
+        v_min: 40.0,
+        v_max: 50.0,
+        a: 0.6,
+    },
+    DecelerationStage {
+        v_min: 50.0,
+        v_max: f64::INFINITY,
+        a: 0.5,
+    },
 ];
 
 /// Inputs for one brake curve computation.
@@ -32,7 +56,11 @@ pub struct BrakeInput {
 
 impl BrakeInput {
     pub fn new(current_speed: f64, target_speed: f64, available_distance: f64) -> Self {
-        Self { current_speed, target_speed, available_distance }
+        Self {
+            current_speed,
+            target_speed,
+            available_distance,
+        }
     }
 }
 
@@ -46,7 +74,11 @@ pub struct BrakeResult {
 
 impl BrakeResult {
     fn new_valid(total_distance: f64, emergency_brake: bool) -> Self {
-        Self { total_distance, emergency_brake, valid_entry: true }
+        Self {
+            total_distance,
+            emergency_brake,
+            valid_entry: true,
+        }
     }
 }
 
@@ -65,7 +97,9 @@ impl fmt::Display for BrakeError {
             BrakeError::NotFinite => write!(f, "input contains NaN or infinity"),
             BrakeError::NegativeSpeed => write!(f, "speed must be non-negative"),
             BrakeError::NegativeDistance => write!(f, "available distance must be non-negative"),
-            BrakeError::TargetAboveCurrent => write!(f, "target speed must not exceed current speed"),
+            BrakeError::TargetAboveCurrent => {
+                write!(f, "target speed must not exceed current speed")
+            }
         }
     }
 }

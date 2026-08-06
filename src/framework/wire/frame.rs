@@ -29,7 +29,6 @@ const TIME_SYNC_REQ_BODY: usize = 8;
 const TIME_SYNC_RESP_BODY: usize = 24;
 const SYSTEM_STATE_CRC_BODY: usize = 4;
 
-
 const DISC_STATE: u8 = 0x00;
 const DISC_RESULT: u8 = 0x01;
 const DISC_ACK: u8 = 0x02;
@@ -41,7 +40,11 @@ const DISC_SYSTEM_STATE_CRC: u8 = 0x06;
 pub const MAX_PAYLOAD_WIRE_SIZE: usize = 64;
 
 const fn max_usize(a: usize, b: usize) -> usize {
-    if a > b { a } else { b }
+    if a > b {
+        a
+    } else {
+        b
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,8 +63,6 @@ impl From<PayloadError> for FrameError {
         }
     }
 }
-
-
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Payload<P: CyclePayload> {
@@ -85,10 +86,20 @@ pub enum Payload<P: CyclePayload> {
         publisher_candidate: u8,
         rejoin_vote: PeerMask,
     },
-    ExclusionProposal { propose_exclude: PeerMask },
-    TimeSyncReq { t1: u64 },
-    TimeSyncResp { t1: u64, t2: u64, t3: u64 },
-    SystemStateCrc { crc: u32 },
+    ExclusionProposal {
+        propose_exclude: PeerMask,
+    },
+    TimeSyncReq {
+        t1: u64,
+    },
+    TimeSyncResp {
+        t1: u64,
+        t2: u64,
+        t3: u64,
+    },
+    SystemStateCrc {
+        crc: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -154,7 +165,10 @@ impl<P: CyclePayload> UdpFrame<P> {
             seq_num,
             node_state,
             timestamp,
-            Payload::State { seen_mask, active_count },
+            Payload::State {
+                seen_mask,
+                active_count,
+            },
         )
     }
 
@@ -166,7 +180,14 @@ impl<P: CyclePayload> UdpFrame<P> {
         timestamp: u64,
         result: P,
     ) -> Self {
-        Self::new(node_id, session_id, seq_num, node_state, timestamp, Payload::Result(result))
+        Self::new(
+            node_id,
+            session_id,
+            seq_num,
+            node_state,
+            timestamp,
+            Payload::Result(result),
+        )
     }
 
     pub fn ack_frame(
@@ -185,7 +206,11 @@ impl<P: CyclePayload> UdpFrame<P> {
             seq_num,
             node_state,
             timestamp,
-            Payload::Ack { received_from, publisher_candidate, rejoin_vote },
+            Payload::Ack {
+                received_from,
+                publisher_candidate,
+                rejoin_vote,
+            },
         )
     }
 
@@ -215,7 +240,14 @@ impl<P: CyclePayload> UdpFrame<P> {
         timestamp: u64,
         t1: u64,
     ) -> Self {
-        Self::new(node_id, session_id, seq_num, node_state, timestamp, Payload::TimeSyncReq { t1 })
+        Self::new(
+            node_id,
+            session_id,
+            seq_num,
+            node_state,
+            timestamp,
+            Payload::TimeSyncReq { t1 },
+        )
     }
 
     pub fn time_sync_resp_frame(
@@ -239,12 +271,12 @@ impl<P: CyclePayload> UdpFrame<P> {
     }
 
     pub fn system_state_crc_frame(
-    node_id: u8,
-    session_id: u64,
-    seq_num: u32,
-    node_state: NodeState,
-    timestamp: u64,
-    crc: u32,
+        node_id: u8,
+        session_id: u64,
+        seq_num: u32,
+        node_state: NodeState,
+        timestamp: u64,
+        crc: u32,
     ) -> Self {
         Self::new(
             node_id,
@@ -256,12 +288,24 @@ impl<P: CyclePayload> UdpFrame<P> {
         )
     }
 
-    pub fn node_id(&self) -> u8 { self.node_id }
-    pub fn session_id(&self) -> u64 { self.session_id }
-    pub fn seq_num(&self) -> u32 { self.seq_num }
-    pub fn node_state_wire(&self) -> u8 { self.node_state_wire }
-    pub fn timestamp(&self) -> u64 { self.timestamp }
-    pub fn payload(&self) -> Payload<P> { self.payload }
+    pub fn node_id(&self) -> u8 {
+        self.node_id
+    }
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+    pub fn seq_num(&self) -> u32 {
+        self.seq_num
+    }
+    pub fn node_state_wire(&self) -> u8 {
+        self.node_state_wire
+    }
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+    pub fn payload(&self) -> Payload<P> {
+        self.payload
+    }
 
     fn compute_crc(&self) -> u32 {
         let _ = Self::_ASSERT_FITS;
@@ -272,7 +316,10 @@ impl<P: CyclePayload> UdpFrame<P> {
         h.update(&[self.node_state_wire]);
         h.update(&self.timestamp.to_le_bytes());
         match &self.payload {
-            Payload::State { seen_mask, active_count } => {
+            Payload::State {
+                seen_mask,
+                active_count,
+            } => {
                 h.update(&[DISC_STATE, seen_mask.as_u8(), *active_count]);
             }
             Payload::Result(r) => {
@@ -284,7 +331,11 @@ impl<P: CyclePayload> UdpFrame<P> {
                 }
                 h.update(&staging[..P::WIRE_SIZE]);
             }
-            Payload::Ack { received_from, publisher_candidate, rejoin_vote } => {
+            Payload::Ack {
+                received_from,
+                publisher_candidate,
+                rejoin_vote,
+            } => {
                 h.update(&[
                     DISC_ACK,
                     received_from.as_u8(),
@@ -305,7 +356,7 @@ impl<P: CyclePayload> UdpFrame<P> {
                 h.update(&t2.to_le_bytes());
                 h.update(&t3.to_le_bytes());
             }
-                Payload::SystemStateCrc { crc } => {
+            Payload::SystemStateCrc { crc } => {
                 h.update(&[DISC_SYSTEM_STATE_CRC]);
                 h.update(&crc.to_le_bytes());
             }
@@ -327,7 +378,10 @@ impl<P: CyclePayload> UdpFrame<P> {
         buf.push(self.node_state_wire);
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
         match self.payload {
-            Payload::State { seen_mask, active_count } => {
+            Payload::State {
+                seen_mask,
+                active_count,
+            } => {
                 buf.extend_from_slice(&[DISC_STATE, seen_mask.as_u8(), active_count]);
             }
             Payload::Result(r) => {
@@ -339,7 +393,11 @@ impl<P: CyclePayload> UdpFrame<P> {
                 }
                 buf.extend_from_slice(&staging[..P::WIRE_SIZE]);
             }
-            Payload::Ack { received_from, publisher_candidate, rejoin_vote } => {
+            Payload::Ack {
+                received_from,
+                publisher_candidate,
+                rejoin_vote,
+            } => {
                 buf.extend_from_slice(&[
                     DISC_ACK,
                     received_from.as_u8(),
@@ -389,7 +447,13 @@ impl<P: CyclePayload> UdpFrame<P> {
                 }
                 let seen_mask = PeerMask::from_u8(bytes[HEADER_SIZE]);
                 let active_count = bytes[HEADER_SIZE + 1];
-                (Payload::State { seen_mask, active_count }, STATE_BODY)
+                (
+                    Payload::State {
+                        seen_mask,
+                        active_count,
+                    },
+                    STATE_BODY,
+                )
             }
             DISC_RESULT => {
                 let end = HEADER_SIZE + P::WIRE_SIZE;
@@ -436,9 +500,16 @@ impl<P: CyclePayload> UdpFrame<P> {
                 if bytes.len() < end + CRC_SIZE {
                     return Err(FrameError::TooShort);
                 }
-                let t1 = u64::from_le_bytes(bytes[HEADER_SIZE..HEADER_SIZE + 8].try_into().unwrap());
-                let t2 = u64::from_le_bytes(bytes[HEADER_SIZE + 8..HEADER_SIZE + 16].try_into().unwrap());
-                let t3 = u64::from_le_bytes(bytes[HEADER_SIZE + 16..HEADER_SIZE + 24].try_into().unwrap());
+                let t1 =
+                    u64::from_le_bytes(bytes[HEADER_SIZE..HEADER_SIZE + 8].try_into().unwrap());
+                let t2 = u64::from_le_bytes(
+                    bytes[HEADER_SIZE + 8..HEADER_SIZE + 16].try_into().unwrap(),
+                );
+                let t3 = u64::from_le_bytes(
+                    bytes[HEADER_SIZE + 16..HEADER_SIZE + 24]
+                        .try_into()
+                        .unwrap(),
+                );
                 (Payload::TimeSyncResp { t1, t2, t3 }, TIME_SYNC_RESP_BODY)
             }
             DISC_SYSTEM_STATE_CRC => {

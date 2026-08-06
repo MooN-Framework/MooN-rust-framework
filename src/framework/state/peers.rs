@@ -39,7 +39,10 @@ pub struct PeerRoster {
 
 impl PeerRoster {
     pub fn new() -> Self {
-        Self { peers: Vec::new(), discovery_locked: false }
+        Self {
+            peers: Vec::new(),
+            discovery_locked: false,
+        }
     }
 
     pub fn peers(&self) -> &[PeerInfo] {
@@ -65,11 +68,20 @@ impl PeerRoster {
             return Ok(());
         }
         if self.peers.len() >= max_peers {
-            warn!(peer_id = id, count = self.peers.len(), limit = max_peers, "peer roster full");
+            warn!(
+                peer_id = id,
+                count = self.peers.len(),
+                limit = max_peers,
+                "peer roster full"
+            );
             return Ok(());
         }
         self.peers
-            .push(PeerInfo { id, health: PeerHealth::Alive, probation_cycles_ok: 0 })
+            .push(PeerInfo {
+                id,
+                health: PeerHealth::Alive,
+                probation_cycles_ok: 0,
+            })
             .expect("push failed despite capacity check");
         Ok(())
     }
@@ -79,7 +91,10 @@ impl PeerRoster {
     pub fn finalize(&mut self, own_id: u8, nominal: u8) -> Result<(), DiscoveryError> {
         let found = self.peers.len() as u8 + 1;
         if found != nominal {
-            return Err(DiscoveryError::WrongNodeCount { found, expected: nominal });
+            return Err(DiscoveryError::WrongNodeCount {
+                found,
+                expected: nominal,
+            });
         }
         self.peers.sort_unstable_by_key(|p| p.id);
         self.discovery_locked = true;
@@ -101,38 +116,44 @@ impl PeerRoster {
         transitions
     }
 
-pub fn readmit(&mut self, peer_id: u8) -> bool {
-    for peer in self.peers.iter_mut() {
-        if peer.id == peer_id && peer.health == PeerHealth::Lost {
-            peer.health = PeerHealth::Probation;
-            peer.probation_cycles_ok = 0;
-            return true;
+    pub fn readmit(&mut self, peer_id: u8) -> bool {
+        for peer in self.peers.iter_mut() {
+            if peer.id == peer_id && peer.health == PeerHealth::Lost {
+                peer.health = PeerHealth::Probation;
+                peer.probation_cycles_ok = 0;
+                return true;
+            }
         }
+        false
     }
-    false
-}
 
     pub fn voting_peer_count(&self) -> usize {
-        self.peers.iter().filter(|p| p.health == PeerHealth::Alive).count()
+        self.peers
+            .iter()
+            .filter(|p| p.health == PeerHealth::Alive)
+            .count()
     }
 
     pub fn tick_probation(&mut self, threshold: u32) -> usize {
-    let mut promoted = 0;
-    for peer in self.peers.iter_mut() {
-        if peer.health == PeerHealth::Probation {
-            peer.probation_cycles_ok = peer.probation_cycles_ok.saturating_add(1);
-            if peer.probation_cycles_ok >= threshold {
-                peer.health = PeerHealth::Alive;
-                peer.probation_cycles_ok = 0;
-                promoted += 1;
+        let mut promoted = 0;
+        for peer in self.peers.iter_mut() {
+            if peer.health == PeerHealth::Probation {
+                peer.probation_cycles_ok = peer.probation_cycles_ok.saturating_add(1);
+                if peer.probation_cycles_ok >= threshold {
+                    peer.health = PeerHealth::Alive;
+                    peer.probation_cycles_ok = 0;
+                    promoted += 1;
+                }
             }
         }
+        promoted
     }
-    promoted
-}
 
     pub fn active_count(&self) -> usize {
-        self.peers.iter().filter(|p| p.health != PeerHealth::Lost).count()
+        self.peers
+            .iter()
+            .filter(|p| p.health != PeerHealth::Lost)
+            .count()
     }
 
     /// Smallest id among the peers marked `Alive`, defaulting to `own_id`

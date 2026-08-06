@@ -78,7 +78,10 @@ fn parse_config_path() -> Result<PathBuf, String> {
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--config" || arg == "-c" {
-            return args.next().map(PathBuf::from).ok_or_else(|| "missing value for --config".into());
+            return args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "missing value for --config".into());
         }
         if let Some(v) = arg.strip_prefix("--config=") {
             return Ok(PathBuf::from(v));
