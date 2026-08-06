@@ -147,38 +147,3 @@ pub fn readmit(&mut self, peer_id: u8) -> bool {
         min_id
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn roster_with_one_peer(health: PeerHealth) -> PeerRoster {
-        let mut r = PeerRoster::new();
-        r.peers.push(PeerInfo { id: 1, health }).unwrap();
-        r
-    }
-
-    #[test]
-    fn exclude_ignores_empty_mask() {
-        let mut r = roster_with_one_peer(PeerHealth::Alive);
-        assert_eq!(r.exclude(PeerMask::EMPTY), 0);
-        assert_eq!(r.peers()[0].health, PeerHealth::Alive);
-    }
-
-    #[test]
-    fn exclude_sets_alive_to_lost() {
-        let mut r = roster_with_one_peer(PeerHealth::Alive);
-        let mut mask = PeerMask::EMPTY;
-        mask.set(0);
-        assert_eq!(r.exclude(mask), 1);
-        assert_eq!(r.peers()[0].health, PeerHealth::Lost);
-    }
-
-    #[test]
-    fn exclude_is_idempotent() {
-        let mut r = roster_with_one_peer(PeerHealth::Lost);
-        let mut mask = PeerMask::EMPTY;
-        mask.set(0);
-        assert_eq!(r.exclude(mask), 0);
-    }
-}

@@ -23,6 +23,7 @@ pub enum NodeState {
     Isolation = 0x09,
     PeerSync = 0x0A,
     ResyncLostPeer = 0x0B,
+    SystemStateCrcExchange = 0x0C,
     Failsafe = 0xFF,
 }
 
@@ -53,6 +54,9 @@ pub enum StateEvent {
     DissenterDetected,
     StateOk,
     StateDiverged,
+
+    CrcOk,
+    CrcDivergent,
     /// Exclusion vote timed out: at least one peer we did NOT propose to
     /// exclude failed to reply (Rule 2b) — failsafe.
     StateTimeout,
@@ -84,8 +88,11 @@ impl NodeState {
             (ReadInputs, InputsRead) => ShareResult,
             (ShareResult, ResultShared) => SendAck,
             (ShareResult, ShareResultTimeout) => ErrorManagement,
-            (SendAck, AckReceived) => PublishResult,
+            (SendAck, AckReceived) => SystemStateCrcExchange,
             (SendAck, AckTimeout) => ErrorManagement,
+
+            (SystemStateCrcExchange, CrcOk) => PublishResult,
+            (SystemStateCrcExchange, CrcDivergent) => ErrorManagement,
 
             (PublishResult, ResultPublished) => CycleSync,
             (PublishResult, ResyncDue) => PeerSync,
@@ -128,6 +135,7 @@ impl NodeState {
             0x09 => Isolation,
             0x0A => PeerSync,
             0x0B => ResyncLostPeer,
+            0x0C => SystemStateCrcExchange,
             0xFF => Failsafe,
             other => return Err(InvalidNodeState(other)),
         })

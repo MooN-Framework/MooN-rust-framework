@@ -27,6 +27,8 @@ const ACK_BODY: usize = 3;
 const EXCLUSION_PROPOSAL_BODY: usize = 1;
 const TIME_SYNC_REQ_BODY: usize = 8;
 const TIME_SYNC_RESP_BODY: usize = 24;
+const SYSTEM_STATE_CRC_BODY: usize = 4;
+
 
 const DISC_STATE: u8 = 0x00;
 const DISC_RESULT: u8 = 0x01;
@@ -34,6 +36,7 @@ const DISC_ACK: u8 = 0x02;
 const DISC_TIMESYNC_REQ: u8 = 0x03;
 const DISC_TIMESYNC_RESP: u8 = 0x04;
 const DISC_EXCLUSION_PROPOSAL: u8 = 0x05;
+const DISC_SYSTEM_STATE_CRC: u8 = 0x06;
 
 pub const MAX_PAYLOAD_WIRE_SIZE: usize = 64;
 
@@ -85,6 +88,7 @@ pub enum Payload<P: CyclePayload> {
     ExclusionProposal { propose_exclude: PeerMask },
     TimeSyncReq { t1: u64 },
     TimeSyncResp { t1: u64, t2: u64, t3: u64 },
+    SystemStateCrc { crc: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -110,6 +114,7 @@ impl<P: CyclePayload> UdpFrame<P> {
         let body = max_usize(body, TIME_SYNC_RESP_BODY);
         let body = max_usize(body, STATE_BODY);
         let body = max_usize(body, EXCLUSION_PROPOSAL_BODY);
+        let body = max_usize(body, SYSTEM_STATE_CRC_BODY);
         HEADER_SIZE + body + CRC_SIZE
     };
 
@@ -233,6 +238,24 @@ impl<P: CyclePayload> UdpFrame<P> {
         )
     }
 
+    pub fn system_state_crc_frame(
+    node_id: u8,
+    session_id: u64,
+    seq_num: u32,
+    node_state: NodeState,
+    timestamp: u64,
+    crc: u32,
+    ) -> Self {
+        Self::new(
+            node_id,
+            session_id,
+            seq_num,
+            node_state,
+            timestamp,
+            Payload::SystemStateCrc { crc },
+        )
+    }
+
     pub fn node_id(&self) -> u8 { self.node_id }
     pub fn session_id(&self) -> u64 { self.session_id }
     pub fn seq_num(&self) -> u32 { self.seq_num }
@@ -281,6 +304,10 @@ impl<P: CyclePayload> UdpFrame<P> {
                 h.update(&t1.to_le_bytes());
                 h.update(&t2.to_le_bytes());
                 h.update(&t3.to_le_bytes());
+            }
+                Payload::SystemStateCrc { crc } => {
+                h.update(&[DISC_SYSTEM_STATE_CRC]);
+                h.update(&crc.to_le_bytes());
             }
         }
         h.finalize()
@@ -332,6 +359,10 @@ impl<P: CyclePayload> UdpFrame<P> {
                 buf.extend_from_slice(&t1.to_le_bytes());
                 buf.extend_from_slice(&t2.to_le_bytes());
                 buf.extend_from_slice(&t3.to_le_bytes());
+            }
+            Payload::SystemStateCrc { crc } => {
+                buf.push(DISC_SYSTEM_STATE_CRC);
+                buf.extend_from_slice(&crc.to_le_bytes());
             }
         }
         buf.extend_from_slice(&self.crc32.to_le_bytes());
@@ -409,6 +440,14 @@ impl<P: CyclePayload> UdpFrame<P> {
                 let t2 = u64::from_le_bytes(bytes[HEADER_SIZE + 8..HEADER_SIZE + 16].try_into().unwrap());
                 let t3 = u64::from_le_bytes(bytes[HEADER_SIZE + 16..HEADER_SIZE + 24].try_into().unwrap());
                 (Payload::TimeSyncResp { t1, t2, t3 }, TIME_SYNC_RESP_BODY)
+            }
+            DISC_SYSTEM_STATE_CRC => {
+                let end = HEADER_SIZE + SYSTEM_STATE_CRC_BODY;
+                if bytes.len() < end + CRC_SIZE {
+                    return Err(FrameError::TooShort);
+                }
+                let crc = u32::from_le_bytes(bytes[HEADER_SIZE..end].try_into().unwrap());
+                (Payload::SystemStateCrc { crc }, SYSTEM_STATE_CRC_BODY)
             }
             _ => return Err(FrameError::UnknownDiscriminator),
         };

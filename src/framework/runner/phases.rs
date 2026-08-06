@@ -139,6 +139,65 @@ let outcome = self.collect_phase(
     }
 }
 
+pub(super) fn handle_system_state_crc(&mut self) -> StateEvent {
+    self.state.reset_crc_evidence();
+
+    let own_crc = self.state.compute_system_state_crc();
+    let node_state = self.state.node_state();
+    let deadline = Instant::now() + self.timing.crc_exchange_timeout_ms;
+
+    debug!(own_crc, "system state crc exchange entered");
+
+    let outcome = self.collect_phase(
+        "system_state_crc",
+        deadline,
+        Duration::from_millis(1),
+        |this| {
+            if let Err(e) = this.transport.send_system_state_crc(node_state, own_crc) {
+                error!(error = ?e, "send_system_state_crc failed");
+                return Err(());
+            }
+            Ok(())
+        },
+        |this| this.state.healthy_peers_missing_crc().is_empty(),
+        |this, frame| {
+            if let Payload::SystemStateCrc { crc } = frame.payload() {
+                let _ = this.state.record_peer_crc(frame.node_id(), crc);
+            }
+        },
+    );
+
+    match outcome {
+        PhaseOutcome::Complete => {
+            if self.state.crc_unanimous(own_crc) {
+                debug!(own_crc, "crc unanimous");
+                StateEvent::CrcOk
+            } else {
+                let picks: Vec<(u8, Option<u32>)> = self
+                    .state
+                    .peers()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, p)| {
+                        if p.health == PeerHealth::Lost {
+                            return None;
+                        }
+                        Some((p.id, self.state.cycle_peer_crc(idx)))
+                    })
+                    .collect();
+                error!(own_crc, peer_crcs = ?picks, "crc divergence, failsafe");
+                StateEvent::CrcDivergent
+            }
+        }
+        PhaseOutcome::Timeout => {
+            let missing = self.state.healthy_peers_missing_crc();
+            error!(missing = ?missing.as_slice(), "crc exchange timeout, failsafe");
+            StateEvent::CrcDivergent
+        }
+        PhaseOutcome::Fault => StateEvent::Fault,
+    }
+}
+
     /// InitSync: broadcast state until the nominal peer set is discovered
     /// or the discovery window elapses.
     pub(super) fn handle_init_sync(&mut self) -> StateEvent {

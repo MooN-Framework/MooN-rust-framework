@@ -59,6 +59,9 @@ where
             Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. } => {
                 debug!(peer_id, "sync frame outside PeerSync, dropped");
             }
+            Payload::SystemStateCrc { .. } => {
+                debug!(peer_id, "system state crc frame outside CrcExchange, dropped");
+            }
         }
     }
 

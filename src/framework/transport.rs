@@ -187,6 +187,16 @@ impl<P: CyclePayload> UdpTransport<P> {
         Ok(seq_marker)
     }
 
+    pub fn send_system_state_crc(
+    &mut self,
+    node_state: NodeState,
+    crc: u32,
+) -> Result<u32, TransportError> {
+    self.send_payload(node_state, |id, sid, seq, ns, ts| {
+        UdpFrame::<P>::system_state_crc_frame(id, sid, seq, ns, ts, crc)
+    })
+}
+
     /// Blocking receive: waits until a frame arrives or the socket's read
     /// timeout fires.
     pub fn recv(&mut self) -> RecvOutcome<P> {

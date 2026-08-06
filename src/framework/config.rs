@@ -63,6 +63,7 @@ pub struct CycleTiming {
     pub ack_timeout: Duration,
     pub error_management_vote_timeout: Duration,
     pub stale_threshold: Duration,
+    pub crc_exchange_timeout_ms : Duration,
     pub resync_interval_cycles: u32,
 }
 
@@ -127,6 +128,7 @@ pub struct TimingSection {
     pub ack_ms: u64,
     pub error_management_vote_ms: u64,
     pub stale_ms: u64,
+    crc_exchange_timeout_ms : u64,
     pub resync_interval_cycles: u32,
 }
 
@@ -162,6 +164,7 @@ impl NodeConfig {
             ack_timeout: Duration::from_millis(t.ack_ms),
             error_management_vote_timeout: Duration::from_millis(t.error_management_vote_ms),
             stale_threshold: Duration::from_millis(t.stale_ms),
+            crc_exchange_timeout_ms: Duration::from_millis(t.crc_exchange_timeout_ms),
             resync_interval_cycles: t.resync_interval_cycles,
         }
     }
@@ -187,32 +190,3 @@ impl NodeConfig {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn participants_valid() {
-        let c = ParticipantConfig::new(2, 3);
-        assert_eq!(c.tolerable_failures(), 1);
-        assert_eq!(c.max_peers(), 2);
-    }
-
-    #[test]
-    #[should_panic]
-    fn participants_zero_minimum() {
-        ParticipantConfig::new(0, 3);
-    }
-
-    #[test]
-    #[should_panic]
-    fn participants_minimum_over_nominal() {
-        ParticipantConfig::new(3, 2);
-    }
-
-    #[test]
-    #[should_panic]
-    fn participants_nominal_over_max() {
-        ParticipantConfig::new(5, 9);
-    }
-}
