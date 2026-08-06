@@ -2,6 +2,7 @@
 |  TO-DO	     |
 |================|
 - ResyncLostPeer timeouts in Config einarbeiten
+- Refactor Configfiles and Configuration
 - GUI-Diagnosetool
 - Dokumentation + Refactoring
 
@@ -25,6 +26,8 @@
 - Fehlermanagement (Suspect) Synchronisierung von Fehlerzustandswechsel [X]
 - Resynchronisierung von Knoten [X]
 - Probation von Resynchroniserten Knoten für konfigurierbare zyklen zeit [X]
+- Systemstate CRC check [x]
+- Resync SystemState after resyncing lost peer [x]
 
 |================|
 |Fehlermanagement|
