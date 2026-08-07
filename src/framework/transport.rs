@@ -1,10 +1,9 @@
 //! Transport layer over multicast UDP.
 
-use crate::framework::config::{TransportConfig, MAX_TOTAL_NODES};
+use crate::framework::config::TransportConfig;
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::CyclePayload;
-use crate::framework::types::PeerMask;
-use crate::framework::wire::{FrameError, Payload, UdpFrame, MAX_PAYLOAD_WIRE_SIZE, SnapshotEntry};
+use crate::framework::wire::{FrameError, Payload, UdpFrame, MAX_PAYLOAD_WIRE_SIZE};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::io;
@@ -117,135 +116,50 @@ impl<P: CyclePayload> UdpTransport<P> {
         })
     }
 
-    /// Send a State beacon carrying the current observation mask.
-    pub fn send_state(
+    /// Wrap `payload` in a frame with the current sender identity and a
+    /// fresh monotonic timestamp, then send it. Returns the allocated seq.
+    ///
+    /// The specialised `send_time_sync_req` / `send_time_sync_resp` paths
+    /// carry timestamps that are semantically identical to the frame's
+    /// `timestamp` field and therefore build the frame directly.
+    pub fn send(
         &mut self,
         node_state: NodeState,
-        seen_mask: PeerMask,
-        active_count: u8,
+        payload: Payload<P>,
     ) -> Result<u32, TransportError> {
-        self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::state_frame(id, sid, seq, ns, ts, seen_mask, active_count)
-        })
-    }
-
-    /// Send the current cycle result.
-    pub fn send_result(&mut self, node_state: NodeState, result: P) -> Result<u32, TransportError> {
-        self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::result_frame(id, sid, seq, ns, ts, result)
-        })
-    }
-
-    /// Send an ack for received results plus our publisher pick.
-    /// `rejoin_vote` attests which lost peers this node endorses for
-    /// rejoin this cycle; empty mask = no endorsement.
-    pub fn send_ack(
-        &mut self,
-        node_state: NodeState,
-        received_from: PeerMask,
-        publisher_candidate: u8,
-        rejoin_vote: PeerMask,
-    ) -> Result<u32, TransportError> {
-        self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::ack_frame(
-                id,
-                sid,
-                seq,
-                ns,
-                ts,
-                received_from,
-                publisher_candidate,
-                rejoin_vote,
-            )
-        })
-    }
-
-    /// Send an exclusion vote for the ErrorManagement phase.
-    pub fn send_exclusion_proposal(
-        &mut self,
-        node_state: NodeState,
-        propose_exclude: PeerMask,
-    ) -> Result<u32, TransportError> {
-        self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::exclusion_proposal_frame(id, sid, seq, ns, ts, propose_exclude)
-        })
+        let ts = now_monotonic_ns();
+        self.send_at(node_state, ts, payload)
     }
 
     /// Send a Cristian request. Returns the sent seq and `t1` for
-    /// correlation.
+    /// correlation. `t1` is both the frame timestamp and the payload's t1.
     pub fn send_time_sync_req(
         &mut self,
         node_state: NodeState,
     ) -> Result<(u32, u64), TransportError> {
-        let seq_marker = self.next_seq_num;
         let t1 = now_monotonic_ns();
-        let frame = UdpFrame::<P>::time_sync_req_frame(
-            self.self_node_id,
-            self.self_session_id,
-            seq_marker,
-            node_state,
-            t1,
-            t1,
-        );
-        self.socket.send_to(&frame.encode(), self.group_addr)?;
-        Ok((seq_marker, t1))
+        let seq = self.send_at(node_state, t1, Payload::TimeSyncReq { t1 })?;
+        Ok((seq, t1))
     }
 
     /// Send a Cristian response echoing t1 and t2, with t3 taken as late
-    /// as possible.
+    /// as possible. `t3` is both the frame timestamp and the payload's t3.
     pub fn send_time_sync_resp(
         &mut self,
         node_state: NodeState,
         t1_echo: u64,
         t2_local: u64,
     ) -> Result<u32, TransportError> {
-        let seq_marker = self.next_seq_num;
         let t3 = now_monotonic_ns();
-        let frame = UdpFrame::<P>::time_sync_resp_frame(
-            self.self_node_id,
-            self.self_session_id,
-            seq_marker,
+        self.send_at(
             node_state,
             t3,
-            t1_echo,
-            t2_local,
-            t3,
-        );
-        self.socket.send_to(&frame.encode(), self.group_addr)?;
-        Ok(seq_marker)
-    }
-
-    pub fn send_system_state_crc(
-        &mut self,
-        node_state: NodeState,
-        crc: u32,
-    ) -> Result<u32, TransportError> {
-        self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::system_state_crc_frame(id, sid, seq, ns, ts, crc)
-        })
-    }
-
-        pub fn send_system_state_snapshot(
-        &mut self,
-        node_state: NodeState,
-        nominal: u8, min: u8, probation_cycles: u32, current_seq: u32,
-        entries: [SnapshotEntry; MAX_TOTAL_NODES],
-    ) -> Result<u32, TransportError> {
-        self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::system_state_snapshot_frame(
-                id, sid, seq, ns, ts, nominal, min, probation_cycles, current_seq, entries,
-            )
-        })
-    }
-
-    pub fn send_system_state_snapshot_ack(
-        &mut self,
-        node_state: NodeState,
-        adopted_crc: u32,
-    ) -> Result<u32, TransportError> {
-        self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::system_state_snapshot_ack_frame(id, sid, seq, ns, ts, adopted_crc)
-        })
+            Payload::TimeSyncResp {
+                t1: t1_echo,
+                t2: t2_local,
+                t3,
+            },
+        )
     }
 
     /// Blocking receive: waits until a frame arrives or the socket's read
@@ -296,14 +210,23 @@ impl<P: CyclePayload> UdpTransport<P> {
         self.peers.remove(&peer_id);
     }
 
-    /// Common send path: allocate seq, timestamp, encode, send, advance seq.
-    fn send_payload<F>(&mut self, node_state: NodeState, build: F) -> Result<u32, TransportError>
-    where
-        F: FnOnce(u8, u64, u32, NodeState, u64) -> UdpFrame<P>,
-    {
+    /// Common send path with an explicit timestamp. All public send methods
+    /// funnel through here.
+    fn send_at(
+        &mut self,
+        node_state: NodeState,
+        ts: u64,
+        payload: Payload<P>,
+    ) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
-        let ts = now_monotonic_ns();
-        let frame = build(self.self_node_id, self.self_session_id, seq, node_state, ts);
+        let frame = UdpFrame::<P>::new(
+            self.self_node_id,
+            self.self_session_id,
+            seq,
+            node_state,
+            ts,
+            payload,
+        );
         self.socket.send_to(&frame.encode(), self.group_addr)?;
         self.next_seq_num = self.next_seq_num.wrapping_add(1);
         Ok(seq)
@@ -395,8 +318,6 @@ fn interface_ipv4(name: &str) -> Result<Ipv4Addr, TransportError> {
 /// Node-local monotonic clock in nanoseconds. Each node has its own epoch
 /// (first call); time-sync exchanges only differences and offsets, not a
 /// shared wall clock.
-pub fn note_monotonic_ns_placeholder() {}
-
 pub fn now_monotonic_ns() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = EPOCH.get_or_init(Instant::now);

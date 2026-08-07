@@ -5,6 +5,7 @@
 - Refactor Configfiles and Configuration
 - GUI-Diagnosetool
 - Dokumentation + Refactoring
+- Testing different error cases
 
 |================|
 |Voter Impl  	 |

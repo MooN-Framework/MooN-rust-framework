@@ -73,7 +73,13 @@ where
                     let pending = this.state.pending_rejoin().as_u8().count_ones() as u8;
                     this.state.active_count_including_self() + pending
                 };
-                if let Err(e) = this.transport.send_state(node_state, mask, ac) {
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::State {
+                        seen_mask: mask,
+                        active_count: ac,
+                    },
+                ) {
                     error!(error = ?e, "send_state failed in resync");
                     return Err(());
                 }
@@ -156,7 +162,10 @@ where
             deadline,
             Duration::from_millis(1),
             |this| {
-                if let Err(e) = this.transport.send_system_state_crc(node_state, own_crc) {
+                if let Err(e) = this
+                    .transport
+                    .send(node_state, Payload::SystemStateCrc { crc: own_crc })
+                {
                     error!(error = ?e, "send_system_state_crc failed");
                     return Err(());
                 }
@@ -214,7 +223,13 @@ where
             deadline,
             Duration::from_millis(10),
             |this| {
-                if let Err(e) = this.transport.send_state(node_state, PeerMask::EMPTY, 0) {
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::State {
+                        seen_mask: PeerMask::EMPTY,
+                        active_count: 0,
+                    },
+                ) {
                     error!(error = ?e, "send_state failed in init sync");
                     return Err(());
                 }
@@ -407,8 +422,9 @@ where
                             return Err(());
                         }
                         let adopted_crc = this.state.compute_system_state_crc();
-                        if let Err(e) = this.transport.send_system_state_snapshot_ack(
-                            node_state, adopted_crc,
+                        if let Err(e) = this.transport.send(
+                            node_state,
+                            Payload::SystemStateSnapshotAck { adopted_crc },
                         ) {
                             error!(error = ?e, "send_snapshot_ack failed");
                             return Err(());
@@ -417,8 +433,15 @@ where
                 }
             } else {
                 // Sender: broadcast snapshot.
-                if let Err(e) = this.transport.send_system_state_snapshot(
-                    node_state, nom, min, pc, cs, entries,
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::SystemStateSnapshot {
+                        nominal_participants: nom,
+                        min_participants: min,
+                        probation_cycles: pc,
+                        current_seq: cs,
+                        entries,
+                    },
                 ) {
                     error!(error = ?e, "send_snapshot failed");
                     return Err(());
@@ -516,10 +539,12 @@ where
             Duration::from_millis(1),
             |this| {
                 let mask = this.state.own_seen_mask();
-                if let Err(e) = this.transport.send_state(
+                if let Err(e) = this.transport.send(
                     node_state,
-                    mask,
-                    this.state.active_count_including_self(),
+                    Payload::State {
+                        seen_mask: mask,
+                        active_count: this.state.active_count_including_self(),
+                    },
                 ) {
                     error!(error = ?e, "send_state failed in cycle sync");
                     return Err(());
@@ -618,7 +643,7 @@ where
                 if suppress_send {
                     return Ok(());
                 }
-                if let Err(e) = this.transport.send_result(node_state, own) {
+                if let Err(e) = this.transport.send(node_state, Payload::Result(own)) {
                     error!(error = ?e, "send_result failed");
                 }
                 Ok(())
@@ -669,10 +694,14 @@ where
                 if suppress_send {
                     return Ok(());
                 }
-                if let Err(e) = this
-                    .transport
-                    .send_ack(node_state, mask, candidate, rejoin_vote)
-                {
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::Ack {
+                        received_from: mask,
+                        publisher_candidate: candidate,
+                        rejoin_vote,
+                    },
+                ) {
                     error!(error = ?e, "send_ack failed");
                 }
                 Ok(())
@@ -842,10 +871,12 @@ where
             deadline,
             Duration::from_millis(1),
             |this| {
-                if let Err(e) = this
-                    .transport
-                    .send_exclusion_proposal(node_state, own_proposal)
-                {
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::ExclusionProposal {
+                        propose_exclude: own_proposal,
+                    },
+                ) {
                     error!(error = ?e, "send_exclusion_proposal failed");
                     return Err(());
                 }

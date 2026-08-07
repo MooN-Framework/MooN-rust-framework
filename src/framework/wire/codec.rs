@@ -78,6 +78,12 @@ impl<'a> WireReader<'a> {
         self.buf.len() - self.pos
     }
 
+    /// Bytes read so far since construction. Used by frame decoders to
+    /// locate the CRC trailer without knowing the payload variant's size.
+    pub fn consumed(&self) -> usize {
+        self.pos
+    }
+
     fn take(&mut self, n: usize) -> Result<&[u8], PayloadError> {
         if self.remaining() < n {
             return Err(PayloadError::TooShort);

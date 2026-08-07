@@ -81,30 +81,27 @@ where
         }
     }
 
+    /// True when every non-Lost peer has a value in the slice this cycle.
+    fn all_non_lost_peers_have<F>(&self, mut check: F) -> bool
+    where
+        F: FnMut(usize) -> bool,
+    {
+        self.state
+            .peers()
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.health != PeerHealth::Lost)
+            .all(|(idx, _)| check(idx))
+    }
+
     /// True when every non-Lost peer has recorded a result this cycle.
     pub(super) fn all_peer_results_in(&self) -> bool {
-        for (idx, peer) in self.state.peers().iter().enumerate() {
-            if peer.health == PeerHealth::Lost {
-                continue;
-            }
-            if self.state.cycle().peer_results[idx].is_none() {
-                return false;
-            }
-        }
-        true
+        self.all_non_lost_peers_have(|idx| self.state.cycle().peer_results[idx].is_some())
     }
 
     /// True when every non-Lost peer has recorded an ack this cycle.
     pub(super) fn all_peer_acks_in(&self) -> bool {
-        for (idx, peer) in self.state.peers().iter().enumerate() {
-            if peer.health == PeerHealth::Lost {
-                continue;
-            }
-            if self.state.cycle().peer_acks[idx].is_none() {
-                return false;
-            }
-        }
-        true
+        self.all_non_lost_peers_have(|idx| self.state.cycle().peer_acks[idx].is_some())
     }
 
     /// Bitmask of peers whose result we have this cycle. Attested to peers

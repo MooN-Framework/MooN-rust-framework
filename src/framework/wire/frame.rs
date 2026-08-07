@@ -130,6 +130,135 @@ pub enum Payload<P: CyclePayload> {
     },
 }
 
+impl<P: CyclePayload> Payload<P> {
+    /// One-byte discriminator written after the header.
+    pub fn discriminator(&self) -> u8 {
+        match self {
+            Payload::State { .. } => DISC_STATE,
+            Payload::Result(_) => DISC_RESULT,
+            Payload::Ack { .. } => DISC_ACK,
+            Payload::ExclusionProposal { .. } => DISC_EXCLUSION_PROPOSAL,
+            Payload::TimeSyncReq { .. } => DISC_TIMESYNC_REQ,
+            Payload::TimeSyncResp { .. } => DISC_TIMESYNC_RESP,
+            Payload::SystemStateCrc { .. } => DISC_SYSTEM_STATE_CRC,
+            Payload::SystemStateSnapshot { .. } => DISC_SYSTEM_STATE_SNAPSHOT,
+            Payload::SystemStateSnapshotAck { .. } => DISC_SYSTEM_STATE_SNAPSHOT_ACK,
+        }
+    }
+
+    /// Serialize the payload body (everything after the discriminator).
+    /// Shared by `UdpFrame::encode` and `UdpFrame::compute_crc`.
+    pub fn write_body(&self, w: &mut WireWriter<'_>) {
+        match self {
+            Payload::State {
+                seen_mask,
+                active_count,
+            } => {
+                w.push_u8(seen_mask.as_u8());
+                w.push_u8(*active_count);
+            }
+            Payload::Result(r) => {
+                r.to_wire(w);
+            }
+            Payload::Ack {
+                received_from,
+                publisher_candidate,
+                rejoin_vote,
+            } => {
+                w.push_u8(received_from.as_u8());
+                w.push_u8(*publisher_candidate);
+                w.push_u8(rejoin_vote.as_u8());
+            }
+            Payload::ExclusionProposal { propose_exclude } => {
+                w.push_u8(propose_exclude.as_u8());
+            }
+            Payload::TimeSyncReq { t1 } => {
+                w.push_u64(*t1);
+            }
+            Payload::TimeSyncResp { t1, t2, t3 } => {
+                w.push_u64(*t1);
+                w.push_u64(*t2);
+                w.push_u64(*t3);
+            }
+            Payload::SystemStateCrc { crc } => {
+                w.push_u32(*crc);
+            }
+            Payload::SystemStateSnapshot {
+                nominal_participants,
+                min_participants,
+                probation_cycles,
+                current_seq,
+                entries,
+            } => {
+                w.push_u8(*nominal_participants);
+                w.push_u8(*min_participants);
+                w.push_u32(*probation_cycles);
+                w.push_u32(*current_seq);
+                for e in entries.iter() {
+                    w.push_bool(e.valid);
+                    w.push_u8(e.id);
+                    w.push_u8(e.health);
+                    w.push_u32(e.probation_cycles_ok);
+                }
+            }
+            Payload::SystemStateSnapshotAck { adopted_crc } => {
+                w.push_u32(*adopted_crc);
+            }
+        }
+    }
+
+    /// Deserialize the payload body given its discriminator. Callers
+    /// pass a reader positioned at the start of the body.
+    pub fn read_body(disc: u8, r: &mut WireReader<'_>) -> Result<Self, FrameError> {
+        Ok(match disc {
+            DISC_STATE => Payload::State {
+                seen_mask: PeerMask::from_u8(r.read_u8()?),
+                active_count: r.read_u8()?,
+            },
+            DISC_RESULT => Payload::Result(P::from_wire(r)?),
+            DISC_ACK => Payload::Ack {
+                received_from: PeerMask::from_u8(r.read_u8()?),
+                publisher_candidate: r.read_u8()?,
+                rejoin_vote: PeerMask::from_u8(r.read_u8()?),
+            },
+            DISC_EXCLUSION_PROPOSAL => Payload::ExclusionProposal {
+                propose_exclude: PeerMask::from_u8(r.read_u8()?),
+            },
+            DISC_TIMESYNC_REQ => Payload::TimeSyncReq { t1: r.read_u64()? },
+            DISC_TIMESYNC_RESP => Payload::TimeSyncResp {
+                t1: r.read_u64()?,
+                t2: r.read_u64()?,
+                t3: r.read_u64()?,
+            },
+            DISC_SYSTEM_STATE_CRC => Payload::SystemStateCrc { crc: r.read_u32()? },
+            DISC_SYSTEM_STATE_SNAPSHOT => {
+                let nominal_participants = r.read_u8()?;
+                let min_participants = r.read_u8()?;
+                let probation_cycles = r.read_u32()?;
+                let current_seq = r.read_u32()?;
+                let mut entries = [SnapshotEntry::default(); MAX_TOTAL_NODES];
+                for e in entries.iter_mut() {
+                    e.valid = r.read_bool()?;
+                    e.id = r.read_u8()?;
+                    e.health = r.read_u8()?;
+                    e.probation_cycles_ok = r.read_u32()?;
+                }
+                Payload::SystemStateSnapshot {
+                    nominal_participants,
+                    min_participants,
+                    probation_cycles,
+                    current_seq,
+                    entries,
+                }
+            }
+            DISC_SYSTEM_STATE_SNAPSHOT_ACK => Payload::SystemStateSnapshotAck {
+                adopted_crc: r.read_u32()?,
+            },
+            _ => return Err(FrameError::UnknownDiscriminator),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UdpFrame<P: CyclePayload> {
     node_id: u8,
@@ -159,7 +288,9 @@ impl<P: CyclePayload> UdpFrame<P> {
         HEADER_SIZE + body + CRC_SIZE
     };
 
-    fn new(
+    /// Construct a frame around any payload. The CRC is computed once at
+    /// construction and cached.
+    pub fn new(
         node_id: u8,
         session_id: u64,
         seq_num: u32,
@@ -178,190 +309,6 @@ impl<P: CyclePayload> UdpFrame<P> {
         };
         f.crc32 = f.compute_crc();
         f
-    }
-
-    pub fn state_frame(
-        node_id: u8,
-        session_id: u64,
-        seq_num: u32,
-        node_state: NodeState,
-        timestamp: u64,
-        seen_mask: PeerMask,
-        active_count: u8,
-    ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::State {
-                seen_mask,
-                active_count,
-            },
-        )
-    }
-
-    pub fn result_frame(
-        node_id: u8,
-        session_id: u64,
-        seq_num: u32,
-        node_state: NodeState,
-        timestamp: u64,
-        result: P,
-    ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::Result(result),
-        )
-    }
-
-    pub fn ack_frame(
-        node_id: u8,
-        session_id: u64,
-        seq_num: u32,
-        node_state: NodeState,
-        timestamp: u64,
-        received_from: PeerMask,
-        publisher_candidate: u8,
-        rejoin_vote: PeerMask,
-    ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::Ack {
-                received_from,
-                publisher_candidate,
-                rejoin_vote,
-            },
-        )
-    }
-
-    pub fn exclusion_proposal_frame(
-        node_id: u8,
-        session_id: u64,
-        seq_num: u32,
-        node_state: NodeState,
-        timestamp: u64,
-        propose_exclude: PeerMask,
-    ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::ExclusionProposal { propose_exclude },
-        )
-    }
-
-    pub fn time_sync_req_frame(
-        node_id: u8,
-        session_id: u64,
-        seq_num: u32,
-        node_state: NodeState,
-        timestamp: u64,
-        t1: u64,
-    ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::TimeSyncReq { t1 },
-        )
-    }
-
-    pub fn time_sync_resp_frame(
-        node_id: u8,
-        session_id: u64,
-        seq_num: u32,
-        node_state: NodeState,
-        timestamp: u64,
-        t1: u64,
-        t2: u64,
-        t3: u64,
-    ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::TimeSyncResp { t1, t2, t3 },
-        )
-    }
-
-    pub fn system_state_crc_frame(
-        node_id: u8,
-        session_id: u64,
-        seq_num: u32,
-        node_state: NodeState,
-        timestamp: u64,
-        crc: u32,
-    ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::SystemStateCrc { crc },
-        )
-    }
-
-    pub fn system_state_snapshot_frame(
-        node_id: u8,
-        session_id: u64,
-        seq_num: u32,
-        node_state: NodeState,
-        timestamp: u64,
-        nominal_participants: u8,
-        min_participants: u8,
-        probation_cycles: u32,
-        current_seq: u32,
-        entries: [SnapshotEntry; MAX_TOTAL_NODES],
-    ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::SystemStateSnapshot {
-                nominal_participants,
-                min_participants,
-                probation_cycles,
-                current_seq,
-                entries,
-            },
-        )
-    }
-
-    pub fn system_state_snapshot_ack_frame(
-        node_id: u8,
-        session_id: u64,
-        seq_num: u32,
-        node_state: NodeState,
-        timestamp: u64,
-        adopted_crc: u32,
-    ) -> Self {
-        Self::new(
-            node_id,
-            session_id,
-            seq_num,
-            node_state,
-            timestamp,
-            Payload::SystemStateSnapshotAck { adopted_crc },
-        )
     }
 
     pub fn node_id(&self) -> u8 {
@@ -391,75 +338,14 @@ impl<P: CyclePayload> UdpFrame<P> {
         h.update(&self.seq_num.to_le_bytes());
         h.update(&[self.node_state_wire]);
         h.update(&self.timestamp.to_le_bytes());
-        match &self.payload {
-            Payload::State {
-                seen_mask,
-                active_count,
-            } => {
-                h.update(&[DISC_STATE, seen_mask.as_u8(), *active_count]);
-            }
-            Payload::Result(r) => {
-                h.update(&[DISC_RESULT]);
-                let mut staging = [0u8; MAX_PAYLOAD_WIRE_SIZE];
-                {
-                    let mut w = WireWriter::new(&mut staging[..P::WIRE_SIZE]);
-                    r.to_wire(&mut w);
-                }
-                h.update(&staging[..P::WIRE_SIZE]);
-            }
-            Payload::Ack {
-                received_from,
-                publisher_candidate,
-                rejoin_vote,
-            } => {
-                h.update(&[
-                    DISC_ACK,
-                    received_from.as_u8(),
-                    *publisher_candidate,
-                    rejoin_vote.as_u8(),
-                ]);
-            }
-            Payload::ExclusionProposal { propose_exclude } => {
-                h.update(&[DISC_EXCLUSION_PROPOSAL, propose_exclude.as_u8()]);
-            }
-            Payload::TimeSyncReq { t1 } => {
-                h.update(&[DISC_TIMESYNC_REQ]);
-                h.update(&t1.to_le_bytes());
-            }
-            Payload::TimeSyncResp { t1, t2, t3 } => {
-                h.update(&[DISC_TIMESYNC_RESP]);
-                h.update(&t1.to_le_bytes());
-                h.update(&t2.to_le_bytes());
-                h.update(&t3.to_le_bytes());
-            }
-            Payload::SystemStateCrc { crc } => {
-                h.update(&[DISC_SYSTEM_STATE_CRC]);
-                h.update(&crc.to_le_bytes());
-            }
-            Payload::SystemStateSnapshot {
-                nominal_participants,
-                min_participants,
-                probation_cycles,
-                current_seq,
-                entries,
-            } => {
-                h.update(&[
-                    DISC_SYSTEM_STATE_SNAPSHOT,
-                    *nominal_participants,
-                    *min_participants,
-                ]);
-                h.update(&probation_cycles.to_le_bytes());
-                h.update(&current_seq.to_le_bytes());
-                for e in entries.iter() {
-                    h.update(&[if e.valid { 1 } else { 0 }, e.id, e.health]);
-                    h.update(&e.probation_cycles_ok.to_le_bytes());
-                }
-            }
-            Payload::SystemStateSnapshotAck { adopted_crc } => {
-                h.update(&[DISC_SYSTEM_STATE_SNAPSHOT_ACK]);
-                h.update(&adopted_crc.to_le_bytes());
-            }
-        }
+        h.update(&[self.payload.discriminator()]);
+        let mut staging = [0u8; MAX_PAYLOAD_WIRE_SIZE];
+        let n = {
+            let mut w = WireWriter::new(&mut staging);
+            self.payload.write_body(&mut w);
+            w.written()
+        };
+        h.update(&staging[..n]);
         h.finalize()
     }
 
@@ -476,75 +362,14 @@ impl<P: CyclePayload> UdpFrame<P> {
         buf.extend_from_slice(&self.seq_num.to_le_bytes());
         buf.push(self.node_state_wire);
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
-        match self.payload {
-            Payload::State {
-                seen_mask,
-                active_count,
-            } => {
-                buf.extend_from_slice(&[DISC_STATE, seen_mask.as_u8(), active_count]);
-            }
-            Payload::Result(r) => {
-                buf.push(DISC_RESULT);
-                let mut staging = [0u8; MAX_PAYLOAD_WIRE_SIZE];
-                {
-                    let mut w = WireWriter::new(&mut staging[..P::WIRE_SIZE]);
-                    r.to_wire(&mut w);
-                }
-                buf.extend_from_slice(&staging[..P::WIRE_SIZE]);
-            }
-            Payload::Ack {
-                received_from,
-                publisher_candidate,
-                rejoin_vote,
-            } => {
-                buf.extend_from_slice(&[
-                    DISC_ACK,
-                    received_from.as_u8(),
-                    publisher_candidate,
-                    rejoin_vote.as_u8(),
-                ]);
-            }
-            Payload::ExclusionProposal { propose_exclude } => {
-                buf.extend_from_slice(&[DISC_EXCLUSION_PROPOSAL, propose_exclude.as_u8()]);
-            }
-            Payload::TimeSyncReq { t1 } => {
-                buf.push(DISC_TIMESYNC_REQ);
-                buf.extend_from_slice(&t1.to_le_bytes());
-            }
-            Payload::TimeSyncResp { t1, t2, t3 } => {
-                buf.push(DISC_TIMESYNC_RESP);
-                buf.extend_from_slice(&t1.to_le_bytes());
-                buf.extend_from_slice(&t2.to_le_bytes());
-                buf.extend_from_slice(&t3.to_le_bytes());
-            }
-            Payload::SystemStateCrc { crc } => {
-                buf.push(DISC_SYSTEM_STATE_CRC);
-                buf.extend_from_slice(&crc.to_le_bytes());
-            }
-            Payload::SystemStateSnapshot {
-                nominal_participants,
-                min_participants,
-                probation_cycles,
-                current_seq,
-                entries,
-            } => {
-                buf.push(DISC_SYSTEM_STATE_SNAPSHOT);
-                buf.push(nominal_participants);
-                buf.push(min_participants);
-                buf.extend_from_slice(&probation_cycles.to_le_bytes());
-                buf.extend_from_slice(&current_seq.to_le_bytes());
-                for e in entries.iter() {
-                    buf.push(if e.valid { 1 } else { 0 });
-                    buf.push(e.id);
-                    buf.push(e.health);
-                    buf.extend_from_slice(&e.probation_cycles_ok.to_le_bytes());
-                }
-            }
-            Payload::SystemStateSnapshotAck { adopted_crc } => {
-                buf.push(DISC_SYSTEM_STATE_SNAPSHOT_ACK);
-                buf.extend_from_slice(&adopted_crc.to_le_bytes());
-            }
-        }
+        buf.push(self.payload.discriminator());
+        let mut staging = [0u8; MAX_PAYLOAD_WIRE_SIZE];
+        let n = {
+            let mut w = WireWriter::new(&mut staging);
+            self.payload.write_body(&mut w);
+            w.written()
+        };
+        buf.extend_from_slice(&staging[..n]);
         buf.extend_from_slice(&self.crc32.to_le_bytes());
         buf
     }
@@ -562,132 +387,10 @@ impl<P: CyclePayload> UdpFrame<P> {
         let timestamp = u64::from_le_bytes(bytes[14..22].try_into().unwrap());
         let disc = bytes[22];
 
-        let (payload, body_size) = match disc {
-            DISC_STATE => {
-                if bytes.len() < HEADER_SIZE + STATE_BODY + CRC_SIZE {
-                    return Err(FrameError::TooShort);
-                }
-                let seen_mask = PeerMask::from_u8(bytes[HEADER_SIZE]);
-                let active_count = bytes[HEADER_SIZE + 1];
-                (
-                    Payload::State {
-                        seen_mask,
-                        active_count,
-                    },
-                    STATE_BODY,
-                )
-            }
-            DISC_RESULT => {
-                let end = HEADER_SIZE + P::WIRE_SIZE;
-                if bytes.len() < end + CRC_SIZE {
-                    return Err(FrameError::TooShort);
-                }
-                let mut r = WireReader::new(&bytes[HEADER_SIZE..end]);
-                (Payload::Result(P::from_wire(&mut r)?), P::WIRE_SIZE)
-            }
-            DISC_ACK => {
-                if bytes.len() < HEADER_SIZE + ACK_BODY + CRC_SIZE {
-                    return Err(FrameError::TooShort);
-                }
-                (
-                    Payload::Ack {
-                        received_from: PeerMask::from_u8(bytes[HEADER_SIZE]),
-                        publisher_candidate: bytes[HEADER_SIZE + 1],
-                        rejoin_vote: PeerMask::from_u8(bytes[HEADER_SIZE + 2]),
-                    },
-                    ACK_BODY,
-                )
-            }
-            DISC_EXCLUSION_PROPOSAL => {
-                if bytes.len() < HEADER_SIZE + EXCLUSION_PROPOSAL_BODY + CRC_SIZE {
-                    return Err(FrameError::TooShort);
-                }
-                (
-                    Payload::ExclusionProposal {
-                        propose_exclude: PeerMask::from_u8(bytes[HEADER_SIZE]),
-                    },
-                    EXCLUSION_PROPOSAL_BODY,
-                )
-            }
-            DISC_TIMESYNC_REQ => {
-                let end = HEADER_SIZE + TIME_SYNC_REQ_BODY;
-                if bytes.len() < end + CRC_SIZE {
-                    return Err(FrameError::TooShort);
-                }
-                let t1 = u64::from_le_bytes(bytes[HEADER_SIZE..end].try_into().unwrap());
-                (Payload::TimeSyncReq { t1 }, TIME_SYNC_REQ_BODY)
-            }
-            DISC_TIMESYNC_RESP => {
-                let end = HEADER_SIZE + TIME_SYNC_RESP_BODY;
-                if bytes.len() < end + CRC_SIZE {
-                    return Err(FrameError::TooShort);
-                }
-                let t1 =
-                    u64::from_le_bytes(bytes[HEADER_SIZE..HEADER_SIZE + 8].try_into().unwrap());
-                let t2 = u64::from_le_bytes(
-                    bytes[HEADER_SIZE + 8..HEADER_SIZE + 16].try_into().unwrap(),
-                );
-                let t3 = u64::from_le_bytes(
-                    bytes[HEADER_SIZE + 16..HEADER_SIZE + 24]
-                        .try_into()
-                        .unwrap(),
-                );
-                (Payload::TimeSyncResp { t1, t2, t3 }, TIME_SYNC_RESP_BODY)
-            }
-            DISC_SYSTEM_STATE_CRC => {
-                let end = HEADER_SIZE + SYSTEM_STATE_CRC_BODY;
-                if bytes.len() < end + CRC_SIZE {
-                    return Err(FrameError::TooShort);
-                }
-                let crc = u32::from_le_bytes(bytes[HEADER_SIZE..end].try_into().unwrap());
-                (Payload::SystemStateCrc { crc }, SYSTEM_STATE_CRC_BODY)
-            }
-            DISC_SYSTEM_STATE_SNAPSHOT => {
-                let end = HEADER_SIZE + SYSTEM_STATE_SNAPSHOT_BODY;
-                if bytes.len() < end + CRC_SIZE {
-                    return Err(FrameError::TooShort);
-                }
-                let nominal_participants = bytes[HEADER_SIZE];
-                let min_participants = bytes[HEADER_SIZE + 1];
-                let probation_cycles =
-                    u32::from_le_bytes(bytes[HEADER_SIZE + 2..HEADER_SIZE + 6].try_into().unwrap());
-                let current_seq = u32::from_le_bytes(
-                    bytes[HEADER_SIZE + 6..HEADER_SIZE + 10].try_into().unwrap(),
-                );
-                let mut entries = [SnapshotEntry::default(); MAX_TOTAL_NODES];
-                let mut off = HEADER_SIZE + SNAPSHOT_SCALARS;
-                for e in entries.iter_mut() {
-                    e.valid = bytes[off] != 0;
-                    e.id = bytes[off + 1];
-                    e.health = bytes[off + 2];
-                    e.probation_cycles_ok =
-                        u32::from_le_bytes(bytes[off + 3..off + 7].try_into().unwrap());
-                    off += SNAPSHOT_SLOT_SIZE;
-                }
-                (
-                    Payload::SystemStateSnapshot {
-                        nominal_participants,
-                        min_participants,
-                        probation_cycles,
-                        current_seq,
-                        entries,
-                    },
-                    SYSTEM_STATE_SNAPSHOT_BODY,
-                )
-            }
-            DISC_SYSTEM_STATE_SNAPSHOT_ACK => {
-                let end = HEADER_SIZE + SYSTEM_STATE_SNAPSHOT_ACK_BODY;
-                if bytes.len() < end + CRC_SIZE {
-                    return Err(FrameError::TooShort);
-                }
-                let adopted_crc = u32::from_le_bytes(bytes[HEADER_SIZE..end].try_into().unwrap());
-                (
-                    Payload::SystemStateSnapshotAck { adopted_crc },
-                    SYSTEM_STATE_SNAPSHOT_ACK_BODY,
-                )
-            }
-            _ => return Err(FrameError::UnknownDiscriminator),
-        };
+        let body_end = bytes.len() - CRC_SIZE;
+        let mut r = WireReader::new(&bytes[HEADER_SIZE..body_end]);
+        let payload = Payload::<P>::read_body(disc, &mut r)?;
+        let body_size = r.consumed();
 
         let crc_off = HEADER_SIZE + body_size;
         if bytes.len() < crc_off + CRC_SIZE {

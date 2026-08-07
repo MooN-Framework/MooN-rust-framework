@@ -46,24 +46,17 @@ pub enum StateEvent {
     AckTimeout,
     ResultPublished,
     ResyncDue,
-
     GoResyncLostPeer,
     ResyncLostPeerTimeout,
     ResyncLostPeerOk,
-    /// Consensus reached but at least one peer diverged. Routed through
-    /// ErrorManagement so the divergent peer can be reconfigured centrally.
     DissenterDetected,
     StateOk,
     StateDiverged,
-
     CrcOk,
     CrcDivergent,
-
     SystemStateSyncOk,
     SystemStateSyncTimeout,
     SystemStateSyncMinority,
-    /// Exclusion vote timed out: at least one peer we did NOT propose to
-    /// exclude failed to reply (Rule 2b) — failsafe.
     StateTimeout,
     TooFewNodes,
     Fault,

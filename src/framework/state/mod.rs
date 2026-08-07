@@ -34,6 +34,18 @@ fn health_from_wire(w: u8) -> Result<PeerHealth, SnapshotApplyError> {
     }
 }
 
+/// Update an existing `(peer_id, value)` entry in place or append a new one.
+/// Used for `sync_snapshots` and `sync_acks` which stay unsorted and small.
+fn upsert_by_id<T, const N: usize>(vec: &mut Vec<(u8, T), N>, peer_id: u8, value: T) {
+    for entry in vec.iter_mut() {
+        if entry.0 == peer_id {
+            entry.1 = value;
+            return;
+        }
+    }
+    let _ = vec.push((peer_id, value));
+}
+
 pub fn crc_from_snapshot_fields(
     nominal: u8, min: u8, probation_cycles: u32, current_seq: u32,
     entries: &[SnapshotEntry],
@@ -145,6 +157,38 @@ sync_acks: Vec::new(),
         }
     }
 
+    /// Look up a peer's slot index if we should record data for it.
+    /// Returns `Ok(None)` when the peer is known but Lost — callers skip
+    /// the recording silently.
+    fn resolve_peer_slot(&self, peer_id: u8) -> Result<Option<usize>, DiscoveryError> {
+        let idx = self
+            .peer_index(peer_id)
+            .ok_or(DiscoveryError::UnknownPeer)?;
+        if self.roster.peers()[idx].health == PeerHealth::Lost {
+            return Ok(None);
+        }
+        Ok(Some(idx))
+    }
+
+    /// Collect ids of non-Lost peers matching `predicate`. Used by the
+    /// various `*_missing_*` methods to walk the roster once with a
+    /// per-peer test.
+    fn collect_peers_where<F>(&self, mut predicate: F) -> Vec<u8, MAX_PEERS>
+    where
+        F: FnMut(usize, &PeerInfo) -> bool,
+    {
+        let mut out: Vec<u8, MAX_PEERS> = Vec::new();
+        for (idx, peer) in self.roster.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            if predicate(idx, peer) {
+                let _ = out.push(peer.id);
+            }
+        }
+        out
+    }
+
     pub fn needs_state_sync(&self) -> bool { self.needs_state_sync }
 pub fn set_needs_state_sync(&mut self, v: bool) { self.needs_state_sync = v; }
 
@@ -154,23 +198,11 @@ pub fn reset_state_sync_evidence(&mut self) {
 }
 
 pub fn record_sync_snapshot(&mut self, peer_id: u8, snap: StoredSnapshot) {
-    for entry in self.sync_snapshots.iter_mut() {
-        if entry.0 == peer_id {
-            entry.1 = snap;
-            return;
-        }
-    }
-    let _ = self.sync_snapshots.push((peer_id, snap));
+    upsert_by_id(&mut self.sync_snapshots, peer_id, snap);
 }
 
 pub fn record_sync_ack(&mut self, peer_id: u8, adopted_crc: u32) {
-    for entry in self.sync_acks.iter_mut() {
-        if entry.0 == peer_id {
-            entry.1 = adopted_crc;
-            return;
-        }
-    }
-    let _ = self.sync_acks.push((peer_id, adopted_crc));
+    upsert_by_id(&mut self.sync_acks, peer_id, adopted_crc);
 }
 
     pub fn compute_system_state_crc(&self) -> u32 {
@@ -286,55 +318,38 @@ pub fn all_receivers_acked_with(&self, own_crc: u32, receivers: &[u8]) -> bool {
 
 /// Peers who have not yet ack'd during SystemStateSync (all non-Lost peers, filtered).
 pub fn peers_missing_sync_ack(&self) -> Vec<u8, MAX_PEERS> {
-    let mut missing: Vec<u8, MAX_PEERS> = Vec::new();
-    for peer in self.roster.peers().iter() {
-        if peer.health == PeerHealth::Lost { continue; }
-        if !self.sync_acks.iter().any(|(pid, _)| *pid == peer.id) {
-            let _ = missing.push(peer.id);
-        }
-    }
-    missing
+    self.collect_peers_where(|_, peer| {
+        !self.sync_acks.iter().any(|(pid, _)| *pid == peer.id)
+    })
 }
 
 /// Peers whose snapshot we haven't received (for receivers).
 pub fn peers_missing_snapshot(&self) -> Vec<u8, MAX_PEERS> {
-    let mut missing: Vec<u8, MAX_PEERS> = Vec::new();
-    for peer in self.roster.peers().iter() {
-        if peer.health == PeerHealth::Lost { continue; }
-        if !self.sync_snapshots.iter().any(|(pid, _)| *pid == peer.id) {
-            let _ = missing.push(peer.id);
-        }
-    }
-    missing
+    self.collect_peers_where(|_, peer| {
+        !self.sync_snapshots.iter().any(|(pid, _)| *pid == peer.id)
+    })
 }
 
     /// Log all fields that go into the system state CRC. For debugging
     /// CRC divergence — call on both nodes and diff the output.
+    ///
+    /// Draws its data from `build_snapshot` so the log stays byte-for-byte
+    /// aligned with what actually flows into the CRC hash. Health is
+    /// reported as the wire byte (0=Alive, 1=Probation, 2=Lost) so a diff
+    /// across nodes shows exactly what the hasher saw.
     pub fn log_system_state_crc_contents(&self) {
-        let own_cycles_ok = self
-            .participants
-            .probation_cycles
-            .saturating_sub(self.self_probation_remaining);
-        let own_health = if self.self_probation_remaining > 0 {
-            PeerHealth::Probation
-        } else {
-            PeerHealth::Alive
-        };
-
-        let mut entries: Vec<(u8, PeerHealth, u32), MAX_TOTAL_NODES> = Vec::new();
-        let _ = entries.push((self.own_id, own_health, own_cycles_ok));
-        for peer in self.roster.peers().iter() {
-            let _ = entries.push((peer.id, peer.health, peer.probation_cycles_ok));
+        let (nominal, min, probation_cycles, current_seq, entries) = self.build_snapshot();
+        let mut nodes: Vec<(u8, u8, u32), MAX_TOTAL_NODES> = Vec::new();
+        for e in entries.iter().filter(|e| e.valid) {
+            let _ = nodes.push((e.id, e.health, e.probation_cycles_ok));
         }
-        entries.sort_unstable_by_key(|(id, _, _)| *id);
-
         info!(
-            crc = self.compute_system_state_crc(),
-            nominal = self.participants.nominal_participants,
-            min = self.participants.min_participants,
-            probation_cycles = self.participants.probation_cycles,
-            current_seq = self.current_seq,
-            nodes = ?entries.as_slice(),
+            crc = crc_from_snapshot_fields(nominal, min, probation_cycles, current_seq, &entries),
+            nominal,
+            min,
+            probation_cycles,
+            current_seq,
+            nodes = ?nodes.as_slice(),
             "system state crc contents"
         );
     }
@@ -380,27 +395,14 @@ pub fn peers_missing_snapshot(&self) -> Vec<u8, MAX_PEERS> {
     }
 
     pub fn record_peer_crc(&mut self, peer_id: u8, crc: u32) -> Result<(), DiscoveryError> {
-        let idx = self
-            .peer_index(peer_id)
-            .ok_or(DiscoveryError::UnknownPeer)?;
-        if self.roster.peers()[idx].health == PeerHealth::Lost {
-            return Ok(());
+        if let Some(idx) = self.resolve_peer_slot(peer_id)? {
+            self.peer_crcs[idx] = Some(crc);
         }
-        self.peer_crcs[idx] = Some(crc);
         Ok(())
     }
 
     pub fn healthy_peers_missing_crc(&self) -> Vec<u8, MAX_PEERS> {
-        let mut missing: Vec<u8, MAX_PEERS> = Vec::new();
-        for (idx, peer) in self.roster.peers().iter().enumerate() {
-            if peer.health == PeerHealth::Lost {
-                continue;
-            }
-            if self.peer_crcs[idx].is_none() {
-                let _ = missing.push(peer.id);
-            }
-        }
-        missing
+        self.collect_peers_where(|idx, _| self.peer_crcs[idx].is_none())
     }
     pub fn cycle_peer_crc(&self, idx: usize) -> Option<u32> {
         self.peer_crcs.get(idx).and_then(|s| *s)
@@ -432,24 +434,16 @@ pub fn peers_missing_snapshot(&self) -> Vec<u8, MAX_PEERS> {
         peer_id: u8,
         payload: V::Payload,
     ) -> Result<(), DiscoveryError> {
-        let idx = self
-            .peer_index(peer_id)
-            .ok_or(DiscoveryError::UnknownPeer)?;
-        if self.roster.peers()[idx].health == PeerHealth::Lost {
-            return Ok(());
+        if let Some(idx) = self.resolve_peer_slot(peer_id)? {
+            self.cycle.peer_results[idx] = Some(payload);
         }
-        self.cycle.peer_results[idx] = Some(payload);
         Ok(())
     }
 
     pub fn record_peer_ack(&mut self, peer_id: u8, ack: AckInfo) -> Result<(), DiscoveryError> {
-        let idx = self
-            .peer_index(peer_id)
-            .ok_or(DiscoveryError::UnknownPeer)?;
-        if self.roster.peers()[idx].health == PeerHealth::Lost {
-            return Ok(());
+        if let Some(idx) = self.resolve_peer_slot(peer_id)? {
+            self.cycle.peer_acks[idx] = Some(ack);
         }
-        self.cycle.peer_acks[idx] = Some(ack);
         Ok(())
     }
 
@@ -549,13 +543,9 @@ pub fn peers_missing_snapshot(&self) -> Vec<u8, MAX_PEERS> {
         peer_id: u8,
         mask: PeerMask,
     ) -> Result<(), DiscoveryError> {
-        let idx = self
-            .peer_index(peer_id)
-            .ok_or(DiscoveryError::UnknownPeer)?;
-        if self.roster.peers()[idx].health == PeerHealth::Lost {
-            return Ok(());
+        if let Some(idx) = self.resolve_peer_slot(peer_id)? {
+            self.obs.peer_seen[idx] = Some(mask);
         }
-        self.obs.peer_seen[idx] = Some(mask);
         Ok(())
     }
 
@@ -609,13 +599,9 @@ pub fn peers_missing_snapshot(&self) -> Vec<u8, MAX_PEERS> {
         peer_id: u8,
         mask: PeerMask,
     ) -> Result<(), DiscoveryError> {
-        let idx = self
-            .peer_index(peer_id)
-            .ok_or(DiscoveryError::UnknownPeer)?;
-        if self.roster.peers()[idx].health == PeerHealth::Lost {
-            return Ok(());
+        if let Some(idx) = self.resolve_peer_slot(peer_id)? {
+            self.votes.proposals[idx] = Some(mask);
         }
-        self.votes.proposals[idx] = Some(mask);
         Ok(())
     }
 
@@ -655,13 +641,9 @@ pub fn peers_missing_snapshot(&self) -> Vec<u8, MAX_PEERS> {
         peer_id: u8,
         vote: PeerMask,
     ) -> Result<(), DiscoveryError> {
-        let idx = self
-            .peer_index(peer_id)
-            .ok_or(DiscoveryError::UnknownPeer)?;
-        if self.roster.peers()[idx].health == PeerHealth::Lost {
-            return Ok(());
+        if let Some(idx) = self.resolve_peer_slot(peer_id)? {
+            self.peer_rejoin_votes[idx] = Some(vote);
         }
-        self.peer_rejoin_votes[idx] = Some(vote);
         Ok(())
     }
 
@@ -688,24 +670,17 @@ pub fn peers_missing_snapshot(&self) -> Vec<u8, MAX_PEERS> {
     /// cycle, is not expected to reply.
     pub fn healthy_peers_missing_vote(&self) -> Vec<u8, MAX_PEERS> {
         let own_proposal = self.proposed_exclusions();
-        let mut missing: Vec<u8, MAX_PEERS> = Vec::new();
-        for (idx, peer) in self.roster.peers().iter().enumerate() {
-            if peer.health == PeerHealth::Lost {
-                continue;
-            }
+        self.collect_peers_where(|idx, _| {
             if own_proposal.contains(idx) {
-                continue;
+                return false;
             }
             let sent_result = self.cycle.peer_results[idx].is_some();
             let sent_ack = self.cycle.peer_acks[idx].is_some();
             if !sent_result && !sent_ack {
-                continue;
+                return false;
             }
-            if self.votes.proposals[idx].is_none() {
-                let _ = missing.push(peer.id);
-            }
-        }
-        missing
+            self.votes.proposals[idx].is_none()
+        })
     }
 
     /// Aggregate peer exclusion proposals + own vote into a confirmed mask.
