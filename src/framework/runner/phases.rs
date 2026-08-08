@@ -1,29 +1,40 @@
-use crate::framework::peer_sync::{PeerSync, SAMPLES_PER_PEER, SyncFields, extract_sync_fields};
-use crate::framework::state::PeerHealth;
-use crate::framework::state_machine::{StateEvent, SystemState, NodeState};
-use crate::framework::traits::{Computation, DecisionSink, Voter, VotingOutcome};
+use crate::framework::peer_sync::{extract_sync_fields, PeerSync, SyncFields, SAMPLES_PER_PEER};
+use crate::framework::state::{PeerHealth, StoredSnapshot, crc_from_snapshot_fields};
+use crate::framework::state_machine::{NodeState, StateEvent, SystemState};
+use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter, VotingOutcome};
 use crate::framework::transport::RecvOutcome;
 use crate::framework::types::PeerMask;
 use crate::framework::wire::Payload;
 use serde::Deserialize;
+use std::cell::Cell;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
-use std::cell::Cell;
-
 use super::PhaseOutcome;
 
-impl<C, V, S> super::Runner<C, V, S>
+impl<C, V, S, T> super::Runner<C, V, S, T>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
+    T: SelfTest,
     C::Input: for<'de> Deserialize<'de>,
 {
-    /// Startup: self-test passes unconditionally today.
+    /// Startup: delegate to the user-supplied `SelfTest`. On `Ok` the
+    /// node proceeds to `InitSync`; on `Err` it goes straight to Failsafe
+    /// via `SelfTestErr`.
     pub(super) fn handle_startup(&mut self) -> StateEvent {
         self.state.set_system_state(SystemState::Startup);
-        StateEvent::SelfTestOk
+        match self.self_test.run() {
+            Ok(()) => {
+                info!("self test passed");
+                StateEvent::SelfTestOk
+            }
+            Err(e) => {
+                error!(error = ?e, "self test failed");
+                StateEvent::SelfTestErr
+            }
+        }
     }
 
     /// Isolation: park until external intervention.
@@ -35,109 +46,181 @@ where
         }
     }
 
-pub(super) fn handle_resync_lost_node(&mut self) -> StateEvent {
-    let is_returning = self.state.was_lost();
-    info!(is_returning, "resync entered");
+    pub(super) fn handle_resync_lost_node(&mut self) -> StateEvent {
+        let is_returning = self.state.was_lost();
+        info!(is_returning, "resync entered");
 
-    let node_state = self.state.node_state();
+        let node_state = self.state.node_state();
 
-    // Healthy peer: expected size = current active + peers we're readmitting.
-    // Lost peer: unknown until we hear from someone.
-    let expected_size: Cell<Option<u8>> = Cell::new(if is_returning {
-        None
-    } else {
-        let pending = self.state.pending_rejoin().as_u8().count_ones() as u8;
-        Some(self.state.active_count_including_self() + pending)
-    });
-
-    let deadline = Instant::now() + if is_returning {
-        Duration::from_secs(30)
-    } else {
-        Duration::from_secs(5)
-    };
-
-let outcome = self.collect_phase(
-    "resync",
-    deadline,
-    Duration::from_millis(10),
-    |this| {
-        // send closure — unchanged
-        let mask = if is_returning {
-            PeerMask::EMPTY
+        // Healthy peer: expected size = current active + peers we're readmitting.
+        // Lost peer: unknown until we hear from someone.
+        let expected_size: Cell<Option<u8>> = Cell::new(if is_returning {
+            None
         } else {
-            this.state.own_seen_mask()
-        };
-        let ac = if is_returning {
-            0
-        } else {
-            let pending = this.state.pending_rejoin().as_u8().count_ones() as u8;
-            this.state.active_count_including_self() + pending
-        };
-        if let Err(e) = this.transport.send_state(node_state, mask, ac) {
-            error!(error = ?e, "send_state failed in resync");
-            return Err(());
-        }
-        Ok(())
-    },
-    |this| match expected_size.get() {
-        Some(n) => {
-            let present = if is_returning {
-                this.state.peers().len() as u8 + 1
+            let pending = self.state.pending_rejoin().as_u8().count_ones() as u8;
+            Some(self.state.active_count_including_self() + pending)
+        });
+
+        let deadline = Instant::now()
+            + if is_returning {
+                self.timing.resync_lost_peer_returning_timeout
             } else {
-                this.state.active_count_including_self()
+                self.timing.resync_lost_peer_healthy_timeout
             };
-            present >= n
-        }
-        None => false,
-    },
-    |this, frame| {
-        if frame.node_state_wire() != NodeState::ResyncLostPeer.to_wire() {
-            warn!(peer_id = frame.node_id(), "non-resync frame in resync phase, ignoring");
-            return;
-        }
-        let peer_id = frame.node_id();
 
-        if is_returning {
-            let _ = this.state.on_peer_discovered(peer_id);
-        } else if this.state.readmit_peer(peer_id) {
-            info!(peer_id, "peer readmitted");
-        }
-
-        if let Payload::State { active_count, .. } = frame.payload() {
-            if active_count > 0 && expected_size.get().is_none() {
-                expected_size.set(Some(active_count));
-                info!(size = active_count, "learned expected system size");
-            }
-        }
-    },
-);
-
-    match outcome {
-        PhaseOutcome::Complete => {
-            if is_returning {
-                if let Err(e) = self.state.finalize_discovery() {
-                    error!(error = ?e, "finalize_discovery failed");
-                    return StateEvent::SelfTestErr;
+        let outcome = self.collect_phase(
+            "resync",
+            deadline,
+            self.timing.resync_send_interval,
+            |this| {
+                // send closure — unchanged
+                let mask = if is_returning {
+                    PeerMask::EMPTY
+                } else {
+                    this.state.own_seen_mask()
+                };
+                let ac = if is_returning {
+                    0
+                } else {
+                    let pending = this.state.pending_rejoin().as_u8().count_ones() as u8;
+                    this.state.active_count_including_self() + pending
+                };
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::State {
+                        seen_mask: mask,
+                        active_count: ac,
+                    },
+                ) {
+                    error!(error = ?e, "send_state failed in resync");
+                    return Err(());
                 }
-                self.state.set_was_lost(false);
-                self.state.enter_self_probation();
-                info!("entering self probation");
+                Ok(())
+            },
+            |this| match expected_size.get() {
+                Some(n) => {
+                    let present = if is_returning {
+                        this.state.peers().len() as u8 + 1
+                    } else {
+                        this.state.active_count_including_self()
+                    };
+                    present >= n
+                }
+                None => false,
+            },
+            |this, frame| {
+                if frame.node_state_wire() != NodeState::ResyncLostPeer.to_wire() {
+                    warn!(
+                        peer_id = frame.node_id(),
+                        "non-resync frame in resync phase, ignoring"
+                    );
+                    return;
+                }
+                let peer_id = frame.node_id();
+
+                if is_returning {
+                    let _ = this.state.on_peer_discovered(peer_id);
+                } else if this.state.readmit_peer(peer_id) {
+                    info!(peer_id, "peer readmitted");
+                }
+
+                if let Payload::State { active_count, .. } = frame.payload() {
+                    if active_count > 0 && expected_size.get().is_none() {
+                        expected_size.set(Some(active_count));
+                        info!(size = active_count, "learned expected system size");
+                    }
+                }
+            },
+        );
+
+        match outcome {
+            PhaseOutcome::Complete => {
+                if is_returning {
+                    if let Err(e) = self.state.finalize_discovery() {
+                        error!(error = ?e, "finalize_discovery failed");
+                        return StateEvent::SelfTestErr;
+                    }
+                    self.state.set_was_lost(false);
+                    self.state.set_needs_state_sync(true);   // NEU: markiere für nächste Phase
+                    // enter_self_probation() ENTFÄLLT — Snapshot setzt self_probation_remaining
+                }
+                self.state.clear_pending_rejoin();
+                self.state.start_new_cycle(self.next_cycle_tick());
+                StateEvent::ResyncLostPeerOk   // statt InitialSyncOk
             }
-            self.state.start_new_cycle(self.next_cycle_tick());
-            self.state.set_system_state(SystemState::Operational);
-            StateEvent::ResyncLostPeerOk
-        }
-        PhaseOutcome::Timeout => {
-            self.state.clear_pending_rejoin();
-            warn!(is_returning, expected = ?expected_size.get(), "resync deadline exceeded");
-            StateEvent::ResyncLostPeerTimeout
-        }
-        PhaseOutcome::Fault => {
-            self.state.clear_pending_rejoin();
-            StateEvent::Fault
+            PhaseOutcome::Timeout => {
+                self.state.clear_pending_rejoin();
+                warn!(is_returning, expected = ?expected_size.get(), "resync deadline exceeded");
+                StateEvent::ResyncLostPeerTimeout
+            }
+            PhaseOutcome::Fault => {
+                self.state.clear_pending_rejoin();
+                StateEvent::Fault
+            }
         }
     }
-}
+
+    pub(super) fn handle_system_state_crc(&mut self) -> StateEvent {
+        self.state.reset_crc_evidence();
+
+        let own_crc = self.state.compute_system_state_crc();
+        let node_state = self.state.node_state();
+        let deadline = Instant::now() + self.timing.system_state_crc_timeout;
+
+        debug!(own_crc, "system state crc exchange entered");
+
+        let outcome = self.collect_phase(
+            "system_state_crc",
+            deadline,
+            self.timing.system_state_crc_send_interval,
+            |this| {
+                if let Err(e) = this
+                    .transport
+                    .send(node_state, Payload::SystemStateCrc { crc: own_crc })
+                {
+                    error!(error = ?e, "send_system_state_crc failed");
+                    return Err(());
+                }
+                Ok(())
+            },
+            |this| this.state.healthy_peers_missing_crc().is_empty(),
+            |this, frame| {
+                if let Payload::SystemStateCrc { crc } = frame.payload() {
+                    let _ = this.state.record_peer_crc(frame.node_id(), crc);
+                }
+            },
+        );
+
+        match outcome {
+            PhaseOutcome::Complete => {
+                if self.state.crc_unanimous(own_crc) {
+                    debug!(own_crc, "crc unanimous");
+                    StateEvent::CrcOk
+                } else {
+                    let picks: Vec<(u8, Option<u32>)> = self
+                        .state
+                        .peers()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, p)| {
+                            if p.health == PeerHealth::Lost {
+                                return None;
+                            }
+                            Some((p.id, self.state.cycle_peer_crc(idx)))
+                        })
+                        .collect();
+                    error!(own_crc, peer_crcs = ?picks, "crc divergence, failsafe");
+                    StateEvent::CrcDivergent
+                }
+            }
+            PhaseOutcome::Timeout => {
+                let missing = self.state.healthy_peers_missing_crc();
+                error!(missing = ?missing.as_slice(), "crc exchange timeout, failsafe");
+                StateEvent::CrcDivergent
+            }
+            PhaseOutcome::Fault => StateEvent::Fault,
+        }
+    }
 
     /// InitSync: broadcast state until the nominal peer set is discovered
     /// or the discovery window elapses.
@@ -150,9 +233,15 @@ let outcome = self.collect_phase(
         let outcome = self.collect_phase(
             "init_sync",
             deadline,
-            Duration::from_millis(10),
+            self.timing.init_sync_send_interval,
             |this| {
-                if let Err(e) = this.transport.send_state(node_state, PeerMask::EMPTY, 0) {
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::State {
+                        seen_mask: PeerMask::EMPTY,
+                        active_count: 0,
+                    },
+                ) {
                     error!(error = ?e, "send_state failed in init sync");
                     return Err(());
                 }
@@ -163,8 +252,7 @@ let outcome = self.collect_phase(
                 if frame.node_state_wire() == NodeState::InitSync.to_wire() {
                     debug!(peer_id = frame.node_id(), "init sync frame received");
                     let _ = this.state.on_peer_discovered(frame.node_id());
-                } else
-                {
+                } else {
                     warn!("Non init sync frame received, i was lost, going into resync state.");
                     this.state.set_was_lost(true);
                 }
@@ -227,7 +315,11 @@ let outcome = self.collect_phase(
             if peer_sync.is_complete() {
                 let clocks = peer_sync.finalize();
                 let epsilon = peer_sync.max_error_bound().unwrap_or(0);
-                info!(epsilon_ns = epsilon, count = clocks.len(), "peer sync complete");
+                info!(
+                    epsilon_ns = epsilon,
+                    count = clocks.len(),
+                    "peer sync complete"
+                );
                 self.state.set_peer_clocks(&clocks);
                 self.state.set_sync_epsilon(epsilon);
                 self.state.mark_sync_valid();
@@ -268,7 +360,12 @@ let outcome = self.collect_phase(
                 }
             }
 
-            if let RecvOutcome::TimeSync { frame, local_recv_ns, .. } = self.transport.try_recv() {
+            if let RecvOutcome::TimeSync {
+                frame,
+                local_recv_ns,
+                ..
+            } = self.transport.try_recv()
+            {
                 match extract_sync_fields(&frame, local_recv_ns) {
                     Some(SyncFields::Request { t1, t2_local, .. }) => {
                         if let Err(e) = self.transport.send_time_sync_resp(node_state, t1, t2_local)
@@ -276,7 +373,13 @@ let outcome = self.collect_phase(
                             warn!(error = ?e, "send_time_sync_resp failed");
                         }
                     }
-                    Some(SyncFields::Response { peer_id, t1, t2, t3, t4_local }) => {
+                    Some(SyncFields::Response {
+                        peer_id,
+                        t1,
+                        t2,
+                        t3,
+                        t4_local,
+                    }) => {
                         peer_sync.on_response(peer_id, t1, t2, t3, t4_local);
                     }
                     None => {}
@@ -285,11 +388,158 @@ let outcome = self.collect_phase(
         }
     }
 
-/// CycleSync: peers exchange State beacons with attested seen-masks
+    pub(super) fn handle_system_state_sync(&mut self) -> StateEvent {
+    let is_receiver = self.state.needs_state_sync();
+    info!(is_receiver, "system state sync entered");
+
+    self.state.reset_state_sync_evidence();
+
+    let node_state = self.state.node_state();
+    let deadline = Instant::now() + self.timing.system_state_sync_timeout;
+
+    // Sender-Rolle: eigener Snapshot bleibt konstant während der Phase.
+    // Receiver-Rolle: eigener Snapshot unbekannt bis Anwendung, nichts zu senden.
+    let (nom, min, pc, cs, entries) = self.state.build_snapshot();
+
+    // Für den Sender: Empfänger-Liste = alle non-Lost Peers (der Receiver
+    // ist einer davon; die anderen Sender ackn nicht, aber schicken auch
+    // keinen Snapshot der ein Ack erwartet, weil sie nicht Empfänger sind).
+    // Vereinfachung: wir warten auf Acks von allen non-Lost, aber
+    // ignorieren fehlende Acks von Sendern (die brauchen wir nicht).
+    // Sauberer: der Sender weiß nicht wer Empfänger ist. Er sendet einfach
+    // und wartet auf mindestens einen Ack. Bei mehreren Empfängern:
+    // Ack von jedem der needs_state_sync=true hat. Aber das weiß der
+    // Sender lokal nicht. Pragmatisch:
+    //   Sender-Abschluss = mindestens ein Ack mit passendem CRC empfangen
+    //                    UND alle non-Lost haben entweder Snapshot ODER Ack gesendet
+    //   Receiver-Abschluss = Snapshot angewandt + Ack gesendet
+    // Für den Rückkehrer-Fall (1 Empfänger, N-1 Sender) reicht: mindestens
+    // 1 Ack mit unserem CRC → wir sind Mehrheit, weiter.
+
+    let outcome = self.collect_phase(
+        "system_state_sync",
+        deadline,
+        self.timing.system_state_sync_send_interval,
+        |this| {
+            if is_receiver {
+                // Receiver: sobald wir Snapshots haben, wenden wir Mehrheit an
+                // und senden Ack. Vorher nichts.
+                if !this.state.sync_snapshots().is_empty() {
+                    if let Some((winner, _minority)) = this.state.majority_snapshot() {
+                        if let Err(e) = this.state.apply_snapshot(
+                            winner.nominal, winner.min, winner.probation_cycles,
+                            winner.current_seq, &winner.entries,
+                        ) {
+                            error!(error = ?e, "apply_snapshot failed");
+                            return Err(());
+                        }
+                        let adopted_crc = this.state.compute_system_state_crc();
+                        if let Err(e) = this.transport.send(
+                            node_state,
+                            Payload::SystemStateSnapshotAck { adopted_crc },
+                        ) {
+                            error!(error = ?e, "send_snapshot_ack failed");
+                            return Err(());
+                        }
+                    }
+                }
+            } else {
+                // Sender: broadcast snapshot.
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::SystemStateSnapshot {
+                        nominal_participants: nom,
+                        min_participants: min,
+                        probation_cycles: pc,
+                        current_seq: cs,
+                        entries,
+                    },
+                ) {
+                    error!(error = ?e, "send_snapshot failed");
+                    return Err(());
+                }
+            }
+            Ok(())
+        },
+        |this| {
+            if is_receiver {
+                // Fertig wenn wir Snapshots von allen non-Lost haben und
+                // (den Snapshot bereits angewandt haben, angezeigt durch
+                // needs_state_sync=false in apply-Erfolg — aber das setzen
+                // wir erst nach Handler-Abschluss). Alternative:
+                // Snapshot-Set komplett + kein Ausstand.
+                this.state.peers_missing_snapshot().is_empty()
+            } else {
+                // Sender: Ack von mindestens einem Peer der needs_state_sync
+                // hatte, und CRC stimmt mit unserem überein.
+                let own_crc = crc_from_snapshot_fields(nom, min, pc, cs, &entries);
+                this.state.sync_acks().iter().any(|(_, c)| *c == own_crc)
+            }
+        },
+        |this, frame| {
+            let peer_id = frame.node_id();
+            match frame.payload() {
+                Payload::SystemStateSnapshot {
+                    nominal_participants, min_participants,
+                    probation_cycles, current_seq, entries,
+                } => {
+                    let snap = StoredSnapshot {
+                        nominal: nominal_participants,
+                        min: min_participants,
+                        probation_cycles,
+                        current_seq,
+                        entries,
+                    };
+                    this.state.record_sync_snapshot(peer_id, snap);
+                }
+                Payload::SystemStateSnapshotAck { adopted_crc } => {
+                    this.state.record_sync_ack(peer_id, adopted_crc);
+                }
+                _ => {
+                    debug!(peer_id, "non-sync frame in state sync phase, dropped");
+                }
+            }
+        },
+    );
+
+    match outcome {
+        PhaseOutcome::Complete => {
+            if is_receiver {
+                self.state.set_needs_state_sync(false);
+                info!("state sync complete as receiver");
+            } else {
+                // Prüfen: wurde unser CRC von den Empfängern akzeptiert?
+                let own_crc = crc_from_snapshot_fields(nom, min, pc, cs, &entries);
+                let all_match = self.state.sync_acks().iter().all(|(_, c)| *c == own_crc);
+                if !all_match {
+                    error!(own_crc, "our snapshot was minority, failsafe");
+                    return StateEvent::SystemStateSyncMinority;
+                }
+                info!("state sync complete as sender");
+            }
+            StateEvent::SystemStateSyncOk
+        }
+        PhaseOutcome::Timeout => {
+            let missing_snap = self.state.peers_missing_snapshot();
+            let missing_ack = self.state.peers_missing_sync_ack();
+            error!(
+                missing_snap = ?missing_snap.as_slice(),
+                missing_ack = ?missing_ack.as_slice(),
+                "state sync timeout"
+            );
+            StateEvent::SystemStateSyncTimeout
+        }
+        PhaseOutcome::Fault => StateEvent::Fault,
+    }
+}
+
+    /// CycleSync: peers exchange State beacons with attested seen-masks
     /// until each side has observed all non-Lost peers, or the phase times
     /// out.
     pub(super) fn handle_cycle_sync(&mut self) -> StateEvent {
         self.state.reset_cycle_sync_evidence();
+
+        self.state.log_system_state_crc_contents();
 
         let node_state = self.state.node_state();
         let expected_mask = self.state.expected_sync_mask();
@@ -298,10 +548,16 @@ let outcome = self.collect_phase(
         let outcome = self.collect_phase(
             "cycle_sync",
             deadline,
-            Duration::from_millis(1),
+            self.timing.cycle_sync_send_interval,
             |this| {
                 let mask = this.state.own_seen_mask();
-                if let Err(e) = this.transport.send_state(node_state, mask, this.state.active_count_including_self()) {
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::State {
+                        seen_mask: mask,
+                        active_count: this.state.active_count_including_self(),
+                    },
+                ) {
                     error!(error = ?e, "send_state failed in cycle sync");
                     return Err(());
                 }
@@ -342,8 +598,11 @@ let outcome = self.collect_phase(
         }
     }
 
-    /// ReadInputs: sleep to the next cycle tick, then run the computation
-    /// on the current input.
+    /// ReadInputs: sleep to the next cycle tick, then latch the current
+    /// input into the cycle state. Actual compute is deferred until after
+    /// ShareInputs so every node has verified all peers' inputs are within
+    /// tolerance before spending the cycle on a computation that would be
+    /// discarded on divergence.
     pub(super) fn handle_read_inputs(&mut self) -> StateEvent {
         self.apply_pending_diagnostic();
         self.wait_for_next_cycle_tick();
@@ -356,10 +615,72 @@ let outcome = self.collect_phase(
         }
         self.last_cycle_start = Some(now);
 
-        match self.computation.compute(self.input) {
+        self.state.record_own_input(self.input);
+        StateEvent::InputsRead
+    }
+
+    /// ShareInputs: broadcast our sensor input until every non-Lost peer's
+    /// input has arrived. Then gate on `Computation::inputs_agree` — any
+    /// disagreement routes the cycle to ErrorManagement so the divergent
+    /// sensor can be excluded. On agreement the local computation runs
+    /// and its result is latched for ShareResult.
+    pub(super) fn handle_share_inputs(&mut self) -> StateEvent {
+        let own = match self.state.own_input() {
+            Some(i) => i,
+            None => {
+                error!("share_inputs entered without own input");
+                return StateEvent::Fault;
+            }
+        };
+
+        let deadline = Instant::now() + self.timing.share_inputs_timeout;
+        let node_state = self.state.node_state();
+
+        let outcome = self.collect_phase(
+            "share_inputs",
+            deadline,
+            self.timing.share_inputs_send_interval,
+            |this| {
+                if let Err(e) = this.transport.send(node_state, Payload::Input(own)) {
+                    error!(error = ?e, "send_input failed");
+                }
+                Ok(())
+            },
+            |this| this.all_peer_inputs_in(),
+            |this, frame| {
+                if frame.node_state_wire() == NodeState::ResyncLostPeer.to_wire() {
+                    this.state.set_rejoin_seen(frame.node_id());
+                } else {
+                    this.ingest_frame(frame);
+                }
+            },
+        );
+
+        match outcome {
+            PhaseOutcome::Timeout => {
+                warn!("share_inputs timeout");
+                return StateEvent::ShareInputsTimeout;
+            }
+            PhaseOutcome::Fault => return StateEvent::Fault,
+            PhaseOutcome::Complete => {}
+        }
+
+        // Divergence gate on collected peer inputs.
+        for (idx, slot) in self.state.peer_inputs().iter().enumerate() {
+            if let Some(peer_input) = slot {
+                if !self.computation.inputs_agree(&own, peer_input) {
+                    let peer_id = self.state.peers()[idx].id;
+                    warn!(peer_id, "input divergence detected");
+                    return StateEvent::InputsDivergent;
+                }
+            }
+        }
+
+        // All peer inputs within tolerance — run the domain computation.
+        match self.computation.compute(own) {
             Ok(payload) => {
                 self.state.record_own_result(payload);
-                StateEvent::InputsRead
+                StateEvent::InputsShared
             }
             Err(e) => {
                 error!(error = ?e, "computation failed");
@@ -368,7 +689,7 @@ let outcome = self.collect_phase(
         }
     }
 
-/// ShareResult: broadcast our result until every non-Lost peer has
+    /// ShareResult: broadcast our result until every non-Lost peer has
     /// delivered theirs.
     pub(super) fn handle_share_result(&mut self) -> StateEvent {
         let suppress_send = self
@@ -388,18 +709,18 @@ let outcome = self.collect_phase(
             }
         };
 
-        let deadline = Instant::now() + self.timing.share_timeout;
+        let deadline = Instant::now() + self.timing.share_result_timeout;
         let node_state = self.state.node_state();
 
         let outcome = self.collect_phase(
             "share_result",
             deadline,
-            Duration::from_millis(1),
+            self.timing.share_result_send_interval,
             |this| {
                 if suppress_send {
                     return Ok(());
                 }
-                if let Err(e) = this.transport.send_result(node_state, own) {
+                if let Err(e) = this.transport.send(node_state, Payload::Result(own)) {
                     error!(error = ?e, "send_result failed");
                 }
                 Ok(())
@@ -440,17 +761,24 @@ let outcome = self.collect_phase(
         let candidate = self.pick_publisher_candidate();
         let rejoin_vote = self.state.own_rejoin_vote();
         let node_state = self.state.node_state();
-        let deadline = Instant::now() + self.timing.ack_timeout;
+        let deadline = Instant::now() + self.timing.send_ack_timeout;
 
         let outcome = self.collect_phase(
             "send_ack",
             deadline,
-            Duration::from_millis(1),
+            self.timing.send_ack_send_interval,
             |this| {
                 if suppress_send {
                     return Ok(());
                 }
-                if let Err(e) = this.transport.send_ack(node_state, mask, candidate, rejoin_vote) {
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::Ack {
+                        received_from: mask,
+                        publisher_candidate: candidate,
+                        rejoin_vote,
+                    },
+                ) {
                     error!(error = ?e, "send_ack failed");
                 }
                 Ok(())
@@ -458,7 +786,9 @@ let outcome = self.collect_phase(
             |this| this.all_peer_acks_in(),
             |this, frame| {
                 if let Payload::Ack { rejoin_vote, .. } = frame.payload() {
-                    let _ = this.state.record_peer_rejoin_vote(frame.node_id(), rejoin_vote);
+                    let _ = this
+                        .state
+                        .record_peer_rejoin_vote(frame.node_id(), rejoin_vote);
                 }
                 this.ingest_frame(frame);
             },
@@ -483,105 +813,113 @@ let outcome = self.collect_phase(
     pub(super) fn handle_publish(&mut self) -> StateEvent {
         let outcome = self.state.run_vote();
         match outcome {
-VotingOutcome::Consensus(decision) => {
-    let own_pick = self.pick_publisher_candidate();
-    let publisher = match self.state.publisher_consensus(own_pick) {
-        Some(id) => id,
-        None => {
-            let picks: Vec<(u8, u8)> = self
-                .state
-                .peers()
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, p)| {
-                    if p.health == PeerHealth::Lost {
-                        return None;
+            VotingOutcome::Consensus(decision) => {
+                let own_pick = self.pick_publisher_candidate();
+                let publisher = match self.state.publisher_consensus(own_pick) {
+                    Some(id) => id,
+                    None => {
+                        let picks: Vec<(u8, u8)> = self
+                            .state
+                            .peers()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, p)| {
+                                if p.health == PeerHealth::Lost {
+                                    return None;
+                                }
+                                self.state.cycle().peer_acks[idx]
+                                    .map(|a| (p.id, a.publisher_candidate))
+                            })
+                            .collect();
+                        error!(
+                            own_id = self.state.own_id(),
+                            own_pick,
+                            peer_picks = ?picks,
+                            "publisher pick divergence, failsafe"
+                        );
+                        return StateEvent::Fault;
                     }
-                    self.state.cycle().peer_acks[idx]
-                        .map(|a| (p.id, a.publisher_candidate))
-                })
-                .collect();
-            error!(
-                own_id = self.state.own_id(),
-                own_pick,
-                peer_picks = ?picks,
-                "publisher pick divergence, failsafe"
-            );
-            return StateEvent::Fault;
-        }
-    };
-    let own_id = self.state.own_id();
+                };
+                let own_id = self.state.own_id();
 
-    let own_result = self.state.cycle().own_result;
-    let dissenter_analysis = own_result.map(|own| {
-        self.state
-            .voter()
-            .find_dissenters(&own, &self.state.cycle().peer_results, &decision)
-    });
+                let own_result = self.state.cycle().own_result;
+                let dissenter_analysis = own_result.map(|own| {
+                    self.state.voter().find_dissenters(
+                        &own,
+                        &self.state.cycle().peer_results,
+                        &decision,
+                    )
+                });
 
-    if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
-        if own_dissented {
-            error!(own_id, "own value dissented, failsafe");
-            return StateEvent::Fault;
-        }
-        if !peer_dissenter_indices.is_empty() {
-            let dissenter_ids: Vec<u8> = peer_dissenter_indices
-                .iter()
-                .filter_map(|idx| self.state.peers().get(*idx as usize).map(|p| p.id))
-                .collect();
+                if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
+                    if own_dissented {
+                        error!(own_id, "own value dissented, failsafe");
+                        return StateEvent::Fault;
+                    }
+                    if !peer_dissenter_indices.is_empty() {
+                        let dissenter_ids: Vec<u8> = peer_dissenter_indices
+                            .iter()
+                            .filter_map(|idx| self.state.peers().get(*idx as usize).map(|p| p.id))
+                            .collect();
 
-            if publisher == own_id {
-                warn!(publisher, "consensus with dissenters, publishing then reconfig");
-                self.sink.publish(&decision);
+                        if publisher == own_id {
+                            warn!(
+                                publisher,
+                                "consensus with dissenters, publishing then reconfig"
+                            );
+                            self.sink.publish(&decision);
+                        }
+                        for peer_id in dissenter_ids {
+                            warn!(peer_id, "peer value diverged from consensus");
+                            let _ = self.state.propose_exclude(peer_id);
+                        }
+                        return StateEvent::DissenterDetected;
+                    }
+                }
+
+                if publisher == own_id {
+                    info!(publisher, "consensus reached, publishing");
+                    self.sink.publish(&decision);
+                } else {
+                    debug!(publisher, own_id, "consensus reached, peer publishes");
+                }
+
+                let promoted = self.state.tick_probation();
+                if promoted > 0 {
+                    info!(promoted, "peers promoted from Probation to Alive");
+                }
+
+                let confirmed_rejoin = self.state.aggregate_rejoin_votes();
+                if confirmed_rejoin.as_u8() != 0 {
+                    warn!(
+                        rejoin_mask = confirmed_rejoin.as_u8(),
+                        "rejoin confirmed by all healthy peers, going into resync"
+                    );
+                    self.state.set_pending_rejoin(confirmed_rejoin);
+                    return StateEvent::GoResyncLostPeer;
+                }
+
+                self.cycles_since_last_sync = self.cycles_since_last_sync.saturating_add(1);
+                if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
+                    info!(
+                        cycles = self.cycles_since_last_sync,
+                        interval = self.timing.resync_interval_cycles,
+                        "resync interval reached"
+                    );
+                    StateEvent::ResyncDue
+                } else {
+                    StateEvent::ResultPublished
+                }
             }
-            for peer_id in dissenter_ids {
-                warn!(peer_id, "peer value diverged from consensus");
-                let _ = self.state.propose_exclude(peer_id);
-            }
-            return StateEvent::DissenterDetected;
-        }
-    }
-
-    if publisher == own_id {
-        info!(publisher, "consensus reached, publishing");
-        self.sink.publish(&decision);
-    } else {
-        debug!(publisher, own_id, "consensus reached, peer publishes");
-    }
-
-    let promoted = self.state.tick_probation();
-    if promoted > 0 {
-        info!(promoted, "peers promoted from Probation to Alive");
-    }
-
-    let confirmed_rejoin = self.state.aggregate_rejoin_votes();
-    if confirmed_rejoin.as_u8() != 0 {
-        warn!(
-            rejoin_mask = confirmed_rejoin.as_u8(),
-            "rejoin confirmed by all healthy peers, going into resync"
-        );
-        self.state.set_pending_rejoin(confirmed_rejoin);
-        return StateEvent::GoResyncLostPeer;
-    }
-
-    self.cycles_since_last_sync = self.cycles_since_last_sync.saturating_add(1);
-    if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
-        info!(
-            cycles = self.cycles_since_last_sync,
-            interval = self.timing.resync_interval_cycles,
-            "resync interval reached"
-        );
-        StateEvent::ResyncDue
-    } else {
-        StateEvent::ResultPublished
-    }
-}
             VotingOutcome::Disagreement => {
                 warn!("vote disagreement");
                 StateEvent::StateDiverged
             }
             VotingOutcome::InsufficientQuorum => {
-                error!(peer_results = self.state.cycle().peer_results.len(), "insufficient quorum");
+                error!(
+                    peer_results = self.state.cycle().peer_results.len(),
+                    "insufficient quorum"
+                );
                 StateEvent::Fault
             }
         }
@@ -601,16 +939,21 @@ VotingOutcome::Consensus(decision) => {
 
         let own_proposal = self.state.proposed_exclusions();
         let node_state = self.state.node_state();
-        let deadline = Instant::now() + self.timing.error_management_vote_timeout;
+        let deadline = Instant::now() + self.timing.error_management_timeout;
 
         debug!(proposed = own_proposal.as_u8(), "exclusion vote entered");
 
         let outcome = self.collect_phase(
             "exclusion_vote",
             deadline,
-            Duration::from_millis(1),
+            self.timing.error_management_send_interval,
             |this| {
-                if let Err(e) = this.transport.send_exclusion_proposal(node_state, own_proposal) {
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::ExclusionProposal {
+                        propose_exclude: own_proposal,
+                    },
+                ) {
                     error!(error = ?e, "send_exclusion_proposal failed");
                     return Err(());
                 }

@@ -14,7 +14,9 @@ pub struct ExclusionVotes {
 
 impl ExclusionVotes {
     pub const fn empty() -> Self {
-        Self { proposals: Vec::new() }
+        Self {
+            proposals: Vec::new(),
+        }
     }
 
     pub fn resize(&mut self, n: usize) {
@@ -32,12 +34,7 @@ impl ExclusionVotes {
     /// Return the mask of peers whose exclusion is confirmed by a strict
     /// majority of reporters. Rule 1a: the target's own vote is excluded
     /// from its own tally.
-    pub fn aggregate(
-        &self,
-        roster: &PeerRoster,
-        own_id: u8,
-        own_proposal: PeerMask,
-    ) -> PeerMask {
+    pub fn aggregate(&self, roster: &PeerRoster, own_id: u8, own_proposal: PeerMask) -> PeerMask {
         let mut confirmed = PeerMask::EMPTY;
         for idx in 0..roster.peers().len() {
             let target = &roster.peers()[idx];

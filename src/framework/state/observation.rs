@@ -16,7 +16,10 @@ pub struct ObservationKind {
 
 impl ObservationKind {
     pub const fn empty() -> Self {
-        Self { own_seen: PeerMask::EMPTY, peer_seen: Vec::new() }
+        Self {
+            own_seen: PeerMask::EMPTY,
+            peer_seen: Vec::new(),
+        }
     }
 
     pub fn resize(&mut self, n: usize) {
@@ -43,6 +46,7 @@ pub enum View<'a, P: CyclePayload> {
         peer_results: &'a [Option<P>],
         peer_acks: &'a [Option<AckInfo>],
     },
+    Input { peer_inputs_present: &'a [bool] },  // NEU
 }
 
 /// Compute the mask of peers this node currently attributes as missing
@@ -85,6 +89,7 @@ impl<'a, P: CyclePayload> View<'a, P> {
                 .get(target_idx)
                 .map(|r| r.is_some())
                 .unwrap_or(false),
+            View::Input { peer_inputs_present } => peer_inputs_present.get(target_idx).copied().unwrap_or(false),
         }
     }
 
@@ -94,6 +99,8 @@ impl<'a, P: CyclePayload> View<'a, P> {
             View::Result { peer_acks, .. } => peer_acks
                 .get(reporter_idx)
                 .and_then(|a| a.map(|ack| PeerMask::from_u8(ack.received_from))),
+            View::Input { .. } => None,  // Inputs carry no attested observation mask
+
         }
     }
 }
@@ -101,12 +108,15 @@ impl<'a, P: CyclePayload> View<'a, P> {
 /// True when at least one piece of evidence was recorded this phase.
 fn any_evidence<P: CyclePayload>(view: &View<'_, P>) -> bool {
     match view {
-        View::CycleSync { own_seen, peer_seen } => {
-            !own_seen.is_empty() || peer_seen.iter().any(|m| m.is_some())
-        }
-        View::Result { peer_results, peer_acks } => {
-            peer_results.iter().any(|r| r.is_some()) || peer_acks.iter().any(|a| a.is_some())
-        }
+        View::CycleSync {
+            own_seen,
+            peer_seen,
+        } => !own_seen.is_empty() || peer_seen.iter().any(|m| m.is_some()),
+        View::Result {
+            peer_results,
+            peer_acks,
+        } => peer_results.iter().any(|r| r.is_some()) || peer_acks.iter().any(|a| a.is_some()),
+        View::Input { peer_inputs_present } => peer_inputs_present.iter().any(|p| *p),
     }
 }
 

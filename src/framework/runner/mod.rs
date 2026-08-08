@@ -9,25 +9,28 @@ use crate::framework::config::{CycleTiming, DiagnosticConfig};
 use crate::framework::diagnostic::Diagnostic;
 use crate::framework::state::RunState;
 use crate::framework::state_machine::NodeState;
-use crate::framework::traits::{Computation, DecisionSink, Voter};
+use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
 use crate::framework::transport::UdpTransport;
 use serde::Deserialize;
 use std::time::Instant;
 use tracing::{debug, error, info};
 
 /// Orchestrates the per-cycle state machine over transport, state, sink,
-/// computation, and optional diagnostic. One runner instance per node.
-pub struct Runner<C, V, S>
+/// computation, self-test, and optional diagnostic. One runner instance
+/// per node.
+pub struct Runner<C, V, S, T>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
+    T: SelfTest,
 {
-    pub(super) state: RunState<V>,
-    pub(super) transport: UdpTransport<V::Payload>,
+    pub(super) state: RunState<V, C::Input>,
+    pub(super) transport: UdpTransport<C::Input, V::Payload>,
     pub(super) computation: C,
     pub(super) input: C::Input,
     pub(super) sink: S,
+    pub(super) self_test: T,
     pub(super) timing: CycleTiming,
     pub(super) last_cycle_start: Option<Instant>,
     pub(super) last_cycle_us: Option<u128>,
@@ -36,21 +39,23 @@ where
     pub(super) diagnostic: Option<Diagnostic>,
 }
 
-impl<C, V, S> Runner<C, V, S>
+impl<C, V, S, T> Runner<C, V, S, T>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
+    T: SelfTest,
     C::Input: for<'de> Deserialize<'de>,
 {
     /// Construct a runner. Attempts to bring up the diagnostic side-channel
     /// when enabled; failure is non-fatal.
     pub fn new(
-        state: RunState<V>,
-        transport: UdpTransport<V::Payload>,
+        state: RunState<V, C::Input>,
+        transport: UdpTransport<C::Input, V::Payload>,
         computation: C,
         input: C::Input,
         sink: S,
+        self_test: T,
         timing: CycleTiming,
         diag_cfg: DiagnosticConfig,
     ) -> Self {
@@ -72,6 +77,7 @@ where
             computation,
             input,
             sink,
+            self_test,
             timing,
             last_cycle_start: None,
             last_cycle_us: None,
@@ -99,12 +105,15 @@ where
                 NodeState::PeerSync => self.handle_peer_sync(),
                 NodeState::CycleSync => self.handle_cycle_sync(),
                 NodeState::ReadInputs => self.handle_read_inputs(),
+                NodeState::ShareInputs => self.handle_share_inputs(),
                 NodeState::ShareResult => self.handle_share_result(),
                 NodeState::SendAck => self.handle_send_ack(),
                 NodeState::PublishResult => self.handle_publish(),
                 NodeState::ErrorManagement => self.handle_error_management(),
                 NodeState::Isolation => self.handle_isolation(),
                 NodeState::ResyncLostPeer => self.handle_resync_lost_node(),
+                NodeState::SystemStateCrcExchange => self.handle_system_state_crc(),
+                NodeState::SystemStateSync => self.handle_system_state_sync(),
                 NodeState::Failsafe => {
                     self.enter_failsafe();
                     return;

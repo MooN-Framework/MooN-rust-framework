@@ -3,8 +3,7 @@
 use crate::framework::config::TransportConfig;
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::CyclePayload;
-use crate::framework::types::PeerMask;
-use crate::framework::wire::{FrameError, MAX_PAYLOAD_WIRE_SIZE, Payload, UdpFrame};
+use crate::framework::wire::{FrameError, Payload, UdpFrame, MAX_PAYLOAD_WIRE_SIZE};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::io;
@@ -20,9 +19,9 @@ pub const RECV_BUFFER_SIZE: usize = HEADER_SIZE + MAX_PAYLOAD_WIRE_SIZE + CRC_SI
 
 /// Classification of an incoming frame after decode + peer-cursor checks.
 #[derive(Debug)]
-pub enum RecvOutcome<P: CyclePayload> {
+pub enum RecvOutcome<I: CyclePayload, R: CyclePayload> {
     /// Well-formed frame from a known peer with the expected next seq.
-    Valid(UdpFrame<P>),
+    Valid(UdpFrame<I, R>),
     /// No frame arrived within the socket's read timeout.
     Timeout,
     /// Our own frame looped back over multicast.
@@ -34,12 +33,25 @@ pub enum RecvOutcome<P: CyclePayload> {
     /// Same or older seq than we last saw for this peer/session.
     Duplicate { peer_id: u8, seen: u32, last: u32 },
     /// Peer's session id changed — likely rebooted.
-    NewSession { peer_id: u8, previous_session: u64, new_session: u64, frame: UdpFrame<P> },
+    NewSession {
+        peer_id: u8,
+        previous_session: u64,
+        new_session: u64,
+        frame: UdpFrame<I, R>,
+    },
     /// Gap detected between last-seen and this seq.
-    SeqGap { peer_id: u8, gap: u32, frame: UdpFrame<P> },
+    SeqGap {
+        peer_id: u8,
+        gap: u32,
+        frame: UdpFrame<I, R>,
+    },
     /// Time-sync frame; bypasses seq-num classification.
     /// `local_recv_ns` is the receive timestamp (t2 or t4).
-    TimeSync { peer_id: u8, frame: UdpFrame<P>, local_recv_ns: u64 },
+    TimeSync {
+        peer_id: u8,
+        frame: UdpFrame<I, R>,
+        local_recv_ns: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -61,17 +73,17 @@ struct PeerCursor {
 }
 
 /// Multicast UDP endpoint with per-peer seq/session tracking.
-pub struct UdpTransport<P: CyclePayload> {
+pub struct UdpTransport<I: CyclePayload, R: CyclePayload> {
     socket: UdpSocket,
     group_addr: SocketAddrV4,
     self_node_id: u8,
     self_session_id: u64,
     next_seq_num: u32,
     peers: HashMap<u8, PeerCursor>,
-    _payload: core::marker::PhantomData<P>,
+    _payload: core::marker::PhantomData<(I, R)>,
 }
 
-impl<P: CyclePayload> UdpTransport<P> {
+impl<I: CyclePayload, R: CyclePayload> UdpTransport<I, R> {
     /// Bind to the multicast group on the given interface.
     pub fn new(cfg: TransportConfig) -> Result<Self, TransportError> {
         let iface_ip = interface_ipv4(&cfg.interface_name)?;
@@ -82,7 +94,10 @@ impl<P: CyclePayload> UdpTransport<P> {
         #[cfg(target_os = "linux")]
         s.bind_device(Some(cfg.interface_name.as_bytes()))?;
 
-        s.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, cfg.port)))?;
+        s.bind(&SockAddr::from(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            cfg.port,
+        )))?;
         s.join_multicast_v4(&cfg.multicast_group, &iface_ip)?;
         s.set_multicast_loop_v4(true)?;
         s.set_multicast_ttl_v4(1)?;
@@ -101,99 +116,61 @@ impl<P: CyclePayload> UdpTransport<P> {
         })
     }
 
-    /// Send a State beacon carrying the current observation mask.
-    pub fn send_state(
+    /// Wrap `payload` in a frame with the current sender identity and a
+    /// fresh monotonic timestamp, then send it. Returns the allocated seq.
+    ///
+    /// The specialised `send_time_sync_req` / `send_time_sync_resp` paths
+    /// carry timestamps that are semantically identical to the frame's
+    /// `timestamp` field and therefore build the frame directly.
+    pub fn send(
         &mut self,
         node_state: NodeState,
-        seen_mask: PeerMask,
-        active_count: u8,
+        payload: Payload<I, R>,
     ) -> Result<u32, TransportError> {
-        self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::state_frame(id, sid, seq, ns, ts, seen_mask, active_count)
-        })
-    }
-
-    /// Send the current cycle result.
-    pub fn send_result(&mut self, node_state: NodeState, result: P) -> Result<u32, TransportError> {
-        self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::result_frame(id, sid, seq, ns, ts, result)
-        })
-    }
-
-    /// Send an ack for received results plus our publisher pick.
-    /// `rejoin_vote` attests which lost peers this node endorses for
-    /// rejoin this cycle; empty mask = no endorsement.
-    pub fn send_ack(
-        &mut self,
-        node_state: NodeState,
-        received_from: PeerMask,
-        publisher_candidate: u8,
-        rejoin_vote: PeerMask,
-    ) -> Result<u32, TransportError> {
-        self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::ack_frame(id, sid, seq, ns, ts, received_from, publisher_candidate, rejoin_vote)
-        })
-    }
-
-    /// Send an exclusion vote for the ErrorManagement phase.
-    pub fn send_exclusion_proposal(
-        &mut self,
-        node_state: NodeState,
-        propose_exclude: PeerMask,
-    ) -> Result<u32, TransportError> {
-        self.send_payload(node_state, |id, sid, seq, ns, ts| {
-            UdpFrame::<P>::exclusion_proposal_frame(id, sid, seq, ns, ts, propose_exclude)
-        })
+        let ts = now_monotonic_ns();
+        self.send_at(node_state, ts, payload)
     }
 
     /// Send a Cristian request. Returns the sent seq and `t1` for
-    /// correlation.
-    pub fn send_time_sync_req(&mut self, node_state: NodeState) -> Result<(u32, u64), TransportError> {
-        let seq_marker = self.next_seq_num;
+    /// correlation. `t1` is both the frame timestamp and the payload's t1.
+    pub fn send_time_sync_req(
+        &mut self,
+        node_state: NodeState,
+    ) -> Result<(u32, u64), TransportError> {
         let t1 = now_monotonic_ns();
-        let frame = UdpFrame::<P>::time_sync_req_frame(
-            self.self_node_id,
-            self.self_session_id,
-            seq_marker,
-            node_state,
-            t1,
-            t1,
-        );
-        self.socket.send_to(&frame.encode(), self.group_addr)?;
-        Ok((seq_marker, t1))
+        let seq = self.send_at(node_state, t1, Payload::TimeSyncReq { t1 })?;
+        Ok((seq, t1))
     }
 
     /// Send a Cristian response echoing t1 and t2, with t3 taken as late
-    /// as possible.
+    /// as possible. `t3` is both the frame timestamp and the payload's t3.
     pub fn send_time_sync_resp(
         &mut self,
         node_state: NodeState,
         t1_echo: u64,
         t2_local: u64,
     ) -> Result<u32, TransportError> {
-        let seq_marker = self.next_seq_num;
         let t3 = now_monotonic_ns();
-        let frame = UdpFrame::<P>::time_sync_resp_frame(
-            self.self_node_id,
-            self.self_session_id,
-            seq_marker,
+        self.send_at(
             node_state,
             t3,
-            t1_echo,
-            t2_local,
-            t3,
-        );
-        self.socket.send_to(&frame.encode(), self.group_addr)?;
-        Ok(seq_marker)
+            Payload::TimeSyncResp {
+                t1: t1_echo,
+                t2: t2_local,
+                t3,
+            },
+        )
     }
 
     /// Blocking receive: waits until a frame arrives or the socket's read
     /// timeout fires.
-    pub fn recv(&mut self) -> RecvOutcome<P> {
+    pub fn recv(&mut self) -> RecvOutcome<I, R> {
         let mut buf = [0u8; RECV_BUFFER_SIZE];
         let (n, _) = match self.socket.recv_from(&mut buf) {
             Ok(x) => x,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
                 return RecvOutcome::Timeout;
             }
             Err(_) => return RecvOutcome::Timeout,
@@ -202,7 +179,7 @@ impl<P: CyclePayload> UdpTransport<P> {
     }
 
     /// Non-blocking receive. Returns `Timeout` if nothing is pending.
-    pub fn try_recv(&mut self) -> RecvOutcome<P> {
+    pub fn try_recv(&mut self) -> RecvOutcome<I, R> {
         if self.socket.set_nonblocking(true).is_err() {
             return RecvOutcome::Timeout;
         }
@@ -218,10 +195,13 @@ impl<P: CyclePayload> UdpTransport<P> {
     /// Accept a `NewSession` or `SeqGap` frame: update the cursor to the
     /// frame's session/seq. State machine's call to signal it took the
     /// frame after policy review.
-    pub fn accept(&mut self, frame: &UdpFrame<P>) {
+    pub fn accept(&mut self, frame: &UdpFrame<I, R>) {
         self.peers.insert(
             frame.node_id(),
-            PeerCursor { session_id: frame.session_id(), last_seq: frame.seq_num() },
+            PeerCursor {
+                session_id: frame.session_id(),
+                last_seq: frame.seq_num(),
+            },
         );
     }
 
@@ -230,23 +210,32 @@ impl<P: CyclePayload> UdpTransport<P> {
         self.peers.remove(&peer_id);
     }
 
-    /// Common send path: allocate seq, timestamp, encode, send, advance seq.
-    fn send_payload<F>(&mut self, node_state: NodeState, build: F) -> Result<u32, TransportError>
-    where
-        F: FnOnce(u8, u64, u32, NodeState, u64) -> UdpFrame<P>,
-    {
+    /// Common send path with an explicit timestamp. All public send methods
+    /// funnel through here.
+    fn send_at(
+        &mut self,
+        node_state: NodeState,
+        ts: u64,
+        payload: Payload<I, R>,
+    ) -> Result<u32, TransportError> {
         let seq = self.next_seq_num;
-        let ts = now_monotonic_ns();
-        let frame = build(self.self_node_id, self.self_session_id, seq, node_state, ts);
+        let frame = UdpFrame::<I, R>::new(
+            self.self_node_id,
+            self.self_session_id,
+            seq,
+            node_state,
+            ts,
+            payload,
+        );
         self.socket.send_to(&frame.encode(), self.group_addr)?;
         self.next_seq_num = self.next_seq_num.wrapping_add(1);
         Ok(seq)
     }
 
     /// Common decode + classification path shared by `recv` and `try_recv`.
-    fn classify_bytes(&mut self, bytes: &[u8]) -> RecvOutcome<P> {
+    fn classify_bytes(&mut self, bytes: &[u8]) -> RecvOutcome<I, R> {
         let local_recv_ns = now_monotonic_ns();
-        let frame = match UdpFrame::<P>::decode(bytes) {
+        let frame = match UdpFrame::<I, R>::decode(bytes) {
             Ok(f) => f,
             Err(FrameError::CrcMismatch) => return RecvOutcome::CrcError,
             Err(e) => return RecvOutcome::Malformed(e),
@@ -254,7 +243,10 @@ impl<P: CyclePayload> UdpTransport<P> {
         if frame.node_id() == self.self_node_id {
             return RecvOutcome::SelfLoopback;
         }
-        if matches!(frame.payload(), Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. }) {
+        if matches!(
+            frame.payload(),
+            Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. }
+        ) {
             return RecvOutcome::TimeSync {
                 peer_id: frame.node_id(),
                 frame,
@@ -265,13 +257,16 @@ impl<P: CyclePayload> UdpTransport<P> {
     }
 
     /// Session/seq classification against the peer cursor table.
-    fn classify(&mut self, frame: UdpFrame<P>) -> RecvOutcome<P> {
+    fn classify(&mut self, frame: UdpFrame<I, R>) -> RecvOutcome<I, R> {
         let peer_id = frame.node_id();
         match self.peers.get(&peer_id).copied() {
             None => {
                 self.peers.insert(
                     peer_id,
-                    PeerCursor { session_id: frame.session_id(), last_seq: frame.seq_num() },
+                    PeerCursor {
+                        session_id: frame.session_id(),
+                        last_seq: frame.seq_num(),
+                    },
                 );
                 RecvOutcome::Valid(frame)
             }
@@ -289,13 +284,20 @@ impl<P: CyclePayload> UdpTransport<P> {
             Some(cur) if frame.seq_num() == cur.last_seq + 1 => {
                 self.peers.insert(
                     peer_id,
-                    PeerCursor { session_id: frame.session_id(), last_seq: frame.seq_num() },
+                    PeerCursor {
+                        session_id: frame.session_id(),
+                        last_seq: frame.seq_num(),
+                    },
                 );
                 RecvOutcome::Valid(frame)
             }
             Some(cur) => {
                 let gap = frame.seq_num() - cur.last_seq - 1;
-                RecvOutcome::SeqGap { peer_id, gap, frame }
+                RecvOutcome::SeqGap {
+                    peer_id,
+                    gap,
+                    frame,
+                }
             }
         }
     }
@@ -316,8 +318,6 @@ fn interface_ipv4(name: &str) -> Result<Ipv4Addr, TransportError> {
 /// Node-local monotonic clock in nanoseconds. Each node has its own epoch
 /// (first call); time-sync exchanges only differences and offsets, not a
 /// shared wall clock.
-pub fn note_monotonic_ns_placeholder() {}
-
 pub fn now_monotonic_ns() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = EPOCH.get_or_init(Instant::now);

@@ -48,11 +48,18 @@ pub trait Voter {
 
 /// Domain-specific computation: raw inputs -> shareable payload.
 pub trait Computation {
-    type Input: Copy;
+    type Input: Copy + CyclePayload;
     type Payload: CyclePayload;
     type Error: fmt::Debug;
 
     fn compute(&mut self, input: Self::Input) -> Result<Self::Payload, Self::Error>;
+
+    /// Divergence gate on sensor inputs. Returns true when `own` and
+    /// `peer` are close enough to be treated as the same physical
+    /// measurement. Called during the ShareInputs phase; a returned
+    /// `false` for any non-Lost peer routes the cycle through
+    /// ErrorManagement so the divergent sensor gets excluded.
+    fn inputs_agree(&self, own: &Self::Input, peer: &Self::Input) -> bool;
 }
 
 /// Recipient of the voting decision. Called once per cycle on consensus.
@@ -60,4 +67,16 @@ pub trait DecisionSink {
     type Decision;
 
     fn publish(&mut self, decision: &Self::Decision);
+}
+
+/// Power-on self-test. Called once from the `Startup` phase before the
+/// node joins the fabric. Any `Err` routes the node straight to Failsafe.
+///
+/// Kept trivially small on purpose — a domain implementation can wire
+/// arbitrary checks (deterministic-compute vectors, sensor sanity,
+/// memory patterns, watchdog probes) behind `run`.
+pub trait SelfTest {
+    type Error: fmt::Debug;
+
+    fn run(&mut self) -> Result<(), Self::Error>;
 }

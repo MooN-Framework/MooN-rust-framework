@@ -16,6 +16,7 @@ pub enum NodeState {
     InitSync = 0x02,
     CycleSync = 0x03,
     ReadInputs = 0x04,
+    ShareInputs = 0x0E,
     ShareResult = 0x05,
     SendAck = 0x06,
     PublishResult = 0x07,
@@ -23,6 +24,8 @@ pub enum NodeState {
     Isolation = 0x09,
     PeerSync = 0x0A,
     ResyncLostPeer = 0x0B,
+    SystemStateCrcExchange = 0x0C,
+    SystemStateSync = 0x0D,
     Failsafe = 0xFF,
 }
 
@@ -38,6 +41,12 @@ pub enum StateEvent {
     CycleSyncOk,
     CycleSyncTimeout,
     InputsRead,
+    /// All non-Lost peer inputs arrived and passed the divergence gate.
+    InputsShared,
+    /// ShareInputs timed out (at least one non-Lost peer silent).
+    ShareInputsTimeout,
+    /// At least one peer input failed `Computation::inputs_agree`.
+    InputsDivergent,
     ResultShared,
     ShareResultTimeout,
     AckReceived,
@@ -53,6 +62,13 @@ pub enum StateEvent {
     DissenterDetected,
     StateOk,
     StateDiverged,
+
+    CrcOk,
+    CrcDivergent,
+
+    SystemStateSyncOk,
+    SystemStateSyncTimeout,
+    SystemStateSyncMinority,
     /// Exclusion vote timed out: at least one peer we did NOT propose to
     /// exclude failed to reply (Rule 2b) — failsafe.
     StateTimeout,
@@ -81,11 +97,19 @@ impl NodeState {
             (CycleSync, CycleSyncOk) => ReadInputs,
             (CycleSync, CycleSyncTimeout) => ErrorManagement,
 
-            (ReadInputs, InputsRead) => ShareResult,
+            (ReadInputs, InputsRead) => ShareInputs,
+
+            (ShareInputs, InputsShared) => ShareResult,
+            (ShareInputs, ShareInputsTimeout) => ErrorManagement,
+            (ShareInputs, InputsDivergent) => ErrorManagement,
+
             (ShareResult, ResultShared) => SendAck,
             (ShareResult, ShareResultTimeout) => ErrorManagement,
-            (SendAck, AckReceived) => PublishResult,
+            (SendAck, AckReceived) => SystemStateCrcExchange,
             (SendAck, AckTimeout) => ErrorManagement,
+
+            (SystemStateCrcExchange, CrcOk) => PublishResult,
+            (SystemStateCrcExchange, CrcDivergent) => ErrorManagement,
 
             (PublishResult, ResultPublished) => CycleSync,
             (PublishResult, ResyncDue) => PeerSync,
@@ -94,7 +118,11 @@ impl NodeState {
             (PublishResult, StateDiverged) => Failsafe,
 
             (ResyncLostPeer, ResyncLostPeerTimeout) => ErrorManagement,
-            (ResyncLostPeer, ResyncLostPeerOk) => PeerSync,
+            (ResyncLostPeer, ResyncLostPeerOk) => SystemStateSync,
+
+            (SystemStateSync, SystemStateSyncOk) => PeerSync,
+            (SystemStateSync, SystemStateSyncTimeout) => Isolation,
+            (SystemStateSync, SystemStateSyncMinority) => Isolation,
 
             (ErrorManagement, StateOk) => CycleSync,
             (ErrorManagement, StateDiverged) => Failsafe,
@@ -121,6 +149,7 @@ impl NodeState {
             0x02 => InitSync,
             0x03 => CycleSync,
             0x04 => ReadInputs,
+            0x0E => ShareInputs,
             0x05 => ShareResult,
             0x06 => SendAck,
             0x07 => PublishResult,
@@ -128,6 +157,8 @@ impl NodeState {
             0x09 => Isolation,
             0x0A => PeerSync,
             0x0B => ResyncLostPeer,
+            0x0C => SystemStateCrcExchange,
+            0x0D => SystemStateSync,
             0xFF => Failsafe,
             other => return Err(InvalidNodeState(other)),
         })

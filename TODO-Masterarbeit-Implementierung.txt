@@ -4,6 +4,7 @@
 - ResyncLostPeer timeouts in Config einarbeiten
 - GUI-Diagnosetool
 - Dokumentation + Refactoring
+- Off-By-One-State-Problem bei Ausfall Lösen? (Phase-Drift)
 
 |================|
 |Voter Impl  	 |
@@ -18,6 +19,11 @@
 - Node rechnet falsche Ergebnis / Verfälschtes Ergebnis durch bitflip (Voting setzt Suspect erst auf Suspect und dann Isolation)
 - Node wählt falschen Voter (Voting setzt Suspect erst auf Suspect und dann Isolation)
 
+- 1 Node fällt silent  => System rekonfiguriert und läuft weiter
+- Mehrheit fällt silent => Failsafe durch letzten alive Node
+- Node in probation fällt aus => System läuft weiter
+- Healthy node fällt in probation vom anderen node aus => System unterschreitet gesunde Größe => Failsafe
+
 |================|
 |Done	 		 |
 |================|
@@ -25,6 +31,10 @@
 - Fehlermanagement (Suspect) Synchronisierung von Fehlerzustandswechsel [X]
 - Resynchronisierung von Knoten [X]
 - Probation von Resynchroniserten Knoten für konfigurierbare zyklen zeit [X]
+- CRC-Systemstate Vergleich der Knoten [X]
+- SendSystemstate nach Reynchonisierung von LostNode [x]
+- SelfTest umfunktionieren zu trait [X]
+- InputDaten sharen und vergleichen [X]
 
 |================|
 |Fehlermanagement|

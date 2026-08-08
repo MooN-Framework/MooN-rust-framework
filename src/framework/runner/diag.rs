@@ -1,15 +1,16 @@
 use crate::framework::diagnostic::{
     Command, Diagnostic, InjectionSnapshot, OutgoingTelegram, PeerStatus, StatusResponse,
 };
-use crate::framework::traits::{Computation, DecisionSink, Voter};
+use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-impl<C, V, S> super::Runner<C, V, S>
+impl<C, V, S, T> super::Runner<C, V, S, T>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
+    T: SelfTest,
     C::Input: for<'de> Deserialize<'de>,
 {
     /// Drain incoming diagnostic telegrams. GetStatus is answered directly;

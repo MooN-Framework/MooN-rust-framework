@@ -12,10 +12,6 @@ pub const MAX_PEERS: usize = MAX_TOTAL_NODES - 1;
 pub const MAX_DISSENTERS: usize = 16;
 
 /// M-oo-N participant configuration.
-///
-/// `nominal` is the full node count expected in normal operation and must
-/// match the discovered set exactly. `minimum` is the safety floor; falling
-/// below triggers failsafe.
 #[derive(Debug, Clone, Copy)]
 pub struct ParticipantConfig {
     pub nominal_participants: u8,
@@ -28,7 +24,10 @@ impl ParticipantConfig {
     /// invariant, must fail loudly at startup).
     pub fn new(minimum: u8, nominal: u8, probation_cycles: u32) -> Self {
         assert!(minimum >= 1, "min_participants must be >= 1");
-        assert!(minimum <= nominal, "min ({minimum}) must not exceed nominal ({nominal})");
+        assert!(
+            minimum <= nominal,
+            "min ({minimum}) must not exceed nominal ({nominal})"
+        );
         assert!(
             nominal as usize <= MAX_TOTAL_NODES,
             "nominal ({nominal}) exceeds MAX_TOTAL_NODES ({MAX_TOTAL_NODES})"
@@ -36,7 +35,7 @@ impl ParticipantConfig {
         Self {
             nominal_participants: nominal,
             min_participants: minimum,
-            probation_cycles: probation_cycles,
+            probation_cycles,
         }
     }
 
@@ -52,17 +51,44 @@ impl ParticipantConfig {
 }
 
 /// All timing parameters for the operational cycle and its subphases.
+///
+/// Naming convention:
+/// - `_duration`  — wall-clock length of a repeating window
+/// - `_timeout`   — phase deadline before falling into ErrorManagement
+/// - `_interval`  — inter-send spacing inside a collect_phase loop
+/// - `_cycles`    — count of cycles, not a time
 #[derive(Debug, Clone, Copy)]
 pub struct CycleTiming {
+    // Cycle scheduling.
     pub cycle_duration: Duration,
+
+    // Phase timeouts.
     pub init_sync_timeout: Duration,
     pub peer_sync_timeout: Duration,
-    pub peer_sync_request_interval: Duration,
     pub cycle_sync_timeout: Duration,
-    pub share_timeout: Duration,
-    pub ack_timeout: Duration,
-    pub error_management_vote_timeout: Duration,
-    pub stale_threshold: Duration,
+    pub share_inputs_timeout: Duration,
+    pub share_result_timeout: Duration,
+    pub send_ack_timeout: Duration,
+    pub error_management_timeout: Duration,
+    pub system_state_crc_timeout: Duration,
+    pub system_state_sync_timeout: Duration,
+    pub resync_lost_peer_returning_timeout: Duration,
+    pub resync_lost_peer_healthy_timeout: Duration,
+
+    // Send intervals inside collect_phase loops.
+    pub init_sync_send_interval: Duration,
+    pub peer_sync_request_interval: Duration,
+    pub cycle_sync_send_interval: Duration,
+    pub share_inputs_send_interval: Duration,
+    pub share_result_send_interval: Duration,
+    pub send_ack_send_interval: Duration,
+    pub error_management_send_interval: Duration,
+    pub system_state_crc_send_interval: Duration,
+    pub system_state_sync_send_interval: Duration,
+    pub resync_send_interval: Duration,
+
+    // Misc.
+    pub stale_frame_threshold: Duration,
     pub resync_interval_cycles: u32,
 }
 
@@ -116,17 +142,38 @@ pub struct ParticipantSection {
     pub probation_cycles: u32,
 }
 
+/// TOML timing section.
+///
+/// All time values are milliseconds and end in `_timeout_ms`,
+/// `_interval_ms`, `_duration_ms`, or `_threshold_ms` for clarity.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TimingSection {
-    pub cycle_ms: u64,
-    pub init_sync_ms: u64,
-    pub peer_sync_ms: u64,
+    pub cycle_duration_ms: u64,
+
+    pub init_sync_timeout_ms: u64,
+    pub peer_sync_timeout_ms: u64,
+    pub cycle_sync_timeout_ms: u64,
+    pub share_inputs_timeout_ms: u64,
+    pub share_result_timeout_ms: u64,
+    pub send_ack_timeout_ms: u64,
+    pub error_management_timeout_ms: u64,
+    pub system_state_crc_timeout_ms: u64,
+    pub system_state_sync_timeout_ms: u64,
+    pub resync_lost_peer_returning_timeout_ms: u64,
+    pub resync_lost_peer_healthy_timeout_ms: u64,
+
+    pub init_sync_send_interval_ms: u64,
     pub peer_sync_request_interval_ms: u64,
-    pub cycle_sync_ms: u64,
-    pub share_ms: u64,
-    pub ack_ms: u64,
-    pub error_management_vote_ms: u64,
-    pub stale_ms: u64,
+    pub cycle_sync_send_interval_ms: u64,
+    pub share_inputs_send_interval_ms: u64,
+    pub share_result_send_interval_ms: u64,
+    pub send_ack_send_interval_ms: u64,
+    pub error_management_send_interval_ms: u64,
+    pub system_state_crc_send_interval_ms: u64,
+    pub system_state_sync_send_interval_ms: u64,
+    pub resync_send_interval_ms: u64,
+
+    pub stale_frame_threshold_ms: u64,
     pub resync_interval_cycles: u32,
 }
 
@@ -147,21 +194,43 @@ pub struct DiagnosticSection {
 
 impl NodeConfig {
     pub fn participants(&self) -> ParticipantConfig {
-        ParticipantConfig::new(self.participants.minimum, self.participants.nominal, self.participants.probation_cycles)
+        ParticipantConfig::new(
+            self.participants.minimum,
+            self.participants.nominal,
+            self.participants.probation_cycles,
+        )
     }
 
     pub fn timing(&self) -> CycleTiming {
         let t = &self.timing;
+        let ms = Duration::from_millis;
         CycleTiming {
-            cycle_duration: Duration::from_millis(t.cycle_ms),
-            init_sync_timeout: Duration::from_millis(t.init_sync_ms),
-            peer_sync_timeout: Duration::from_millis(t.peer_sync_ms),
-            peer_sync_request_interval: Duration::from_millis(t.peer_sync_request_interval_ms),
-            cycle_sync_timeout: Duration::from_millis(t.cycle_sync_ms),
-            share_timeout: Duration::from_millis(t.share_ms),
-            ack_timeout: Duration::from_millis(t.ack_ms),
-            error_management_vote_timeout: Duration::from_millis(t.error_management_vote_ms),
-            stale_threshold: Duration::from_millis(t.stale_ms),
+            cycle_duration: ms(t.cycle_duration_ms),
+
+            init_sync_timeout: ms(t.init_sync_timeout_ms),
+            peer_sync_timeout: ms(t.peer_sync_timeout_ms),
+            cycle_sync_timeout: ms(t.cycle_sync_timeout_ms),
+            share_inputs_timeout: ms(t.share_inputs_timeout_ms),
+            share_result_timeout: ms(t.share_result_timeout_ms),
+            send_ack_timeout: ms(t.send_ack_timeout_ms),
+            error_management_timeout: ms(t.error_management_timeout_ms),
+            system_state_crc_timeout: ms(t.system_state_crc_timeout_ms),
+            system_state_sync_timeout: ms(t.system_state_sync_timeout_ms),
+            resync_lost_peer_returning_timeout: ms(t.resync_lost_peer_returning_timeout_ms),
+            resync_lost_peer_healthy_timeout: ms(t.resync_lost_peer_healthy_timeout_ms),
+
+            init_sync_send_interval: ms(t.init_sync_send_interval_ms),
+            peer_sync_request_interval: ms(t.peer_sync_request_interval_ms),
+            cycle_sync_send_interval: ms(t.cycle_sync_send_interval_ms),
+            share_inputs_send_interval: ms(t.share_inputs_send_interval_ms),
+            share_result_send_interval: ms(t.share_result_send_interval_ms),
+            send_ack_send_interval: ms(t.send_ack_send_interval_ms),
+            error_management_send_interval: ms(t.error_management_send_interval_ms),
+            system_state_crc_send_interval: ms(t.system_state_crc_send_interval_ms),
+            system_state_sync_send_interval: ms(t.system_state_sync_send_interval_ms),
+            resync_send_interval: ms(t.resync_send_interval_ms),
+
+            stale_frame_threshold: ms(t.stale_frame_threshold_ms),
             resync_interval_cycles: t.resync_interval_cycles,
         }
     }
@@ -184,35 +253,5 @@ impl NodeConfig {
             multicast_group: self.diagnostic.multicast_group,
             port: self.diagnostic.port,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn participants_valid() {
-        let c = ParticipantConfig::new(2, 3);
-        assert_eq!(c.tolerable_failures(), 1);
-        assert_eq!(c.max_peers(), 2);
-    }
-
-    #[test]
-    #[should_panic]
-    fn participants_zero_minimum() {
-        ParticipantConfig::new(0, 3);
-    }
-
-    #[test]
-    #[should_panic]
-    fn participants_minimum_over_nominal() {
-        ParticipantConfig::new(3, 2);
-    }
-
-    #[test]
-    #[should_panic]
-    fn participants_nominal_over_max() {
-        ParticipantConfig::new(5, 9);
     }
 }

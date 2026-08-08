@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 use swb_fault_tolerance::brake::braking_curve::BrakeInput;
-use swb_fault_tolerance::brake::computation::BrakeComputation;
+use swb_fault_tolerance::brake::computation::{BrakeComputation, BrakeInputTolerance};
+use swb_fault_tolerance::brake::selftest::BrakeSelfTest;
 use swb_fault_tolerance::brake::sink::BrakeSink;
 use swb_fault_tolerance::brake::voter::BrakeVoter;
 use swb_fault_tolerance::framework::config::NodeConfig;
@@ -14,7 +15,7 @@ use swb_fault_tolerance::framework::transport::UdpTransport;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::DEBUG)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -43,9 +44,9 @@ fn main() -> ExitCode {
     let participants = cfg.participants();
 
     let voter = BrakeVoter::new(participants.min_participants, 0.5);
-    let state = RunState::<BrakeVoter>::new(own_id, session_id, voter, participants);
+    let state = RunState::<BrakeVoter, BrakeInput>::new(own_id, session_id, voter, participants);
 
-    let transport = match UdpTransport::<_>::new(cfg.transport(session_id)) {
+    let transport = match UdpTransport::<BrakeInput, _>::new(cfg.transport(session_id)) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("transport init failed: {e:?}");
@@ -53,8 +54,11 @@ fn main() -> ExitCode {
         }
     };
 
-    let computation = BrakeComputation;
+    // TODO: read tolerances from config. For now hardcoded — speed within
+    // 0.1 m/s, distance within 0.5 m of the majority.
+    let computation = BrakeComputation::new(BrakeInputTolerance::new(0.1, 0.5));
     let sink = BrakeSink::new();
+    let self_test = BrakeSelfTest::default_vectors();
     let initial_input = BrakeInput::new(1.0, 0.0, 100.0);
 
     let mut runner = Runner::new(
@@ -63,6 +67,7 @@ fn main() -> ExitCode {
         computation,
         initial_input,
         sink,
+        self_test,
         cfg.timing(),
         cfg.diagnostic(),
     );
@@ -78,7 +83,10 @@ fn parse_config_path() -> Result<PathBuf, String> {
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--config" || arg == "-c" {
-            return args.next().map(PathBuf::from).ok_or_else(|| "missing value for --config".into());
+            return args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "missing value for --config".into());
         }
         if let Some(v) = arg.strip_prefix("--config=") {
             return Ok(PathBuf::from(v));

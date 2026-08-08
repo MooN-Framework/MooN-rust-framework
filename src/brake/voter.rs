@@ -45,7 +45,10 @@ impl BrakeVoter {
             distance_tolerance >= 0.0 && distance_tolerance.is_finite(),
             "distance_tolerance must be finite and non-negative"
         );
-        Self { min_participants, distance_tolerance }
+        Self {
+            min_participants,
+            distance_tolerance,
+        }
     }
 
     /// True when both values match on both flags and their distances are

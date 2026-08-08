@@ -14,16 +14,23 @@ pub struct AckInfo {
 ///
 /// Sizes are set once at discovery finalize via `resize`; slots stay
 /// allocated for the process lifetime.
-pub struct CycleState<P: CyclePayload> {
+///
+/// `I` is the sensor input payload (shared during ShareInputs). `P` is
+/// the computation result payload (shared during ShareResult).
+pub struct CycleState<P: CyclePayload, I: CyclePayload> {
+    pub own_input: Option<I>,
+    pub peer_inputs: Vec<Option<I>, MAX_PEERS>,
     pub own_result: Option<P>,
     pub peer_results: Vec<Option<P>, MAX_PEERS>,
     pub peer_acks: Vec<Option<AckInfo>, MAX_PEERS>,
     pub phase_deadline: u64,
 }
 
-impl<P: CyclePayload> CycleState<P> {
+impl<P: CyclePayload, I: CyclePayload> CycleState<P, I> {
     pub const fn empty() -> Self {
         Self {
+            own_input: None,
+            peer_inputs: Vec::new(),
             own_result: None,
             peer_results: Vec::new(),
             peer_acks: Vec::new(),
@@ -34,6 +41,7 @@ impl<P: CyclePayload> CycleState<P> {
     /// Set the per-peer slot count. Called once at discovery finalize.
     pub fn resize(&mut self, n: usize) {
         for _ in 0..n {
+            let _ = self.peer_inputs.push(None);
             let _ = self.peer_results.push(None);
             let _ = self.peer_acks.push(None);
         }
@@ -41,7 +49,11 @@ impl<P: CyclePayload> CycleState<P> {
 
     /// Clear all per-peer slots for a new cycle.
     pub fn reset(&mut self, deadline: u64) {
+        self.own_input = None;
         self.own_result = None;
+        for slot in self.peer_inputs.iter_mut() {
+            *slot = None;
+        }
         for slot in self.peer_results.iter_mut() {
             *slot = None;
         }

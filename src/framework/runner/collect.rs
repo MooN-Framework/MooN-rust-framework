@@ -1,6 +1,6 @@
-use crate::framework::peer_sync::{SyncFields, extract_sync_fields};
+use crate::framework::peer_sync::{extract_sync_fields, SyncFields};
 use crate::framework::state::PeerHealth;
-use crate::framework::traits::{Computation, DecisionSink, Voter};
+use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
 use crate::framework::transport::RecvOutcome;
 use crate::framework::wire::UdpFrame;
 use serde::Deserialize;
@@ -17,11 +17,12 @@ pub enum PhaseOutcome {
     Fault,
 }
 
-impl<C, V, S> super::Runner<C, V, S>
+impl<C, V, S, T> super::Runner<C, V, S, T>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
+    T: SelfTest,
     C::Input: for<'de> Deserialize<'de>,
 {
     /// Generic phase driver: periodically send until the completion
@@ -39,7 +40,7 @@ where
     where
         Snd: FnMut(&mut Self) -> Result<(), ()>,
         Done: FnMut(&Self) -> bool,
-        Ing: FnMut(&mut Self, UdpFrame<V::Payload>),
+        Ing: FnMut(&mut Self, UdpFrame<C::Input, V::Payload>),
     {
         let mut next_send = Instant::now();
         loop {
@@ -64,26 +65,49 @@ where
 
             match self.transport.try_recv() {
                 RecvOutcome::Valid(frame) => ingest(self, frame),
-                RecvOutcome::SeqGap { peer_id, gap, frame } => {
+                RecvOutcome::SeqGap {
+                    peer_id,
+                    gap,
+                    frame,
+                } => {
                     warn!(peer_id, gap, "seq gap, advancing cursor");
                     self.transport.accept(&frame);
                     ingest(self, frame);
                 }
-                RecvOutcome::NewSession { peer_id, previous_session, new_session, frame } => {
+                RecvOutcome::NewSession {
+                    peer_id,
+                    previous_session,
+                    new_session,
+                    frame,
+                } => {
                     let was_lost = self
                         .state
                         .peer_index(peer_id)
                         .map(|idx| self.state.peers()[idx].health == PeerHealth::Lost)
                         .unwrap_or(false);
                     if was_lost {
-                        warn!(peer_id, previous_session, new_session, "Rejoin request from Lost peer, accepting and continuing phase");
+                        warn!(
+                            peer_id,
+                            previous_session,
+                            new_session,
+                            "Rejoin request from Lost peer, accepting and continuing phase"
+                        );
                         self.transport.accept(&frame);
-                        ingest(self, frame);                     
+                        ingest(self, frame);
                     } else {
-                        warn!(peer_id, previous_session, new_session, "Peer either rebooted mid phase or wasn't in peer list, ignoring");
+                        warn!(
+                            peer_id,
+                            previous_session,
+                            new_session,
+                            "Peer either rebooted mid phase or wasn't in peer list, ignoring"
+                        );
                     }
                 }
-                RecvOutcome::TimeSync { frame, local_recv_ns, .. } => {
+                RecvOutcome::TimeSync {
+                    frame,
+                    local_recv_ns,
+                    ..
+                } => {
                     if let Some(SyncFields::Request { t1, t2_local, .. }) =
                         extract_sync_fields(&frame, local_recv_ns)
                     {
