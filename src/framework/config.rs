@@ -53,27 +53,38 @@ impl ParticipantConfig {
 /// All timing parameters for the operational cycle and its subphases.
 ///
 /// Naming convention:
-/// - `_duration`  — wall-clock length of a repeating window
-/// - `_timeout`   — phase deadline before falling into ErrorManagement
-/// - `_interval`  — inter-send spacing inside a collect_phase loop
-/// - `_cycles`    — count of cycles, not a time
+/// - `_duration`         — wall-clock length of a repeating window
+/// - `_timeout`          — phase deadline before falling into ErrorManagement,
+///                         measured from phase entry (used for phases outside
+///                         the cycle body)
+/// - `_deadline_offset`  — phase deadline measured from the cycle anchor
+///                         (`last_cycle_start`); used for the four in-cycle
+///                         phases so that all healthy nodes see the deadline
+///                         at the same wall-clock instant regardless of
+///                         intra-node phase drift
+/// - `_interval`         — inter-send spacing inside a collect_phase loop
+/// - `_cycles`           — count of cycles, not a time
 #[derive(Debug, Clone, Copy)]
 pub struct CycleTiming {
     // Cycle scheduling.
     pub cycle_duration: Duration,
 
-    // Phase timeouts.
+    // Phase timeouts (phase-relative, used outside the cycle body).
     pub init_sync_timeout: Duration,
     pub peer_sync_timeout: Duration,
     pub cycle_sync_timeout: Duration,
-    pub share_inputs_timeout: Duration,
-    pub share_result_timeout: Duration,
-    pub send_ack_timeout: Duration,
     pub error_management_timeout: Duration,
-    pub system_state_crc_timeout: Duration,
     pub system_state_sync_timeout: Duration,
     pub resync_lost_peer_returning_timeout: Duration,
     pub resync_lost_peer_healthy_timeout: Duration,
+
+    // Cycle-anchored deadlines for the in-cycle phases. Offsets from the
+    // cycle anchor (= `last_cycle_start`, set in `handle_read_inputs`).
+    // Strictly monotonic and < `cycle_duration`.
+    pub share_inputs_deadline_offset: Duration,
+    pub share_result_deadline_offset: Duration,
+    pub send_ack_deadline_offset: Duration,
+    pub system_state_crc_deadline_offset: Duration,
 
     // Send intervals inside collect_phase loops.
     pub init_sync_send_interval: Duration,
@@ -90,6 +101,34 @@ pub struct CycleTiming {
     // Misc.
     pub stale_frame_threshold: Duration,
     pub resync_interval_cycles: u32,
+}
+
+impl CycleTiming {
+    /// Validate that the in-cycle deadline offsets are strictly monotonic
+    /// and fit inside the cycle. Call at startup — panic is intentional.
+    pub fn validate_phase_offsets(&self) {
+        let d = self.cycle_duration;
+        let si = self.share_inputs_deadline_offset;
+        let sr = self.share_result_deadline_offset;
+        let sa = self.send_ack_deadline_offset;
+        let cr = self.system_state_crc_deadline_offset;
+        assert!(
+            si < sr,
+            "share_inputs_deadline_offset ({si:?}) must precede share_result ({sr:?})"
+        );
+        assert!(
+            sr < sa,
+            "share_result_deadline_offset ({sr:?}) must precede send_ack ({sa:?})"
+        );
+        assert!(
+            sa < cr,
+            "send_ack_deadline_offset ({sa:?}) must precede system_state_crc ({cr:?})"
+        );
+        assert!(
+            cr < d,
+            "system_state_crc_deadline_offset ({cr:?}) must fit into cycle_duration ({d:?})"
+        );
+    }
 }
 
 /// UDP multicast transport binding for peer-to-peer traffic.
@@ -145,7 +184,8 @@ pub struct ParticipantSection {
 /// TOML timing section.
 ///
 /// All time values are milliseconds and end in `_timeout_ms`,
-/// `_interval_ms`, `_duration_ms`, or `_threshold_ms` for clarity.
+/// `_deadline_offset_ms`, `_interval_ms`, `_duration_ms`, or
+/// `_threshold_ms` for clarity.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TimingSection {
     pub cycle_duration_ms: u64,
@@ -153,14 +193,16 @@ pub struct TimingSection {
     pub init_sync_timeout_ms: u64,
     pub peer_sync_timeout_ms: u64,
     pub cycle_sync_timeout_ms: u64,
-    pub share_inputs_timeout_ms: u64,
-    pub share_result_timeout_ms: u64,
-    pub send_ack_timeout_ms: u64,
     pub error_management_timeout_ms: u64,
-    pub system_state_crc_timeout_ms: u64,
     pub system_state_sync_timeout_ms: u64,
     pub resync_lost_peer_returning_timeout_ms: u64,
     pub resync_lost_peer_healthy_timeout_ms: u64,
+
+    // Cycle-anchored deadlines for the in-cycle phases.
+    pub share_inputs_deadline_offset_ms: u64,
+    pub share_result_deadline_offset_ms: u64,
+    pub send_ack_deadline_offset_ms: u64,
+    pub system_state_crc_deadline_offset_ms: u64,
 
     pub init_sync_send_interval_ms: u64,
     pub peer_sync_request_interval_ms: u64,
@@ -204,20 +246,21 @@ impl NodeConfig {
     pub fn timing(&self) -> CycleTiming {
         let t = &self.timing;
         let ms = Duration::from_millis;
-        CycleTiming {
+        let ct = CycleTiming {
             cycle_duration: ms(t.cycle_duration_ms),
 
             init_sync_timeout: ms(t.init_sync_timeout_ms),
             peer_sync_timeout: ms(t.peer_sync_timeout_ms),
             cycle_sync_timeout: ms(t.cycle_sync_timeout_ms),
-            share_inputs_timeout: ms(t.share_inputs_timeout_ms),
-            share_result_timeout: ms(t.share_result_timeout_ms),
-            send_ack_timeout: ms(t.send_ack_timeout_ms),
             error_management_timeout: ms(t.error_management_timeout_ms),
-            system_state_crc_timeout: ms(t.system_state_crc_timeout_ms),
             system_state_sync_timeout: ms(t.system_state_sync_timeout_ms),
             resync_lost_peer_returning_timeout: ms(t.resync_lost_peer_returning_timeout_ms),
             resync_lost_peer_healthy_timeout: ms(t.resync_lost_peer_healthy_timeout_ms),
+
+            share_inputs_deadline_offset: ms(t.share_inputs_deadline_offset_ms),
+            share_result_deadline_offset: ms(t.share_result_deadline_offset_ms),
+            send_ack_deadline_offset: ms(t.send_ack_deadline_offset_ms),
+            system_state_crc_deadline_offset: ms(t.system_state_crc_deadline_offset_ms),
 
             init_sync_send_interval: ms(t.init_sync_send_interval_ms),
             peer_sync_request_interval: ms(t.peer_sync_request_interval_ms),
@@ -232,7 +275,9 @@ impl NodeConfig {
 
             stale_frame_threshold: ms(t.stale_frame_threshold_ms),
             resync_interval_cycles: t.resync_interval_cycles,
-        }
+        };
+        ct.validate_phase_offsets();
+        ct
     }
 
     pub fn transport(&self, self_session_id: u64) -> TransportConfig {

@@ -162,10 +162,13 @@ where
 
     pub(super) fn handle_system_state_crc(&mut self) -> StateEvent {
         self.state.reset_crc_evidence();
+        // Discard any stale rendezvous flag from the previous phase.
+        let _ = self.take_peer_in_error();
 
         let own_crc = self.state.compute_system_state_crc();
         let node_state = self.state.node_state();
-        let deadline = Instant::now() + self.timing.system_state_crc_timeout;
+        // Cycle-anchored deadline: same wall-clock instant across all nodes.
+        let deadline = self.cycle_anchor() + self.timing.system_state_crc_deadline_offset;
 
         debug!(own_crc, "system state crc exchange entered");
 
@@ -190,6 +193,17 @@ where
                 }
             },
         );
+
+        // Rendezvous: if a healthy peer reached ErrorManagement while we
+        // were still here, attribute what evidence we have from earlier
+        // phases in this cycle and follow the peer forward.
+        if self.take_peer_in_error() {
+            warn!("system_state_crc: peer already in ErrorManagement, rendezvous");
+            self.state.attribute_input_missing();
+            self.state.attribute_result_missing();
+            self.fault_peers_missing_ack_unilateral();
+            return StateEvent::PeerInError;
+        }
 
         match outcome {
             PhaseOutcome::Complete => {
@@ -603,6 +617,11 @@ where
     /// ShareInputs so every node has verified all peers' inputs are within
     /// tolerance before spending the cycle on a computation that would be
     /// discarded on divergence.
+    ///
+    /// `last_cycle_start` is set here — this is the cycle anchor used by
+    /// the in-cycle phases for their deadlines. All healthy nodes reach
+    /// this point via the CycleSync barrier, so the anchor is aligned to
+    /// within the peer-sync epsilon across the fabric.
     pub(super) fn handle_read_inputs(&mut self) -> StateEvent {
         self.apply_pending_diagnostic();
         self.wait_for_next_cycle_tick();
@@ -624,7 +643,15 @@ where
     /// disagreement routes the cycle to ErrorManagement so the divergent
     /// sensor can be excluded. On agreement the local computation runs
     /// and its result is latched for ShareResult.
+    ///
+    /// Rendezvous: if a healthy peer already advanced to ErrorManagement
+    /// (typically because its input-arrival timeout fired a few μs earlier)
+    /// we follow it forward via `PeerInError` instead of waiting for our
+    /// own deadline and going to Failsafe in isolation.
     pub(super) fn handle_share_inputs(&mut self) -> StateEvent {
+        // Discard any stale rendezvous flag from the previous phase.
+        let _ = self.take_peer_in_error();
+
         let own = match self.state.own_input() {
             Some(i) => i,
             None => {
@@ -633,7 +660,8 @@ where
             }
         };
 
-        let deadline = Instant::now() + self.timing.share_inputs_timeout;
+        // Cycle-anchored deadline.
+        let deadline = self.cycle_anchor() + self.timing.share_inputs_deadline_offset;
         let node_state = self.state.node_state();
 
         let outcome = self.collect_phase(
@@ -655,6 +683,13 @@ where
                 }
             },
         );
+
+        // Rendezvous check: did a healthy peer already reach ErrorManagement?
+        if self.take_peer_in_error() {
+            warn!("share_inputs: peer already in ErrorManagement, rendezvous");
+            self.state.attribute_input_missing();
+            return StateEvent::PeerInError;
+        }
 
         match outcome {
             PhaseOutcome::Timeout => {
@@ -691,7 +726,13 @@ where
 
     /// ShareResult: broadcast our result until every non-Lost peer has
     /// delivered theirs.
+    ///
+    /// Rendezvous: same as ShareInputs — a peer already in ErrorManagement
+    /// pulls us forward. We attribute both input- and result-phase evidence
+    /// before following.
     pub(super) fn handle_share_result(&mut self) -> StateEvent {
+        let _ = self.take_peer_in_error();
+
         let suppress_send = self
             .diagnostic
             .as_mut()
@@ -709,7 +750,7 @@ where
             }
         };
 
-        let deadline = Instant::now() + self.timing.share_result_timeout;
+        let deadline = self.cycle_anchor() + self.timing.share_result_deadline_offset;
         let node_state = self.state.node_state();
 
         let outcome = self.collect_phase(
@@ -735,6 +776,13 @@ where
             },
         );
 
+        if self.take_peer_in_error() {
+            warn!("share_result: peer already in ErrorManagement, rendezvous");
+            self.state.attribute_input_missing();
+            self.state.attribute_result_missing();
+            return StateEvent::PeerInError;
+        }
+
         match outcome {
             PhaseOutcome::Complete => StateEvent::ResultShared,
             PhaseOutcome::Timeout => {
@@ -747,7 +795,12 @@ where
 
     /// SendAck: broadcast our attested received-mask, publisher pick, and
     /// rejoin vote until every non-Lost peer has done the same.
+    ///
+    /// Rendezvous: as in the earlier phases, we follow a peer already in
+    /// ErrorManagement and attribute what we have from all cycle buffers.
     pub(super) fn handle_send_ack(&mut self) -> StateEvent {
+        let _ = self.take_peer_in_error();
+
         let suppress_send = self
             .diagnostic
             .as_mut()
@@ -761,7 +814,7 @@ where
         let candidate = self.pick_publisher_candidate();
         let rejoin_vote = self.state.own_rejoin_vote();
         let node_state = self.state.node_state();
-        let deadline = Instant::now() + self.timing.send_ack_timeout;
+        let deadline = self.cycle_anchor() + self.timing.send_ack_deadline_offset;
 
         let outcome = self.collect_phase(
             "send_ack",
@@ -793,6 +846,14 @@ where
                 this.ingest_frame(frame);
             },
         );
+
+        if self.take_peer_in_error() {
+            warn!("send_ack: peer already in ErrorManagement, rendezvous");
+            self.state.attribute_input_missing();
+            self.state.attribute_result_missing();
+            self.fault_peers_missing_ack_unilateral();
+            return StateEvent::PeerInError;
+        }
 
         match outcome {
             PhaseOutcome::Complete => {
@@ -936,6 +997,10 @@ where
     ///   third witness, both mean stop.
     pub(super) fn handle_error_management(&mut self) -> StateEvent {
         self.state.reset_exclusion_proposals();
+        // Clear the rendezvous flag: we are already here, further EM
+        // frames from peers are expected and shouldn't be treated as a
+        // rendezvous signal on the next in-cycle phase.
+        let _ = self.take_peer_in_error();
 
         let own_proposal = self.state.proposed_exclusions();
         let node_state = self.state.node_state();
@@ -962,6 +1027,10 @@ where
             |this| this.state.healthy_peers_missing_vote().is_empty(),
             |this, frame| this.ingest_frame(frame),
         );
+
+        // Any rendezvous flag raised during EM itself is not meaningful —
+        // we're already in EM. Consume and discard.
+        let _ = self.take_peer_in_error();
 
         match outcome {
             PhaseOutcome::Complete => {

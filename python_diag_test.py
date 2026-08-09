@@ -160,13 +160,60 @@ def build_telegram(args):
     raise ValueError(f"unknown command: {cmd}")
 
 
+def build_silent_telegrams(node_id, count):
+    """
+    'Silent'-Injection: der Zielnode sendet weiterhin Input, danach aber
+    weder Result noch Ack fuer `count` Cycles. Das simuliert einen stillen
+    Ausfall mitten im Cycle und triggert den Rendezvous-Pfad (PeerInError)
+    auf den beiden gesunden Peers.
+
+    Zwei einzelne Telegramme; Rust-seitig staged Diagnostic beide beim
+    naechsten Cycle-Boundary gemeinsam, sodass sie im selben Cycle
+    aktiv werden.
+    """
+    return [
+        {
+            "type": "command",
+            "targets": [node_id],
+            "cmd": "inject_drop_results",
+            "count": count,
+        },
+        {
+            "type": "command",
+            "targets": [node_id],
+            "cmd": "inject_drop_acks",
+            "count": count,
+        },
+    ]
+
+
 def default_expected(cmd):
     """Sinnvolle Defaults, wenn --expect nicht gesetzt wurde."""
-    if cmd in ("status", "drop-results", "drop-acks", "clear"):
+    if cmd in ("status", "drop-results", "drop-acks", "clear", "silent"):
         return 1  # gerichtet an einen Node
     if cmd == "set-input":
         return 3  # broadcast an alle
     return 1
+
+
+def run_silent(sock, args):
+    """
+    Silent-Injection: zwei Telegramme nacheinander an denselben Node.
+    Wartet nach jedem auf ein Staged-Ack, damit sichergestellt ist,
+    dass beide Kommandos vom Rust-Node auch angenommen wurden.
+    """
+    telegrams = build_silent_telegrams(args.node_id, args.count)
+    for i, tel in enumerate(telegrams, start=1):
+        print(f"--- silent step {i}/{len(telegrams)} ---")
+        ok = send_and_wait(
+            sock, tel, expected_count=1,
+            overall_timeout=args.timeout,
+        )
+        if not ok:
+            print(f"--- silent step {i} nicht bestaetigt, abbruch ---")
+            return False
+    print(f"--- silent aktiviert fuer node {args.node_id}, {args.count} cycles ---")
+    return True
 
 
 def main():
@@ -194,6 +241,15 @@ def main():
     p_drop_a.add_argument("node_id", type=int)
     p_drop_a.add_argument("count", type=int)
 
+    p_silent = subs.add_parser(
+        "silent",
+        help="Stiller Ausfall mid-cycle: droppt Result UND Ack fuer N Cycles "
+             "(Kombination aus drop-results + drop-acks). Testet den "
+             "Rendezvous-Pfad in der 2oo3-Konfiguration.",
+    )
+    p_silent.add_argument("node_id", type=int)
+    p_silent.add_argument("count", type=int)
+
     p_clear = subs.add_parser("clear", help="Injection loeschen")
     p_clear.add_argument("node_id", type=int)
 
@@ -204,6 +260,13 @@ def main():
 
     args = parser.parse_args()
 
+    sock = make_socket()
+
+    # Silent laeuft ueber zwei Telegramme, daher eigener Pfad.
+    if args.cmd == "silent":
+        ok = run_silent(sock, args)
+        sys.exit(0 if ok else 1)
+
     try:
         telegram = build_telegram(args)
     except ValueError as e:
@@ -212,7 +275,6 @@ def main():
 
     expected = args.expect if args.expect is not None else default_expected(args.cmd)
 
-    sock = make_socket()
     print(f"--- send loop, warte auf {expected} Antwort(en) ---")
     ok = send_and_wait(sock, telegram, expected_count=expected,
                        overall_timeout=args.timeout)

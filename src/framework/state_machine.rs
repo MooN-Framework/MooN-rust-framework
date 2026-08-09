@@ -74,6 +74,13 @@ pub enum StateEvent {
     StateTimeout,
     TooFewNodes,
     Fault,
+
+    /// A healthy peer's frame carried a `node_state` of `ErrorManagement`
+    /// while we were still in an earlier in-cycle phase. Rendezvous rule:
+    /// follow the peer forward so both healthy nodes reach the exclusion
+    /// vote in the same cycle, instead of both timing out in different
+    /// phases and going into Failsafe independently.
+    PeerInError,
 }
 
 impl NodeState {
@@ -102,14 +109,19 @@ impl NodeState {
             (ShareInputs, InputsShared) => ShareResult,
             (ShareInputs, ShareInputsTimeout) => ErrorManagement,
             (ShareInputs, InputsDivergent) => ErrorManagement,
+            (ShareInputs, PeerInError) => ErrorManagement,
 
             (ShareResult, ResultShared) => SendAck,
             (ShareResult, ShareResultTimeout) => ErrorManagement,
+            (ShareResult, PeerInError) => ErrorManagement,
+
             (SendAck, AckReceived) => SystemStateCrcExchange,
             (SendAck, AckTimeout) => ErrorManagement,
+            (SendAck, PeerInError) => ErrorManagement,
 
             (SystemStateCrcExchange, CrcOk) => PublishResult,
             (SystemStateCrcExchange, CrcDivergent) => ErrorManagement,
+            (SystemStateCrcExchange, PeerInError) => ErrorManagement,
 
             (PublishResult, ResultPublished) => CycleSync,
             (PublishResult, ResyncDue) => PeerSync,

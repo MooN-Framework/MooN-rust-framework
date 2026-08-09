@@ -1,4 +1,5 @@
 use crate::framework::state::{AckInfo, PeerHealth};
+use crate::framework::state_machine::NodeState;
 use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
 use crate::framework::transport::now_monotonic_ns;
 use crate::framework::types::PeerMask;
@@ -16,6 +17,10 @@ where
 {
     /// Route a validated frame into `RunState`. Drops frames from unknown
     /// or lost peers and stale frames (post time-sync).
+    ///
+    /// Also detects the rendezvous condition: a frame from a healthy peer
+    /// whose header carries `node_state == ErrorManagement`. The flag is
+    /// consumed by the four in-cycle phase handlers.
     pub(super) fn ingest_frame(&mut self, frame: UdpFrame<C::Input, V::Payload>) {
         let peer_id = frame.node_id();
 
@@ -32,6 +37,14 @@ where
         if let Some(age) = self.frame_age_if_stale(&frame) {
             debug!(peer_id, age_ns = age, "stale frame dropped");
             return;
+        }
+
+        // Rendezvous detection: healthy peer already in ErrorManagement.
+        // Health check re-uses the checks above — if we got here the peer
+        // exists and is non-Lost.
+        if frame.node_state_wire() == NodeState::ErrorManagement.to_wire() {
+            debug!(peer_id, "peer in ErrorManagement, rendezvous flag raised");
+            self.peer_in_error_seen = true;
         }
 
         match frame.payload() {

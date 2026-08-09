@@ -37,6 +37,10 @@ where
     pub(super) next_cycle_deadline: Option<Instant>,
     pub(super) cycles_since_last_sync: u32,
     pub(super) diagnostic: Option<Diagnostic>,
+    /// Rendezvous flag: set by ingest paths when a healthy peer's frame
+    /// arrives with `node_state == ErrorManagement`. Read + cleared by
+    /// the in-cycle phase handlers via `take_peer_in_error`.
+    pub(super) peer_in_error_seen: bool,
 }
 
 impl<C, V, S, T> Runner<C, V, S, T>
@@ -84,12 +88,29 @@ where
             next_cycle_deadline: None,
             cycles_since_last_sync: 0,
             diagnostic,
+            peer_in_error_seen: false,
         }
     }
 
     /// Overwrite the runtime input, bypassing diagnostic staging.
     pub fn set_input(&mut self, input: C::Input) {
         self.input = input;
+    }
+
+    /// Cycle-global deadline anchor. Falls back to `Instant::now()` for
+    /// the first cycle before `handle_read_inputs` has set `last_cycle_start`.
+    #[inline]
+    pub(super) fn cycle_anchor(&self) -> Instant {
+        self.last_cycle_start.unwrap_or_else(Instant::now)
+    }
+
+    /// Read + clear the rendezvous flag. Callers use this at the entry of
+    /// an in-cycle phase to discard a stale flag from a previous phase,
+    /// and again before the phase returns to check whether a peer has
+    /// entered ErrorManagement during this phase.
+    #[inline]
+    pub(super) fn take_peer_in_error(&mut self) -> bool {
+        core::mem::replace(&mut self.peer_in_error_seen, false)
     }
 
     /// Main loop. Returns once the node enters `Failsafe`.

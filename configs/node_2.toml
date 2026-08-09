@@ -8,31 +8,35 @@ probation_cycles = 10
 [timing]
 cycle_duration_ms  = 2000
 # Phase timeouts.
-init_sync_timeout_ms = 10000
-peer_sync_timeout_ms = 500
-cycle_sync_timeout_ms = 50
-share_inputs_timeout_ms = 50
-share_result_timeout_ms = 50
-send_ack_timeout_ms = 50
-error_management_timeout_ms = 50
-system_state_crc_timeout_ms = 50
-system_state_sync_timeout_ms = 50
-resync_lost_peer_returning_timeout_ms = 30000
-resync_lost_peer_healthy_timeout_ms = 5000
-# Send intervals inside collect_phase loops.
-init_sync_send_interval_ms = 10
-peer_sync_request_interval_ms = 1
-cycle_sync_send_interval_ms = 1
-share_inputs_send_interval_ms = 1
-share_result_send_interval_ms = 1
-send_ack_send_interval_ms = 1
-error_management_send_interval_ms = 1
-system_state_crc_send_interval_ms = 1
-system_state_sync_send_interval_ms = 5
-resync_send_interval_ms = 10
-# Misc.
+share_inputs_deadline_offset_ms     = 5
+share_result_deadline_offset_ms     = 10
+send_ack_deadline_offset_ms         = 14
+system_state_crc_deadline_offset_ms = 17
+# ---- Phase-relative timeouts (outside the cycle body) ----
+init_sync_timeout_ms                     = 10000
+peer_sync_timeout_ms                     = 500
+cycle_sync_timeout_ms                    = 10
+error_management_timeout_ms              = 20
+system_state_sync_timeout_ms             = 500
+resync_lost_peer_returning_timeout_ms    = 5000
+resync_lost_peer_healthy_timeout_ms      = 500
+# ---- Send intervals inside collect_phase loops ----
+# Must be shorter than the corresponding timeout/deadline offset.
+init_sync_send_interval_ms          = 50
+peer_sync_request_interval_ms       = 20
+cycle_sync_send_interval_ms         = 2
+share_inputs_send_interval_ms       = 1
+share_result_send_interval_ms       = 1
+send_ack_send_interval_ms           = 1
+error_management_send_interval_ms   = 2
+system_state_crc_send_interval_ms   = 1
+system_state_sync_send_interval_ms  = 20
+resync_send_interval_ms             = 50
+# ---- Misc ----
+# Drop frames older than this once time sync is valid.
 stale_frame_threshold_ms = 50
-resync_interval_cycles = 30
+# Trigger a PeerSync round every N cycles (~10 s at 20 ms/cycle).
+resync_interval_cycles   = 500
 
 [transport]
 interface = "lo"
