@@ -3,3 +3,4 @@ main
 target/
 .venv/
 ./Cargo.lock
+__pycache__/
