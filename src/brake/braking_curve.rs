@@ -1,7 +1,7 @@
-//! This module implements the braking curve computation for a vehicle. 
-//! It defines the necessary data structures, constants, 
-//! and functions to calculate the total braking distance required to decelerate from a current speed to a target speed within 
-//! an available distance. The braking curve is based on a hardcoded deceleration table that specifies 
+//! This module implements the braking curve computation for a vehicle.
+//! It defines the necessary data structures, constants,
+//! and functions to calculate the total braking distance required to decelerate from a current speed to a target speed within
+//! an available distance. The braking curve is based on a hardcoded deceleration table that specifies
 //! different deceleration rates for various speed ranges.
 
 #![deny(unsafe_code)]
@@ -74,10 +74,10 @@ impl BrakeInput {
     }
 }
 
-/// Implementation of the `CyclePayload` trait for `BrakeInput`. 
-/// This allows `BrakeInput` to be serialized and deserialized for network transmission. 
+/// Implementation of the `CyclePayload` trait for `BrakeInput`.
+/// This allows `BrakeInput` to be serialized and deserialized for network transmission.
 /// The wire layout is defined as 24 bytes in little-endian format, with each field represented as a 64-bit floating-point number (f64).
-/// 
+///
 /// Wire layout (24 bytes, little-endian):
 /// ```text
 ///   0..8    current_speed       (f64)
@@ -103,7 +103,7 @@ impl CyclePayload for BrakeInput {
     }
 }
 
-/// Result of a brake curve computation. 
+/// Result of a brake curve computation.
 /// Contains the total distance required to brake to the target speed, whether an emergency brake is needed, #
 /// and whether the input was valid.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -123,8 +123,8 @@ impl BrakeResult {
     }
 }
 
-/// Error types for brake curve computation. 
-/// These errors indicate invalid input conditions, such as negative speeds or distances, 
+/// Error types for brake curve computation.
+/// These errors indicate invalid input conditions, such as negative speeds or distances,
 /// or a target speed that exceeds the current speed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BrakeError {

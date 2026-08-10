@@ -8,7 +8,7 @@ use crate::framework::wire::{PayloadError, WireReader, WireWriter};
 use heapless::Vec;
 use tracing::error;
 
-/// Cycle Payload implementation for `BrakeResult`. 
+/// Cycle Payload implementation for `BrakeResult`.
 /// This allows the framework to serialize and deserialize `BrakeResult` instances for communication between nodes in the distributed system.
 /// Wire layout (10 bytes, little-endian):
 /// ```text
@@ -128,7 +128,7 @@ impl Voter for BrakeVoter {
         }
 
         // Iterate through each candidate value and group all agreeing values together.
-        // If a group meets or exceeds the minimum agreement threshold, 
+        // If a group meets or exceeds the minimum agreement threshold,
         // return a Consensus outcome with the representative value of that group.
         for candidate in all.iter() {
             let mut group: Vec<BrakeResult, MAX_TOTAL_NODES> = Vec::new();
@@ -145,8 +145,8 @@ impl Voter for BrakeVoter {
     }
 
     /// Find dissenters among the peers based on the own value, peer values, and the final decision.
-    /// A decenter is a peer whose value does not agree with the final decision. 
-    /// The function returns a tuple containing a boolean indicating whether the own value dissented and 
+    /// A decenter is a peer whose value does not agree with the final decision.
+    /// The function returns a tuple containing a boolean indicating whether the own value dissented and
     /// a vector of peer indices that dissented.
     fn find_dissenters(
         &self,

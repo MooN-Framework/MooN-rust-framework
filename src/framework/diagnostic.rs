@@ -355,12 +355,24 @@ impl Diagnostic {
 
     // --- Drop counters ---------------------------------------------------
 
-    pub fn should_drop_input(&mut self) -> bool { dec(&mut self.injection.drop_next_n_inputs) }
-    pub fn should_drop_result(&mut self) -> bool { dec(&mut self.injection.drop_next_n_results) }
-    pub fn should_drop_ack(&mut self) -> bool { dec(&mut self.injection.drop_next_n_acks) }
-    pub fn should_drop_cyclesync(&mut self) -> bool { dec(&mut self.injection.drop_next_n_cyclesync) }
-    pub fn should_drop_crc(&mut self) -> bool { dec(&mut self.injection.drop_next_n_crc) }
-    pub fn should_drop_vote(&mut self) -> bool { dec(&mut self.injection.drop_next_n_votes) }
+    pub fn should_drop_input(&mut self) -> bool {
+        dec(&mut self.injection.drop_next_n_inputs)
+    }
+    pub fn should_drop_result(&mut self) -> bool {
+        dec(&mut self.injection.drop_next_n_results)
+    }
+    pub fn should_drop_ack(&mut self) -> bool {
+        dec(&mut self.injection.drop_next_n_acks)
+    }
+    pub fn should_drop_cyclesync(&mut self) -> bool {
+        dec(&mut self.injection.drop_next_n_cyclesync)
+    }
+    pub fn should_drop_crc(&mut self) -> bool {
+        dec(&mut self.injection.drop_next_n_crc)
+    }
+    pub fn should_drop_vote(&mut self) -> bool {
+        dec(&mut self.injection.drop_next_n_votes)
+    }
 
     // --- Value corruption ------------------------------------------------
 

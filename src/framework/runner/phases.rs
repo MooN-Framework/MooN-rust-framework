@@ -1,5 +1,6 @@
+use super::PhaseOutcome;
 use crate::framework::peer_sync::{extract_sync_fields, PeerSync, SyncFields, SAMPLES_PER_PEER};
-use crate::framework::state::{PeerHealth, StoredSnapshot, crc_from_snapshot_fields};
+use crate::framework::state::{crc_from_snapshot_fields, PeerHealth, StoredSnapshot};
 use crate::framework::state_machine::{NodeState, StateEvent, SystemState};
 use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter, VotingOutcome};
 use crate::framework::transport::RecvOutcome;
@@ -10,7 +11,6 @@ use std::cell::Cell;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
-use super::PhaseOutcome;
 
 impl<C, V, S, T> super::Runner<C, V, S, T>
 where
@@ -141,12 +141,12 @@ where
                         return StateEvent::SelfTestErr;
                     }
                     self.state.set_was_lost(false);
-                    self.state.set_needs_state_sync(true);   // NEU: markiere für nächste Phase
-                    // enter_self_probation() ENTFÄLLT — Snapshot setzt self_probation_remaining
+                    self.state.set_needs_state_sync(true); // NEU: markiere für nächste Phase
+                                                           // enter_self_probation() ENTFÄLLT — Snapshot setzt self_probation_remaining
                 }
                 self.state.clear_pending_rejoin();
                 self.state.start_new_cycle(self.next_cycle_tick());
-                StateEvent::ResyncLostPeerOk   // statt InitialSyncOk
+                StateEvent::ResyncLostPeerOk // statt InitialSyncOk
             }
             PhaseOutcome::Timeout => {
                 self.state.clear_pending_rejoin();
@@ -327,157 +327,163 @@ where
     }
 
     pub(super) fn handle_system_state_sync(&mut self) -> StateEvent {
-    let is_receiver = self.state.needs_state_sync();
-    info!(is_receiver, "system state sync entered");
+        let is_receiver = self.state.needs_state_sync();
+        info!(is_receiver, "system state sync entered");
 
-    self.state.reset_state_sync_evidence();
+        self.state.reset_state_sync_evidence();
 
-    let node_state = self.state.node_state();
-    let deadline = Instant::now() + self.timing.state_sync_timeout;
+        let node_state = self.state.node_state();
+        let deadline = Instant::now() + self.timing.state_sync_timeout;
 
-    // Sender-Rolle: eigener Snapshot bleibt konstant während der Phase.
-    // Receiver-Rolle: eigener Snapshot unbekannt bis Anwendung, nichts zu senden.
-    let (nom, min, pc, cs, entries) = self.state.build_snapshot();
+        // Sender-Rolle: eigener Snapshot bleibt konstant während der Phase.
+        // Receiver-Rolle: eigener Snapshot unbekannt bis Anwendung, nichts zu senden.
+        let (nom, min, pc, cs, entries) = self.state.build_snapshot();
 
-    // Für den Sender: Empfänger-Liste = alle non-Lost Peers (der Receiver
-    // ist einer davon; die anderen Sender ackn nicht, aber schicken auch
-    // keinen Snapshot der ein Ack erwartet, weil sie nicht Empfänger sind).
-    // Vereinfachung: wir warten auf Acks von allen non-Lost, aber
-    // ignorieren fehlende Acks von Sendern (die brauchen wir nicht).
-    // Sauberer: der Sender weiß nicht wer Empfänger ist. Er sendet einfach
-    // und wartet auf mindestens einen Ack. Bei mehreren Empfängern:
-    // Ack von jedem der needs_state_sync=true hat. Aber das weiß der
-    // Sender lokal nicht. Pragmatisch:
-    //   Sender-Abschluss = mindestens ein Ack mit passendem CRC empfangen
-    //                    UND alle non-Lost haben entweder Snapshot ODER Ack gesendet
-    //   Receiver-Abschluss = Snapshot angewandt + Ack gesendet
-    // Für den Rückkehrer-Fall (1 Empfänger, N-1 Sender) reicht: mindestens
-    // 1 Ack mit unserem CRC → wir sind Mehrheit, weiter.
+        // Für den Sender: Empfänger-Liste = alle non-Lost Peers (der Receiver
+        // ist einer davon; die anderen Sender ackn nicht, aber schicken auch
+        // keinen Snapshot der ein Ack erwartet, weil sie nicht Empfänger sind).
+        // Vereinfachung: wir warten auf Acks von allen non-Lost, aber
+        // ignorieren fehlende Acks von Sendern (die brauchen wir nicht).
+        // Sauberer: der Sender weiß nicht wer Empfänger ist. Er sendet einfach
+        // und wartet auf mindestens einen Ack. Bei mehreren Empfängern:
+        // Ack von jedem der needs_state_sync=true hat. Aber das weiß der
+        // Sender lokal nicht. Pragmatisch:
+        //   Sender-Abschluss = mindestens ein Ack mit passendem CRC empfangen
+        //                    UND alle non-Lost haben entweder Snapshot ODER Ack gesendet
+        //   Receiver-Abschluss = Snapshot angewandt + Ack gesendet
+        // Für den Rückkehrer-Fall (1 Empfänger, N-1 Sender) reicht: mindestens
+        // 1 Ack mit unserem CRC → wir sind Mehrheit, weiter.
 
-    let outcome = self.collect_phase(
-        "system_state_sync",
-        deadline,
-        self.timing.send_interval,
-        |this| {
-            if is_receiver {
-                // Receiver: sobald wir Snapshots haben, wenden wir Mehrheit an
-                // und senden Ack. Vorher nichts.
-                if !this.state.sync_snapshots().is_empty() {
-                    if let Some((winner, _minority)) = this.state.majority_snapshot() {
-                        if let Err(e) = this.state.apply_snapshot(
-                            winner.nominal, winner.min, winner.probation_cycles,
-                            winner.current_seq, &winner.entries,
-                        ) {
-                            error!(error = ?e, "apply_snapshot failed");
-                            return Err(());
-                        }
-                        let adopted_crc = this.state.compute_system_state_crc();
-                        if let Err(e) = this.transport.send(
-                            node_state,
-                            Payload::SystemStateSnapshotAck { adopted_crc },
-                        ) {
-                            error!(error = ?e, "send_snapshot_ack failed");
-                            return Err(());
+        let outcome = self.collect_phase(
+            "system_state_sync",
+            deadline,
+            self.timing.send_interval,
+            |this| {
+                if is_receiver {
+                    // Receiver: sobald wir Snapshots haben, wenden wir Mehrheit an
+                    // und senden Ack. Vorher nichts.
+                    if !this.state.sync_snapshots().is_empty() {
+                        if let Some((winner, _minority)) = this.state.majority_snapshot() {
+                            if let Err(e) = this.state.apply_snapshot(
+                                winner.nominal,
+                                winner.min,
+                                winner.probation_cycles,
+                                winner.current_seq,
+                                &winner.entries,
+                            ) {
+                                error!(error = ?e, "apply_snapshot failed");
+                                return Err(());
+                            }
+                            let adopted_crc = this.state.compute_system_state_crc();
+                            if let Err(e) = this
+                                .transport
+                                .send(node_state, Payload::SystemStateSnapshotAck { adopted_crc })
+                            {
+                                error!(error = ?e, "send_snapshot_ack failed");
+                                return Err(());
+                            }
                         }
                     }
+                } else {
+                    // Sender: broadcast snapshot.
+                    if let Err(e) = this.transport.send(
+                        node_state,
+                        Payload::SystemStateSnapshot {
+                            nominal_participants: nom,
+                            min_participants: min,
+                            probation_cycles: pc,
+                            current_seq: cs,
+                            entries,
+                        },
+                    ) {
+                        error!(error = ?e, "send_snapshot failed");
+                        return Err(());
+                    }
                 }
-            } else {
-                // Sender: broadcast snapshot.
-                if let Err(e) = this.transport.send(
-                    node_state,
+                Ok(())
+            },
+            |this| {
+                if is_receiver {
+                    // Fertig wenn wir Snapshots von allen non-Lost haben und
+                    // (den Snapshot bereits angewandt haben, angezeigt durch
+                    // needs_state_sync=false in apply-Erfolg — aber das setzen
+                    // wir erst nach Handler-Abschluss). Alternative:
+                    // Snapshot-Set komplett + kein Ausstand.
+                    this.state.peers_missing_snapshot().is_empty()
+                } else {
+                    // Sender: Ack von mindestens einem Peer der needs_state_sync
+                    // hatte, und CRC stimmt mit unserem überein.
+                    let own_crc = crc_from_snapshot_fields(nom, min, pc, cs, &entries);
+                    this.state.sync_acks().iter().any(|(_, c)| *c == own_crc)
+                }
+            },
+            |this, frame| {
+                let peer_id = frame.node_id();
+                match frame.payload() {
                     Payload::SystemStateSnapshot {
-                        nominal_participants: nom,
-                        min_participants: min,
-                        probation_cycles: pc,
-                        current_seq: cs,
-                        entries,
-                    },
-                ) {
-                    error!(error = ?e, "send_snapshot failed");
-                    return Err(());
-                }
-            }
-            Ok(())
-        },
-        |this| {
-            if is_receiver {
-                // Fertig wenn wir Snapshots von allen non-Lost haben und
-                // (den Snapshot bereits angewandt haben, angezeigt durch
-                // needs_state_sync=false in apply-Erfolg — aber das setzen
-                // wir erst nach Handler-Abschluss). Alternative:
-                // Snapshot-Set komplett + kein Ausstand.
-                this.state.peers_missing_snapshot().is_empty()
-            } else {
-                // Sender: Ack von mindestens einem Peer der needs_state_sync
-                // hatte, und CRC stimmt mit unserem überein.
-                let own_crc = crc_from_snapshot_fields(nom, min, pc, cs, &entries);
-                this.state.sync_acks().iter().any(|(_, c)| *c == own_crc)
-            }
-        },
-        |this, frame| {
-            let peer_id = frame.node_id();
-            match frame.payload() {
-                Payload::SystemStateSnapshot {
-                    nominal_participants, min_participants,
-                    probation_cycles, current_seq, entries,
-                } => {
-                    let snap = StoredSnapshot {
-                        nominal: nominal_participants,
-                        min: min_participants,
+                        nominal_participants,
+                        min_participants,
                         probation_cycles,
                         current_seq,
                         entries,
-                    };
-                    this.state.record_sync_snapshot(peer_id, snap);
+                    } => {
+                        let snap = StoredSnapshot {
+                            nominal: nominal_participants,
+                            min: min_participants,
+                            probation_cycles,
+                            current_seq,
+                            entries,
+                        };
+                        this.state.record_sync_snapshot(peer_id, snap);
+                    }
+                    Payload::SystemStateSnapshotAck { adopted_crc } => {
+                        this.state.record_sync_ack(peer_id, adopted_crc);
+                    }
+                    _ => {
+                        debug!(peer_id, "non-sync frame in state sync phase, dropped");
+                    }
                 }
-                Payload::SystemStateSnapshotAck { adopted_crc } => {
-                    this.state.record_sync_ack(peer_id, adopted_crc);
-                }
-                _ => {
-                    debug!(peer_id, "non-sync frame in state sync phase, dropped");
-                }
-            }
-        },
-    );
+            },
+        );
 
-    match outcome {
-        PhaseOutcome::Complete => {
-            if is_receiver {
-                self.state.set_needs_state_sync(false);
-                info!("state sync complete as receiver");
-            } else {
-                // Prüfen: wurde unser CRC von den Empfängern akzeptiert?
-                let own_crc = crc_from_snapshot_fields(nom, min, pc, cs, &entries);
-                let all_match = self.state.sync_acks().iter().all(|(_, c)| *c == own_crc);
-                if !all_match {
-                    error!(own_crc, "our snapshot was minority, failsafe");
-                    return StateEvent::SystemStateSyncMinority;
+        match outcome {
+            PhaseOutcome::Complete => {
+                if is_receiver {
+                    self.state.set_needs_state_sync(false);
+                    info!("state sync complete as receiver");
+                } else {
+                    // Prüfen: wurde unser CRC von den Empfängern akzeptiert?
+                    let own_crc = crc_from_snapshot_fields(nom, min, pc, cs, &entries);
+                    let all_match = self.state.sync_acks().iter().all(|(_, c)| *c == own_crc);
+                    if !all_match {
+                        error!(own_crc, "our snapshot was minority, failsafe");
+                        return StateEvent::SystemStateSyncMinority;
+                    }
+                    info!("state sync complete as sender");
                 }
-                info!("state sync complete as sender");
+                StateEvent::SystemStateSyncOk
             }
-            StateEvent::SystemStateSyncOk
+            PhaseOutcome::Timeout => {
+                let missing_snap = self.state.peers_missing_snapshot();
+                let missing_ack = self.state.peers_missing_sync_ack();
+                error!(
+                    missing_snap = ?missing_snap.as_slice(),
+                    missing_ack = ?missing_ack.as_slice(),
+                    "state sync timeout"
+                );
+                StateEvent::SystemStateSyncTimeout
+            }
+            PhaseOutcome::Fault => StateEvent::Fault,
         }
-        PhaseOutcome::Timeout => {
-            let missing_snap = self.state.peers_missing_snapshot();
-            let missing_ack = self.state.peers_missing_sync_ack();
-            error!(
-                missing_snap = ?missing_snap.as_slice(),
-                missing_ack = ?missing_ack.as_slice(),
-                "state sync timeout"
-            );
-            StateEvent::SystemStateSyncTimeout
-        }
-        PhaseOutcome::Fault => StateEvent::Fault,
     }
-}
 
     /// CycleSync: peers exchange State beacons with attested seen-masks
     /// until each side has observed all non-Lost peers, or the phase times
     /// out.
- pub(super) fn handle_cycle_sync(&mut self) -> StateEvent {
+    pub(super) fn handle_cycle_sync(&mut self) -> StateEvent {
         self.state.reset_cycle_sync_evidence();
         self.state.log_system_state_crc_contents();
- 
+
         let suppress = self.is_muted()
             || self
                 .diagnostic
@@ -487,11 +493,11 @@ where
         if suppress {
             warn!("injection: suppressing cyclesync send");
         }
- 
+
         let node_state = self.state.node_state();
         let expected_mask = self.state.expected_sync_mask();
         let deadline = std::time::Instant::now() + self.timing.cycle_sync_timeout;
- 
+
         let outcome = self.collect_phase(
             "cycle_sync",
             deadline,
@@ -526,9 +532,9 @@ where
                 }
             },
         );
- 
+
         self.state.attribute_cycle_sync_missing();
- 
+
         match outcome {
             super::PhaseOutcome::Complete => {
                 self.state.start_new_cycle(self.next_cycle_tick());
@@ -551,15 +557,15 @@ where
     /// within the peer-sync epsilon across the fabric.
     pub(super) fn handle_read_inputs(&mut self) -> StateEvent {
         self.apply_pending_diagnostic();
- 
+
         // Optional per-cycle extra sleep, taken from InjectCycleDelay.
         let extra_ms = self.take_pending_cycle_delay_ms();
         if extra_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(extra_ms as u64));
         }
- 
+
         self.wait_for_next_cycle_tick();
- 
+
         let now = std::time::Instant::now();
         if let Some(prev) = self.last_cycle_start {
             let elapsed = now.duration_since(prev);
@@ -567,7 +573,7 @@ where
             info!(cycle_us = elapsed.as_micros(), "cycle duration");
         }
         self.last_cycle_start = Some(now);
- 
+
         self.state.record_own_input(self.input);
         StateEvent::InputsRead
     }
@@ -584,15 +590,15 @@ where
     /// own deadline and going to Failsafe in isolation.
     pub(super) fn handle_share_inputs(&mut self) -> StateEvent {
         let _ = self.take_peer_in_error();
- 
+
         let own = match self.state.own_input() {
             Some(i) => i,
             None => return StateEvent::Fault,
         };
- 
+
         let deadline = self.cycle_anchor() + self.timing.share_inputs_offset;
         let node_state = self.state.node_state();
- 
+
         // Injection decisions latched per-phase (not per-send-attempt) so
         // that a `count=1` drops the entire cycle's transmit, not just the
         // first retransmit.
@@ -605,7 +611,7 @@ where
         if suppress {
             warn!("injection: suppressing input send");
         }
- 
+
         let outcome = self.collect_phase(
             "share_inputs",
             deadline,
@@ -628,22 +634,22 @@ where
                 }
             },
         );
- 
+
         if self.take_peer_in_error() {
             warn!("share_inputs: peer already in ErrorManagement, rendezvous");
             self.state.attribute_input_missing();
             return StateEvent::PeerInError;
         }
- 
+
         match outcome {
             super::PhaseOutcome::Timeout => {
                 self.state.attribute_input_missing();
                 return StateEvent::ShareInputsTimeout;
-            },
+            }
             super::PhaseOutcome::Fault => return StateEvent::Fault,
             super::PhaseOutcome::Complete => {}
         }
- 
+
         // Divergence gate.
         for (idx, slot) in self.state.peer_inputs().iter().enumerate() {
             if let Some(peer_input) = slot {
@@ -654,7 +660,7 @@ where
                 }
             }
         }
- 
+
         match self.computation.compute(own) {
             Ok(payload) => {
                 self.state.record_own_result(payload);
@@ -673,9 +679,9 @@ where
     /// Rendezvous: same as ShareInputs — a peer already in ErrorManagement
     /// pulls us forward. We attribute both input- and result-phase evidence
     /// before following.
-pub(super) fn handle_share_result(&mut self) -> StateEvent {
+    pub(super) fn handle_share_result(&mut self) -> StateEvent {
         let _ = self.take_peer_in_error();
- 
+
         let suppress = self.is_muted()
             || self
                 .diagnostic
@@ -685,14 +691,14 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
         if suppress {
             warn!("injection: suppressing result send");
         }
- 
+
         let own = match self.state.cycle().own_result {
             Some(r) => r,
             None => return StateEvent::Fault,
         };
         let deadline = self.cycle_anchor() + self.timing.share_result_offset;
         let node_state = self.state.node_state();
- 
+
         let outcome = self.collect_phase(
             "share_result",
             deadline,
@@ -715,14 +721,14 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
                 }
             },
         );
- 
+
         if self.take_peer_in_error() {
             warn!("share_result: peer already in ErrorManagement, rendezvous");
             self.state.attribute_input_missing();
             self.state.attribute_result_missing();
             return StateEvent::PeerInError;
         }
- 
+
         match outcome {
             super::PhaseOutcome::Complete => StateEvent::ResultShared,
             super::PhaseOutcome::Timeout => {
@@ -733,7 +739,6 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
         }
     }
 
-
     /// SendAck: broadcast our attested received-mask, publisher pick, and
     /// rejoin vote until every non-Lost peer has done the same.
     ///
@@ -741,7 +746,7 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
     /// ErrorManagement and attribute what we have from all cycle buffers.
     pub(super) fn handle_send_ack(&mut self) -> StateEvent {
         let _ = self.take_peer_in_error();
- 
+
         let suppress = self.is_muted()
             || self
                 .diagnostic
@@ -759,7 +764,7 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
         if corrupt_pub {
             warn!("injection: sending ack with divergent publisher");
         }
- 
+
         let mask = self.received_mask();
         let mut candidate = self.pick_publisher_candidate();
         if corrupt_pub {
@@ -768,7 +773,7 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
         let rejoin_vote = self.state.own_rejoin_vote();
         let node_state = self.state.node_state();
         let deadline = self.cycle_anchor() + self.timing.send_ack_offset;
- 
+
         let outcome = self.collect_phase(
             "send_ack",
             deadline,
@@ -792,12 +797,14 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
             |this| this.all_peer_acks_in(),
             |this, frame| {
                 if let Payload::Ack { rejoin_vote, .. } = frame.payload() {
-                    let _ = this.state.record_peer_rejoin_vote(frame.node_id(), rejoin_vote);
+                    let _ = this
+                        .state
+                        .record_peer_rejoin_vote(frame.node_id(), rejoin_vote);
                 }
                 this.ingest_frame(frame);
             },
         );
- 
+
         if self.take_peer_in_error() {
             warn!("send_ack: peer already in ErrorManagement, rendezvous");
             self.state.attribute_input_missing();
@@ -805,7 +812,7 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
             self.fault_peers_missing_ack_unilateral();
             return StateEvent::PeerInError;
         }
- 
+
         match outcome {
             super::PhaseOutcome::Complete => {
                 self.state.attribute_result_missing();
@@ -820,18 +827,17 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
         }
     }
 
-
-      pub(super) fn handle_system_state_crc(&mut self) -> StateEvent {
+    pub(super) fn handle_system_state_crc(&mut self) -> StateEvent {
         self.state.reset_crc_evidence();
         let _ = self.take_peer_in_error();
- 
+
         let real_crc = self.state.compute_system_state_crc();
         let fake = self.diagnostic.as_mut().and_then(|d| d.should_fake_crc());
         let own_crc_on_wire = fake.unwrap_or(real_crc);
         if fake.is_some() {
             warn!(real_crc, own_crc_on_wire, "injection: sending fake crc");
         }
- 
+
         let suppress = self.is_muted()
             || self
                 .diagnostic
@@ -841,10 +847,10 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
         if suppress {
             warn!("injection: suppressing crc send");
         }
- 
+
         let node_state = self.state.node_state();
         let deadline = self.cycle_anchor() + self.timing.crc_offset;
- 
+
         let outcome = self.collect_phase(
             "system_state_crc",
             deadline,
@@ -855,7 +861,9 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
                 }
                 if let Err(e) = this.transport.send(
                     node_state,
-                    Payload::SystemStateCrc { crc: own_crc_on_wire },
+                    Payload::SystemStateCrc {
+                        crc: own_crc_on_wire,
+                    },
                 ) {
                     error!(error = ?e, "send_system_state_crc failed");
                 }
@@ -868,7 +876,7 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
                 }
             },
         );
- 
+
         if self.take_peer_in_error() {
             warn!("system_state_crc: peer already in ErrorManagement, rendezvous");
             self.state.attribute_input_missing();
@@ -876,7 +884,7 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
             self.fault_peers_missing_ack_unilateral();
             return StateEvent::PeerInError;
         }
- 
+
         match outcome {
             super::PhaseOutcome::Complete => {
                 // Divergence detection uses the REAL crc against peer values.
@@ -1021,7 +1029,7 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
     pub(super) fn handle_error_management(&mut self) -> StateEvent {
         self.state.reset_exclusion_proposals();
         let _ = self.take_peer_in_error();
- 
+
         let suppress = self.is_muted()
             || self
                 .diagnostic
@@ -1031,11 +1039,11 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
         if suppress {
             warn!("injection: suppressing exclusion vote send");
         }
- 
+
         let own_proposal = self.state.proposed_exclusions();
         let node_state = self.state.node_state();
         let deadline = std::time::Instant::now() + self.timing.error_mgmt_timeout;
- 
+
         let outcome = self.collect_phase(
             "exclusion_vote",
             deadline,
@@ -1057,20 +1065,28 @@ pub(super) fn handle_share_result(&mut self) -> StateEvent {
             |this| this.state.healthy_peers_missing_vote().is_empty(),
             |this, frame| this.ingest_frame(frame),
         );
- 
+
         let _ = self.take_peer_in_error();
- 
+
         match outcome {
             super::PhaseOutcome::Complete => {
                 let no_buffer_before_vote = self.state.tolerable_failures_remaining() == 0;
                 let confirmed = self.state.aggregate_exclusion_votes();
                 let transitions = self.state.apply_confirmed_exclusions(confirmed);
                 if transitions > 0 {
-                    info!(transitions, confirmed = confirmed.as_u8(), "health transitions");
+                    info!(
+                        transitions,
+                        confirmed = confirmed.as_u8(),
+                        "health transitions"
+                    );
                 }
                 self.state.start_new_cycle(self.next_cycle_tick());
-                if !self.state.quorum_available() { return StateEvent::TooFewNodes; }
-                if no_buffer_before_vote { return StateEvent::TooFewNodes; }
+                if !self.state.quorum_available() {
+                    return StateEvent::TooFewNodes;
+                }
+                if no_buffer_before_vote {
+                    return StateEvent::TooFewNodes;
+                }
                 StateEvent::StateOk
             }
             super::PhaseOutcome::Timeout => StateEvent::StateTimeout,

@@ -1,3 +1,8 @@
+//! This module defines the `PeerMask` type, which is a bitmask representing the set of peer slots in a distributed system.
+//! Each bit in the mask corresponds to a peer slot, allowing efficient tracking of which peers are active or have been seen in error.
+//! The `PeerMask` type provides methods for setting, clearing, and checking bits, as well as iterating over the set bits.
+//! Also this module provides space for future types that may be used in the framework.
+
 use crate::framework::config::MAX_PEERS;
 
 /// Bitmask over peer slots. Bit `k` refers to the `k`-th peer in the owner's
@@ -8,6 +13,8 @@ pub struct PeerMask(pub u8);
 impl PeerMask {
     pub const EMPTY: Self = Self(0);
 
+    /// Return the mask of all peers in the roster, excluding the own peer.
+    /// This works because self.0 accesses the first bit of the u8, which corresponds to the first peer slot in the roster.
     #[inline]
     pub fn as_u8(&self) -> u8 {
         self.0

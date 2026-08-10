@@ -16,7 +16,10 @@ pub struct ParticipantConfig {
 impl ParticipantConfig {
     pub fn new(minimum: u8, nominal: u8, probation_cycles: u32) -> Self {
         assert!(minimum >= 1, "min_participants must be >= 1");
-        assert!(minimum <= nominal, "min ({minimum}) must not exceed nominal ({nominal})");
+        assert!(
+            minimum <= nominal,
+            "min ({minimum}) must not exceed nominal ({nominal})"
+        );
         assert!(
             nominal as usize <= MAX_TOTAL_NODES,
             "nominal ({nominal}) exceeds MAX_TOTAL_NODES ({MAX_TOTAL_NODES})"
@@ -121,7 +124,8 @@ impl CycleTiming {
         assert!(
             self.send_interval < min_timeout,
             "send_interval ({:?}) must be smaller than smallest timeout ({:?})",
-            self.send_interval, min_timeout
+            self.send_interval,
+            min_timeout
         );
     }
 }

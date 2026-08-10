@@ -1,14 +1,14 @@
 //! # Software-Based Fault Tolerance Framework
 //!
-//! This main binary is a concrete example for the brake example implementation of the framework. 
-//! It is a node that participates in a distributed system and performs computations, voting, and 
-//! decision-making based on the brake input data. The node communicates with other nodes using UDP transport and 
+//! This main binary is a concrete example for the brake example implementation of the framework.
+//! It is a node that participates in a distributed system and performs computations, voting, and
+//! decision-making based on the brake input data. The node communicates with other nodes using UDP transport and
 //! follows the protocols defined in the framework to ensure fault tolerance and correct operation even in the presence of failures.
 //!
 //! ## Responsibilities
 //!
 //! - Load the configuration from a TOML file specified by the `--config` command-line argument.
-//! - Initialize the runner with the loaded configuration, including the computation, 
+//! - Initialize the runner with the loaded configuration, including the computation,
 //!  voter, sink, and self-test components (that have to be implemented by you for your use case ).
 //!
 
@@ -36,7 +36,7 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    
+
     // Parse the configuration file path from command-line arguments. If the argument is missing or invalid, print an error message and exit.
     let config_path = match parse_config_path() {
         Ok(p) => p,

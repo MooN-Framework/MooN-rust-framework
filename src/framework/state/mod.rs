@@ -638,18 +638,20 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
     }
 
     pub fn attribute_input_missing(&mut self) {
-    let mut present: Vec<bool, MAX_PEERS> = Vec::new();
-    for slot in self.cycle.peer_inputs.iter() {
-        let _ = present.push(slot.is_some());
+        let mut present: Vec<bool, MAX_PEERS> = Vec::new();
+        for slot in self.cycle.peer_inputs.iter() {
+            let _ = present.push(slot.is_some());
+        }
+        if let Some(mask) = observation::attribute_missing::<V::Payload>(
+            &self.roster,
+            observation::View::Input {
+                peer_inputs_present: &present,
+            },
+            self.own_id,
+        ) {
+            self.pending_exclusion_proposal.0 |= mask.0;
+        }
     }
-    if let Some(mask) = observation::attribute_missing::<V::Payload>(
-        &self.roster,
-        observation::View::Input { peer_inputs_present: &present },
-        self.own_id,
-    ) {
-        self.pending_exclusion_proposal.0 |= mask.0;
-    }
-}
 
     /// Add a peer to the local exclusion proposal explicitly (e.g. after
     /// a value-divergence detection in Publish).
@@ -745,8 +747,8 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
             if own_proposal.contains(idx) {
                 return false;
             }
-            let sent_result    = self.cycle.peer_results[idx].is_some();
-            let sent_ack       = self.cycle.peer_acks[idx].is_some();
+            let sent_result = self.cycle.peer_results[idx].is_some();
+            let sent_ack = self.cycle.peer_acks[idx].is_some();
             // A peer that sent a CycleSync State frame this cycle recorded
             // its seen-mask into the buffer. Without this, EM entered from
             // CycleSyncTimeout completes with no votes exchanged because
@@ -758,7 +760,7 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
             self.votes.proposals[idx].is_none()
         })
     }
-    
+
     /// Aggregate peer exclusion proposals + own vote into a confirmed mask.
     /// Rule 1a: target's own vote is ignored.
     pub fn aggregate_exclusion_votes(&self) -> PeerMask {
