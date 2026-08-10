@@ -37,40 +37,49 @@ impl ParticipantConfig {
     }
 }
 
-/// Timing parameters. Reorganized into three groups:
-/// - Cycle scheduling: one wall-clock period.
-/// - In-cycle phase deadlines: offsets from the cycle anchor
+/// Timing parameters. Organized into three groups:
+///
+/// - **Cycle scheduling**: one wall-clock period.
+/// - **In-cycle phase deadlines**: offsets from the cycle anchor
 ///   (`last_cycle_start` in the runner), strictly monotonic. All healthy
-///   nodes see the same deadline at the same wall-clock instant.
-/// - Non-cycle phase timeouts: relative to phase entry. Used for
+///   nodes see the same deadline at the same wall-clock instant, which
+///   keeps their phase transitions aligned regardless of intra-node jitter.
+/// - **Non-cycle phase timeouts**: relative to phase entry. Used for
 ///   phases outside the cycle body (init, sync, error mgmt, resync).
 ///
+/// The two resync timeouts are semantically distinct:
+/// - `resync_returning_timeout` is for a node coming back from lost —
+///   it must wait for the running fabric to acknowledge it, and needs
+///   more headroom because cold-start latency dominates.
+/// - `resync_healthy_timeout` is for an established node waiting on the
+///   returning peer's state frame; can be shorter.
+///
 /// A single `send_interval` covers all `collect_phase` retransmit loops.
-/// It must be smaller than the smallest timeout. 1 ms is a safe default
-/// for any 20 ms cycle.
+/// It must be smaller than every timeout. 1 ms is a safe default.
 #[derive(Debug, Clone, Copy)]
 pub struct CycleTiming {
-    // Cycle scheduling
+    // Cycle scheduling.
     pub cycle_duration: Duration,
 
-    // In-cycle phase deadlines (offsets from cycle anchor)
+    // In-cycle phase deadlines (offsets from cycle anchor).
     pub share_inputs_offset: Duration,
     pub share_result_offset: Duration,
     pub send_ack_offset: Duration,
     pub crc_offset: Duration,
 
-    // Non-cycle phase timeouts (relative to phase entry)
+    // Non-cycle phase timeouts (relative to phase entry).
     pub init_sync_timeout: Duration,
     pub peer_sync_timeout: Duration,
     pub cycle_sync_timeout: Duration,
     pub error_mgmt_timeout: Duration,
     pub state_sync_timeout: Duration,
-    pub resync_timeout: Duration,
+    pub resync_returning_timeout: Duration,
+    pub resync_healthy_timeout: Duration,
 
-    // Universal retransmit interval for collect_phase loops
+    // Universal retransmit interval for collect_phase loops.
     pub send_interval: Duration,
 
-    // Misc
+    // Misc.
     pub stale_frame_threshold: Duration,
     pub resync_interval_cycles: u32,
 }
@@ -104,7 +113,8 @@ impl CycleTiming {
             self.peer_sync_timeout,
             self.state_sync_timeout,
             self.init_sync_timeout,
-            self.resync_timeout,
+            self.resync_returning_timeout,
+            self.resync_healthy_timeout,
             self.share_inputs_offset,
         ];
         let min_timeout = all_timeouts.iter().min().copied().unwrap();
@@ -175,7 +185,8 @@ pub struct TimingSection {
     pub cycle_sync_timeout_ms: u64,
     pub error_mgmt_timeout_ms: u64,
     pub state_sync_timeout_ms: u64,
-    pub resync_timeout_ms: u64,
+    pub resync_returning_timeout_ms: u64,
+    pub resync_healthy_timeout_ms: u64,
 
     pub send_interval_ms: u64,
 
@@ -223,7 +234,8 @@ impl NodeConfig {
             cycle_sync_timeout: ms(t.cycle_sync_timeout_ms),
             error_mgmt_timeout: ms(t.error_mgmt_timeout_ms),
             state_sync_timeout: ms(t.state_sync_timeout_ms),
-            resync_timeout: ms(t.resync_timeout_ms),
+            resync_returning_timeout: ms(t.resync_returning_timeout_ms),
+            resync_healthy_timeout: ms(t.resync_healthy_timeout_ms),
 
             send_interval: ms(t.send_interval_ms),
 

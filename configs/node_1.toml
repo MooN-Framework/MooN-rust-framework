@@ -1,6 +1,6 @@
 # Node-Config — pro Node eine Datei; nur `own_id` und ggf. `port`
 # unterscheiden sich zwischen den Fabric-Nodes.
-own_id = 0
+own_id = 1
 
 [participants]
 nominal          = 3
@@ -23,7 +23,8 @@ peer_sync_timeout_ms   = 500
 cycle_sync_timeout_ms  = 10
 error_mgmt_timeout_ms  = 20
 state_sync_timeout_ms  = 500
-resync_timeout_ms      = 5000
+resync_returning_timeout_ms = 5000
+resync_healthy_timeout_ms   = 500
 
 # Universelles Retransmit-Intervall fuer alle collect_phase-Loops.
 # Muss < kleinster Timeout sein.

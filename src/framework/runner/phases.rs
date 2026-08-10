@@ -63,15 +63,15 @@ where
 
         let deadline = Instant::now()
             + if is_returning {
-                self.timing.resync_lost_peer_returning_timeout
+                self.timing.resync_returning_timeout
             } else {
-                self.timing.resync_lost_peer_healthy_timeout
+                self.timing.resync_healthy_timeout
             };
 
         let outcome = self.collect_phase(
             "resync",
             deadline,
-            self.timing.resync_send_interval,
+            self.timing.send_interval,
             |this| {
                 // send closure — unchanged
                 let mask = if is_returning {
@@ -171,7 +171,7 @@ where
         let outcome = self.collect_phase(
             "init_sync",
             deadline,
-            self.timing.init_sync_send_interval,
+            self.timing.send_interval,
             |this| {
                 if let Err(e) = this.transport.send(
                     node_state,
@@ -288,7 +288,7 @@ where
                                     peer_sync.record_outgoing_request(peer_id, t1);
                                 }
                             }
-                            next_request = Instant::now() + self.timing.peer_sync_request_interval;
+                            next_request = Instant::now() + self.timing.send_interval;
                         }
                         Err(e) => {
                             error!(error = ?e, "send_time_sync_req failed");
@@ -333,7 +333,7 @@ where
     self.state.reset_state_sync_evidence();
 
     let node_state = self.state.node_state();
-    let deadline = Instant::now() + self.timing.system_state_sync_timeout;
+    let deadline = Instant::now() + self.timing.state_sync_timeout;
 
     // Sender-Rolle: eigener Snapshot bleibt konstant während der Phase.
     // Receiver-Rolle: eigener Snapshot unbekannt bis Anwendung, nichts zu senden.
@@ -357,7 +357,7 @@ where
     let outcome = self.collect_phase(
         "system_state_sync",
         deadline,
-        self.timing.system_state_sync_send_interval,
+        self.timing.send_interval,
         |this| {
             if is_receiver {
                 // Receiver: sobald wir Snapshots haben, wenden wir Mehrheit an
