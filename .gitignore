@@ -4,3 +4,4 @@ target/
 .venv/
 ./Cargo.lock
 __pycache__/
+.pytest_cache/
