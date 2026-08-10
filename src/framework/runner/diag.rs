@@ -20,15 +20,13 @@ where
             return;
         };
         while let Some(cmd) = diag.try_recv() {
-            match cmd {
-                Command::GetStatus => {
-                    let status = self.build_status_response(&diag);
-                    diag.send(&OutgoingTelegram::Status {
-                        source_node_id: diag.node_id(),
-                        data: status,
-                    });
-                }
-                _ => {}
+            if let Command::GetStatus = cmd {
+                let status = self.build_status_response(&diag);
+
+                diag.send(&OutgoingTelegram::Status {
+                    source_node_id: diag.node_id(),
+                    data: status,
+                });
             }
         }
         self.diagnostic = Some(diag);

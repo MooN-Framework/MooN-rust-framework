@@ -1,8 +1,8 @@
-//! This module defines the core components of the software-based fault tolerance framework. 
-//! It includes configuration, diagnostics, peer synchronization, state management, and transport mechanisms. 
-//! The framework is designed to facilitate the development of fault-tolerant distributed systems by providing 
+//! This module defines the core components of the software-based fault tolerance framework.
+//! It includes configuration, diagnostics, peer synchronization, state management, and transport mechanisms.
+//! The framework is designed to facilitate the development of fault-tolerant distributed systems by providing
 //! abstractions for common tasks such as state replication, consensus, and error handling.
-//! To function correctly, the framework requires the user to implement specific traits for computation, voting, and decision-making logic, 
+//! To function correctly, the framework requires the user to implement specific traits for computation, voting, and decision-making logic,
 //! which can be customized for different use cases.
 
 pub mod config;

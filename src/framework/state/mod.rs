@@ -903,13 +903,10 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
             if peer.health == PeerHealth::Lost {
                 continue;
             }
-            match self.cycle.peer_acks[idx] {
-                Some(ack) => {
-                    if ack.publisher_candidate != own_pick {
-                        return None;
-                    }
-                }
-                None => return None,
+            let ack = self.cycle.peer_acks[idx]?;
+
+            if ack.publisher_candidate != own_pick {
+                return None;
             }
         }
         Some(own_pick)

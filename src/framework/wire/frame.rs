@@ -341,7 +341,7 @@ impl<I: CyclePayload, R: CyclePayload> UdpFrame<I, R> {
     }
 
     fn compute_crc(&self) -> u32 {
-        let _ = Self::_ASSERT_FITS;
+        let _: () = Self::_ASSERT_FITS;
         let mut h = Hasher::new();
         h.update(&[self.node_id]);
         h.update(&self.session_id.to_le_bytes());
@@ -364,7 +364,7 @@ impl<I: CyclePayload, R: CyclePayload> UdpFrame<I, R> {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let _ = Self::_ASSERT_FITS;
+        let _: () = Self::_ASSERT_FITS;
 
         let mut buf = Vec::with_capacity(Self::MAX_FRAME_SIZE);
         buf.push(self.node_id);
@@ -385,7 +385,7 @@ impl<I: CyclePayload, R: CyclePayload> UdpFrame<I, R> {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, FrameError> {
-        let _ = Self::_ASSERT_FITS;
+        let _: () = Self::_ASSERT_FITS;
 
         if bytes.len() < HEADER_SIZE + CRC_SIZE {
             return Err(FrameError::TooShort);

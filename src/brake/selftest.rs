@@ -39,7 +39,7 @@ impl fmt::Display for SelfTestError {
 impl std::error::Error for SelfTestError {}
 
 /// One deterministic test vector — `input` fed to `compute_braking_curve`
-/// must produce a `total_distance` within `tolerance` of `expected_distance`.
+// must produce a `total_distance` within `tolerance` of `expected_distance`.
 #[derive(Debug, Clone, Copy)]
 pub struct BrakeSelfTestVector {
     pub input: BrakeInput,
@@ -66,7 +66,7 @@ impl BrakeSelfTest {
 /// Default test vectors for the brake self-test.
 /// These are simple cases that exercise the braking curve computation.
 const DEFAULT_VECTORS: &[BrakeSelfTestVector] = &[
-    /// Simple case: 5 m/s → 0 m/s in 1000 m. Should brake to a stop in 25 m.
+    // Simple case: 5 m/s → 0 m/s in 1000 m. Should brake to a stop in 25 m.
     BrakeSelfTestVector {
         input: BrakeInput {
             current_speed: 5.0,
@@ -76,7 +76,7 @@ const DEFAULT_VECTORS: &[BrakeSelfTestVector] = &[
         expected_distance: 25.0,
         tolerance: 1e-6,
     },
-    /// Edge case: 3 m/s → 3 m/s in 100 m. Should brake to a stop in 7.5 m.
+    // Edge case: 3 m/s → 3 m/s in 100 m. Should brake to a stop in 7.5 m.
     BrakeSelfTestVector {
         input: BrakeInput {
             current_speed: 3.0,

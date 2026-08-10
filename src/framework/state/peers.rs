@@ -37,6 +37,12 @@ pub struct PeerRoster {
     discovery_locked: bool,
 }
 
+impl Default for PeerRoster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PeerRoster {
     pub fn new() -> Self {
         Self {

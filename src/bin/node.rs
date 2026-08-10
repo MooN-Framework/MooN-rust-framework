@@ -9,8 +9,7 @@
 //!
 //! - Load the configuration from a TOML file specified by the `--config` command-line argument.
 //! - Initialize the runner with the loaded configuration, including the computation,
-//!  voter, sink, and self-test components (that have to be implemented by you for your use case ).
-//!
+//! - voter, sink, and self-test components (that have to be implemented by you for your use case ).
 
 use std::env;
 use std::fs;
