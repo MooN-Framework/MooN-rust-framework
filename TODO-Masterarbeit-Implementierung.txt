@@ -5,7 +5,8 @@
 - Tatsächliche Notbremse im Fall vom Reißen des Bremsweges => publish anpassen.
 - automatische Testfälle
 - GUI-Diagnosetool
-- Dokumentation + Refactoring
+- Dokumentation + Refactoring => Document rest of framework
+- Clippy warnings nochmal fixen
 
 |================|
 |Voter Impl  	 |
@@ -39,6 +40,7 @@
 - Off-By-One-State-Problem bei Ausfall Lösen? (Phase-Drift) => rendevouz in error management [x]
 - diagnose schnittstelle erweitern [x]
 - ResyncLostPeer timeouts in Config einarbeiten [x]
+- Docs for brake implementation and main [x]
 
 |================|
 |Fehlermanagement|
