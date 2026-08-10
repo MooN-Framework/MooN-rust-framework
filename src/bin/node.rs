@@ -93,7 +93,7 @@ fn main() -> ExitCode {
     runner.run();
 
     eprintln!("node {own_id} in failsafe, exiting program context.");
-    ExitCode::from(-1)
+    ExitCode::from(1)
 }
 
 /// Parse `--config <path>` from argv. `-c` and `--config=<path>` are also
