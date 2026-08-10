@@ -15,9 +15,6 @@ use serde::Deserialize;
 use std::time::Instant;
 use tracing::{debug, error, info};
 
-/// Orchestrates the per-cycle state machine over transport, state, sink,
-/// computation, self-test, and optional diagnostic. One runner instance
-/// per node.
 pub struct Runner<C, V, S, T>
 where
     C: Computation,
@@ -37,10 +34,20 @@ where
     pub(super) next_cycle_deadline: Option<Instant>,
     pub(super) cycles_since_last_sync: u32,
     pub(super) diagnostic: Option<Diagnostic>,
+
     /// Rendezvous flag: set by ingest paths when a healthy peer's frame
-    /// arrives with `node_state == ErrorManagement`. Read + cleared by
-    /// the in-cycle phase handlers via `take_peer_in_error`.
+    /// arrives with `node_state == ErrorManagement`.
     pub(super) peer_in_error_seen: bool,
+
+    /// True for the current cycle if InjectMute is active. Send paths
+    /// consult this and suppress transmit while true. Refreshed once per
+    /// cycle in `apply_pending_diagnostic`.
+    pub(super) mute_active: bool,
+
+    /// Extra sleep (ms) to add to `wait_for_next_cycle_tick` this cycle.
+    /// Used by InjectCycleDelay to test cycle-skew handling. Refreshed
+    /// once per cycle in `apply_pending_diagnostic`.
+    pub(super) pending_cycle_delay_ms: u32,
 }
 
 impl<C, V, S, T> Runner<C, V, S, T>
@@ -51,8 +58,6 @@ where
     T: SelfTest,
     C::Input: for<'de> Deserialize<'de>,
 {
-    /// Construct a runner. Attempts to bring up the diagnostic side-channel
-    /// when enabled; failure is non-fatal.
     pub fn new(
         state: RunState<V, C::Input>,
         transport: UdpTransport<C::Input, V::Payload>,
@@ -89,31 +94,39 @@ where
             cycles_since_last_sync: 0,
             diagnostic,
             peer_in_error_seen: false,
+            mute_active: false,
+            pending_cycle_delay_ms: 0,
         }
     }
 
-    /// Overwrite the runtime input, bypassing diagnostic staging.
     pub fn set_input(&mut self, input: C::Input) {
         self.input = input;
     }
 
-    /// Cycle-global deadline anchor. Falls back to `Instant::now()` for
-    /// the first cycle before `handle_read_inputs` has set `last_cycle_start`.
+    /// Cycle-global deadline anchor.
     #[inline]
     pub(super) fn cycle_anchor(&self) -> Instant {
         self.last_cycle_start.unwrap_or_else(Instant::now)
     }
 
-    /// Read + clear the rendezvous flag. Callers use this at the entry of
-    /// an in-cycle phase to discard a stale flag from a previous phase,
-    /// and again before the phase returns to check whether a peer has
-    /// entered ErrorManagement during this phase.
+    /// Read + clear the rendezvous flag.
     #[inline]
     pub(super) fn take_peer_in_error(&mut self) -> bool {
         core::mem::replace(&mut self.peer_in_error_seen, false)
     }
 
-    /// Main loop. Returns once the node enters `Failsafe`.
+    /// Consult mute state. If true, send paths return without transmitting.
+    #[inline]
+    pub(super) fn is_muted(&self) -> bool {
+        self.mute_active
+    }
+
+    /// Consume the pending cycle delay (only applied once).
+    #[inline]
+    pub(super) fn take_pending_cycle_delay_ms(&mut self) -> u32 {
+        core::mem::replace(&mut self.pending_cycle_delay_ms, 0)
+    }
+
     pub fn run(&mut self) {
         info!(own_id = self.state.own_id(), "runner started");
         loop {

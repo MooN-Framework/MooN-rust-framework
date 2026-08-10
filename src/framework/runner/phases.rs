@@ -160,82 +160,6 @@ where
         }
     }
 
-    pub(super) fn handle_system_state_crc(&mut self) -> StateEvent {
-        self.state.reset_crc_evidence();
-        // Discard any stale rendezvous flag from the previous phase.
-        let _ = self.take_peer_in_error();
-
-        let own_crc = self.state.compute_system_state_crc();
-        let node_state = self.state.node_state();
-        // Cycle-anchored deadline: same wall-clock instant across all nodes.
-        let deadline = self.cycle_anchor() + self.timing.system_state_crc_deadline_offset;
-
-        debug!(own_crc, "system state crc exchange entered");
-
-        let outcome = self.collect_phase(
-            "system_state_crc",
-            deadline,
-            self.timing.system_state_crc_send_interval,
-            |this| {
-                if let Err(e) = this
-                    .transport
-                    .send(node_state, Payload::SystemStateCrc { crc: own_crc })
-                {
-                    error!(error = ?e, "send_system_state_crc failed");
-                    return Err(());
-                }
-                Ok(())
-            },
-            |this| this.state.healthy_peers_missing_crc().is_empty(),
-            |this, frame| {
-                if let Payload::SystemStateCrc { crc } = frame.payload() {
-                    let _ = this.state.record_peer_crc(frame.node_id(), crc);
-                }
-            },
-        );
-
-        // Rendezvous: if a healthy peer reached ErrorManagement while we
-        // were still here, attribute what evidence we have from earlier
-        // phases in this cycle and follow the peer forward.
-        if self.take_peer_in_error() {
-            warn!("system_state_crc: peer already in ErrorManagement, rendezvous");
-            self.state.attribute_input_missing();
-            self.state.attribute_result_missing();
-            self.fault_peers_missing_ack_unilateral();
-            return StateEvent::PeerInError;
-        }
-
-        match outcome {
-            PhaseOutcome::Complete => {
-                if self.state.crc_unanimous(own_crc) {
-                    debug!(own_crc, "crc unanimous");
-                    StateEvent::CrcOk
-                } else {
-                    let picks: Vec<(u8, Option<u32>)> = self
-                        .state
-                        .peers()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(idx, p)| {
-                            if p.health == PeerHealth::Lost {
-                                return None;
-                            }
-                            Some((p.id, self.state.cycle_peer_crc(idx)))
-                        })
-                        .collect();
-                    error!(own_crc, peer_crcs = ?picks, "crc divergence, failsafe");
-                    StateEvent::CrcDivergent
-                }
-            }
-            PhaseOutcome::Timeout => {
-                let missing = self.state.healthy_peers_missing_crc();
-                error!(missing = ?missing.as_slice(), "crc exchange timeout, failsafe");
-                StateEvent::CrcDivergent
-            }
-            PhaseOutcome::Fault => StateEvent::Fault,
-        }
-    }
-
     /// InitSync: broadcast state until the nominal peer set is discovered
     /// or the discovery window elapses.
     pub(super) fn handle_init_sync(&mut self) -> StateEvent {
@@ -550,20 +474,32 @@ where
     /// CycleSync: peers exchange State beacons with attested seen-masks
     /// until each side has observed all non-Lost peers, or the phase times
     /// out.
-    pub(super) fn handle_cycle_sync(&mut self) -> StateEvent {
+ pub(super) fn handle_cycle_sync(&mut self) -> StateEvent {
         self.state.reset_cycle_sync_evidence();
-
         self.state.log_system_state_crc_contents();
-
+ 
+        let suppress = self.is_muted()
+            || self
+                .diagnostic
+                .as_mut()
+                .map(|d| d.should_drop_cyclesync())
+                .unwrap_or(false);
+        if suppress {
+            warn!("injection: suppressing cyclesync send");
+        }
+ 
         let node_state = self.state.node_state();
         let expected_mask = self.state.expected_sync_mask();
-        let deadline = Instant::now() + self.timing.cycle_sync_timeout;
-
+        let deadline = std::time::Instant::now() + self.timing.cycle_sync_timeout;
+ 
         let outcome = self.collect_phase(
             "cycle_sync",
             deadline,
-            self.timing.cycle_sync_send_interval,
+            self.timing.send_interval,
             |this| {
+                if suppress {
+                    return Ok(());
+                }
                 let mask = this.state.own_seen_mask();
                 if let Err(e) = this.transport.send(
                     node_state,
@@ -573,7 +509,6 @@ where
                     },
                 ) {
                     error!(error = ?e, "send_state failed in cycle sync");
-                    return Err(());
                 }
                 Ok(())
             },
@@ -582,7 +517,6 @@ where
                 if frame.node_state_wire() == NodeState::ResyncLostPeer.to_wire() {
                     this.state.set_rejoin_seen(frame.node_id());
                 }
-
                 let peer_id = frame.node_id();
                 if let Payload::State { seen_mask, .. } = frame.payload() {
                     if let Some(idx) = this.state.peer_index(peer_id) {
@@ -592,23 +526,16 @@ where
                 }
             },
         );
-
+ 
         self.state.attribute_cycle_sync_missing();
-
+ 
         match outcome {
-            PhaseOutcome::Complete => {
+            super::PhaseOutcome::Complete => {
                 self.state.start_new_cycle(self.next_cycle_tick());
                 StateEvent::CycleSyncOk
             }
-            PhaseOutcome::Timeout => {
-                warn!(
-                    got = self.state.own_seen_mask().as_u8(),
-                    expected = expected_mask,
-                    "cycle sync deadline exceeded"
-                );
-                StateEvent::CycleSyncTimeout
-            }
-            PhaseOutcome::Fault => StateEvent::Fault,
+            super::PhaseOutcome::Timeout => StateEvent::CycleSyncTimeout,
+            super::PhaseOutcome::Fault => StateEvent::Fault,
         }
     }
 
@@ -624,16 +551,23 @@ where
     /// within the peer-sync epsilon across the fabric.
     pub(super) fn handle_read_inputs(&mut self) -> StateEvent {
         self.apply_pending_diagnostic();
+ 
+        // Optional per-cycle extra sleep, taken from InjectCycleDelay.
+        let extra_ms = self.take_pending_cycle_delay_ms();
+        if extra_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(extra_ms as u64));
+        }
+ 
         self.wait_for_next_cycle_tick();
-
-        let now = Instant::now();
+ 
+        let now = std::time::Instant::now();
         if let Some(prev) = self.last_cycle_start {
             let elapsed = now.duration_since(prev);
             self.last_cycle_us = Some(elapsed.as_micros());
             info!(cycle_us = elapsed.as_micros(), "cycle duration");
         }
         self.last_cycle_start = Some(now);
-
+ 
         self.state.record_own_input(self.input);
         StateEvent::InputsRead
     }
@@ -649,26 +583,37 @@ where
     /// we follow it forward via `PeerInError` instead of waiting for our
     /// own deadline and going to Failsafe in isolation.
     pub(super) fn handle_share_inputs(&mut self) -> StateEvent {
-        // Discard any stale rendezvous flag from the previous phase.
         let _ = self.take_peer_in_error();
-
+ 
         let own = match self.state.own_input() {
             Some(i) => i,
-            None => {
-                error!("share_inputs entered without own input");
-                return StateEvent::Fault;
-            }
+            None => return StateEvent::Fault,
         };
-
-        // Cycle-anchored deadline.
-        let deadline = self.cycle_anchor() + self.timing.share_inputs_deadline_offset;
+ 
+        let deadline = self.cycle_anchor() + self.timing.share_inputs_offset;
         let node_state = self.state.node_state();
-
+ 
+        // Injection decisions latched per-phase (not per-send-attempt) so
+        // that a `count=1` drops the entire cycle's transmit, not just the
+        // first retransmit.
+        let suppress = self.is_muted()
+            || self
+                .diagnostic
+                .as_mut()
+                .map(|d| d.should_drop_input())
+                .unwrap_or(false);
+        if suppress {
+            warn!("injection: suppressing input send");
+        }
+ 
         let outcome = self.collect_phase(
             "share_inputs",
             deadline,
-            self.timing.share_inputs_send_interval,
+            self.timing.send_interval,
             |this| {
+                if suppress {
+                    return Ok(());
+                }
                 if let Err(e) = this.transport.send(node_state, Payload::Input(own)) {
                     error!(error = ?e, "send_input failed");
                 }
@@ -683,24 +628,23 @@ where
                 }
             },
         );
-
-        // Rendezvous check: did a healthy peer already reach ErrorManagement?
+ 
         if self.take_peer_in_error() {
             warn!("share_inputs: peer already in ErrorManagement, rendezvous");
             self.state.attribute_input_missing();
             return StateEvent::PeerInError;
         }
-
+ 
         match outcome {
-            PhaseOutcome::Timeout => {
-                warn!("share_inputs timeout");
+            super::PhaseOutcome::Timeout => {
+                self.state.attribute_input_missing();
                 return StateEvent::ShareInputsTimeout;
-            }
-            PhaseOutcome::Fault => return StateEvent::Fault,
-            PhaseOutcome::Complete => {}
+            },
+            super::PhaseOutcome::Fault => return StateEvent::Fault,
+            super::PhaseOutcome::Complete => {}
         }
-
-        // Divergence gate on collected peer inputs.
+ 
+        // Divergence gate.
         for (idx, slot) in self.state.peer_inputs().iter().enumerate() {
             if let Some(peer_input) = slot {
                 if !self.computation.inputs_agree(&own, peer_input) {
@@ -710,8 +654,7 @@ where
                 }
             }
         }
-
-        // All peer inputs within tolerance — run the domain computation.
+ 
         match self.computation.compute(own) {
             Ok(payload) => {
                 self.state.record_own_result(payload);
@@ -730,35 +673,32 @@ where
     /// Rendezvous: same as ShareInputs — a peer already in ErrorManagement
     /// pulls us forward. We attribute both input- and result-phase evidence
     /// before following.
-    pub(super) fn handle_share_result(&mut self) -> StateEvent {
+pub(super) fn handle_share_result(&mut self) -> StateEvent {
         let _ = self.take_peer_in_error();
-
-        let suppress_send = self
-            .diagnostic
-            .as_mut()
-            .map(|d| d.should_drop_result())
-            .unwrap_or(false);
-        if suppress_send {
-            warn!("injection: suppressing send_result");
+ 
+        let suppress = self.is_muted()
+            || self
+                .diagnostic
+                .as_mut()
+                .map(|d| d.should_drop_result())
+                .unwrap_or(false);
+        if suppress {
+            warn!("injection: suppressing result send");
         }
-
+ 
         let own = match self.state.cycle().own_result {
             Some(r) => r,
-            None => {
-                error!("share_result entered without own result");
-                return StateEvent::Fault;
-            }
+            None => return StateEvent::Fault,
         };
-
-        let deadline = self.cycle_anchor() + self.timing.share_result_deadline_offset;
+        let deadline = self.cycle_anchor() + self.timing.share_result_offset;
         let node_state = self.state.node_state();
-
+ 
         let outcome = self.collect_phase(
             "share_result",
             deadline,
-            self.timing.share_result_send_interval,
+            self.timing.send_interval,
             |this| {
-                if suppress_send {
+                if suppress {
                     return Ok(());
                 }
                 if let Err(e) = this.transport.send(node_state, Payload::Result(own)) {
@@ -775,23 +715,24 @@ where
                 }
             },
         );
-
+ 
         if self.take_peer_in_error() {
             warn!("share_result: peer already in ErrorManagement, rendezvous");
             self.state.attribute_input_missing();
             self.state.attribute_result_missing();
             return StateEvent::PeerInError;
         }
-
+ 
         match outcome {
-            PhaseOutcome::Complete => StateEvent::ResultShared,
-            PhaseOutcome::Timeout => {
+            super::PhaseOutcome::Complete => StateEvent::ResultShared,
+            super::PhaseOutcome::Timeout => {
                 self.state.attribute_result_missing();
                 StateEvent::ShareResultTimeout
             }
-            PhaseOutcome::Fault => StateEvent::Fault,
+            super::PhaseOutcome::Fault => StateEvent::Fault,
         }
     }
+
 
     /// SendAck: broadcast our attested received-mask, publisher pick, and
     /// rejoin vote until every non-Lost peer has done the same.
@@ -800,28 +741,40 @@ where
     /// ErrorManagement and attribute what we have from all cycle buffers.
     pub(super) fn handle_send_ack(&mut self) -> StateEvent {
         let _ = self.take_peer_in_error();
-
-        let suppress_send = self
+ 
+        let suppress = self.is_muted()
+            || self
+                .diagnostic
+                .as_mut()
+                .map(|d| d.should_drop_ack())
+                .unwrap_or(false);
+        let corrupt_pub = self
             .diagnostic
             .as_mut()
-            .map(|d| d.should_drop_ack())
+            .map(|d| d.should_send_divergent_publisher())
             .unwrap_or(false);
-        if suppress_send {
-            warn!("injection: suppressing send_ack");
+        if suppress {
+            warn!("injection: suppressing ack send");
         }
-
+        if corrupt_pub {
+            warn!("injection: sending ack with divergent publisher");
+        }
+ 
         let mask = self.received_mask();
-        let candidate = self.pick_publisher_candidate();
+        let mut candidate = self.pick_publisher_candidate();
+        if corrupt_pub {
+            candidate = candidate.wrapping_add(99);
+        }
         let rejoin_vote = self.state.own_rejoin_vote();
         let node_state = self.state.node_state();
-        let deadline = self.cycle_anchor() + self.timing.send_ack_deadline_offset;
-
+        let deadline = self.cycle_anchor() + self.timing.send_ack_offset;
+ 
         let outcome = self.collect_phase(
             "send_ack",
             deadline,
-            self.timing.send_ack_send_interval,
+            self.timing.send_interval,
             |this| {
-                if suppress_send {
+                if suppress {
                     return Ok(());
                 }
                 if let Err(e) = this.transport.send(
@@ -839,14 +792,12 @@ where
             |this| this.all_peer_acks_in(),
             |this, frame| {
                 if let Payload::Ack { rejoin_vote, .. } = frame.payload() {
-                    let _ = this
-                        .state
-                        .record_peer_rejoin_vote(frame.node_id(), rejoin_vote);
+                    let _ = this.state.record_peer_rejoin_vote(frame.node_id(), rejoin_vote);
                 }
                 this.ingest_frame(frame);
             },
         );
-
+ 
         if self.take_peer_in_error() {
             warn!("send_ack: peer already in ErrorManagement, rendezvous");
             self.state.attribute_input_missing();
@@ -854,18 +805,90 @@ where
             self.fault_peers_missing_ack_unilateral();
             return StateEvent::PeerInError;
         }
-
+ 
         match outcome {
-            PhaseOutcome::Complete => {
+            super::PhaseOutcome::Complete => {
                 self.state.attribute_result_missing();
                 StateEvent::AckReceived
             }
-            PhaseOutcome::Timeout => {
+            super::PhaseOutcome::Timeout => {
                 self.state.attribute_result_missing();
                 self.fault_peers_missing_ack_unilateral();
                 StateEvent::AckTimeout
             }
-            PhaseOutcome::Fault => StateEvent::Fault,
+            super::PhaseOutcome::Fault => StateEvent::Fault,
+        }
+    }
+
+
+      pub(super) fn handle_system_state_crc(&mut self) -> StateEvent {
+        self.state.reset_crc_evidence();
+        let _ = self.take_peer_in_error();
+ 
+        let real_crc = self.state.compute_system_state_crc();
+        let fake = self.diagnostic.as_mut().and_then(|d| d.should_fake_crc());
+        let own_crc_on_wire = fake.unwrap_or(real_crc);
+        if fake.is_some() {
+            warn!(real_crc, own_crc_on_wire, "injection: sending fake crc");
+        }
+ 
+        let suppress = self.is_muted()
+            || self
+                .diagnostic
+                .as_mut()
+                .map(|d| d.should_drop_crc())
+                .unwrap_or(false);
+        if suppress {
+            warn!("injection: suppressing crc send");
+        }
+ 
+        let node_state = self.state.node_state();
+        let deadline = self.cycle_anchor() + self.timing.crc_offset;
+ 
+        let outcome = self.collect_phase(
+            "system_state_crc",
+            deadline,
+            self.timing.send_interval,
+            |this| {
+                if suppress {
+                    return Ok(());
+                }
+                if let Err(e) = this.transport.send(
+                    node_state,
+                    Payload::SystemStateCrc { crc: own_crc_on_wire },
+                ) {
+                    error!(error = ?e, "send_system_state_crc failed");
+                }
+                Ok(())
+            },
+            |this| this.state.healthy_peers_missing_crc().is_empty(),
+            |this, frame| {
+                if let Payload::SystemStateCrc { crc } = frame.payload() {
+                    let _ = this.state.record_peer_crc(frame.node_id(), crc);
+                }
+            },
+        );
+ 
+        if self.take_peer_in_error() {
+            warn!("system_state_crc: peer already in ErrorManagement, rendezvous");
+            self.state.attribute_input_missing();
+            self.state.attribute_result_missing();
+            self.fault_peers_missing_ack_unilateral();
+            return StateEvent::PeerInError;
+        }
+ 
+        match outcome {
+            super::PhaseOutcome::Complete => {
+                // Divergence detection uses the REAL crc against peer values.
+                if self.state.crc_unanimous(real_crc) {
+                    StateEvent::CrcOk
+                } else {
+                    error!(real_crc, "crc divergence, failsafe");
+                    StateEvent::CrcDivergent
+                }
+            }
+            super::PhaseOutcome::Timeout => StateEvent::CrcDivergent,
+            super::PhaseOutcome::Fault => StateEvent::Fault,
         }
     }
 
@@ -997,22 +1020,30 @@ where
     ///   third witness, both mean stop.
     pub(super) fn handle_error_management(&mut self) -> StateEvent {
         self.state.reset_exclusion_proposals();
-        // Clear the rendezvous flag: we are already here, further EM
-        // frames from peers are expected and shouldn't be treated as a
-        // rendezvous signal on the next in-cycle phase.
         let _ = self.take_peer_in_error();
-
+ 
+        let suppress = self.is_muted()
+            || self
+                .diagnostic
+                .as_mut()
+                .map(|d| d.should_drop_vote())
+                .unwrap_or(false);
+        if suppress {
+            warn!("injection: suppressing exclusion vote send");
+        }
+ 
         let own_proposal = self.state.proposed_exclusions();
         let node_state = self.state.node_state();
-        let deadline = Instant::now() + self.timing.error_management_timeout;
-
-        debug!(proposed = own_proposal.as_u8(), "exclusion vote entered");
-
+        let deadline = std::time::Instant::now() + self.timing.error_mgmt_timeout;
+ 
         let outcome = self.collect_phase(
             "exclusion_vote",
             deadline,
-            self.timing.error_management_send_interval,
+            self.timing.send_interval,
             |this| {
+                if suppress {
+                    return Ok(());
+                }
                 if let Err(e) = this.transport.send(
                     node_state,
                     Payload::ExclusionProposal {
@@ -1020,62 +1051,30 @@ where
                     },
                 ) {
                     error!(error = ?e, "send_exclusion_proposal failed");
-                    return Err(());
                 }
                 Ok(())
             },
             |this| this.state.healthy_peers_missing_vote().is_empty(),
             |this, frame| this.ingest_frame(frame),
         );
-
-        // Any rendezvous flag raised during EM itself is not meaningful —
-        // we're already in EM. Consume and discard.
+ 
         let _ = self.take_peer_in_error();
-
+ 
         match outcome {
-            PhaseOutcome::Complete => {
+            super::PhaseOutcome::Complete => {
                 let no_buffer_before_vote = self.state.tolerable_failures_remaining() == 0;
-
                 let confirmed = self.state.aggregate_exclusion_votes();
                 let transitions = self.state.apply_confirmed_exclusions(confirmed);
                 if transitions > 0 {
-                    info!(
-                        transitions,
-                        confirmed = confirmed.as_u8(),
-                        active_peers = self.state.active_peer_count(),
-                        "health transitions applied"
-                    );
+                    info!(transitions, confirmed = confirmed.as_u8(), "health transitions");
                 }
-
                 self.state.start_new_cycle(self.next_cycle_tick());
-
-                if !self.state.quorum_available() {
-                    error!(
-                        active_peers = self.state.active_peer_count(),
-                        minimum = self.state.participants().min_participants,
-                        "quorum lost"
-                    );
-                    return StateEvent::TooFewNodes;
-                }
-
-                if no_buffer_before_vote {
-                    error!(
-                        active_peers = self.state.active_peer_count(),
-                        nominal = self.state.participants().nominal_participants,
-                        minimum = self.state.participants().min_participants,
-                        "error in no-tolerance mode, failsafe"
-                    );
-                    return StateEvent::TooFewNodes;
-                }
-
+                if !self.state.quorum_available() { return StateEvent::TooFewNodes; }
+                if no_buffer_before_vote { return StateEvent::TooFewNodes; }
                 StateEvent::StateOk
             }
-            PhaseOutcome::Timeout => {
-                let missing = self.state.healthy_peers_missing_vote();
-                error!(missing = ?missing.as_slice(), "exclusion vote timed out, failsafe");
-                StateEvent::StateTimeout
-            }
-            PhaseOutcome::Fault => StateEvent::Fault,
+            super::PhaseOutcome::Timeout => StateEvent::StateTimeout,
+            super::PhaseOutcome::Fault => StateEvent::Fault,
         }
     }
 

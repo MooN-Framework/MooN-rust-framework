@@ -1,50 +1,45 @@
+# Node-Config — pro Node eine Datei; nur `own_id` und ggf. `port`
+# unterscheiden sich zwischen den Fabric-Nodes.
 own_id = 2
 
 [participants]
-nominal = 3
-minimum = 2
+nominal          = 3
+minimum          = 2
 probation_cycles = 10
 
 [timing]
-cycle_duration_ms  = 2000
-# Phase timeouts.
-share_inputs_deadline_offset_ms     = 5
-share_result_deadline_offset_ms     = 10
-send_ack_deadline_offset_ms         = 14
-system_state_crc_deadline_offset_ms = 17
-# ---- Phase-relative timeouts (outside the cycle body) ----
-init_sync_timeout_ms                     = 10000
-peer_sync_timeout_ms                     = 500
-cycle_sync_timeout_ms                    = 10
-error_management_timeout_ms              = 20
-system_state_sync_timeout_ms             = 500
-resync_lost_peer_returning_timeout_ms    = 5000
-resync_lost_peer_healthy_timeout_ms      = 500
-# ---- Send intervals inside collect_phase loops ----
-# Must be shorter than the corresponding timeout/deadline offset.
-init_sync_send_interval_ms          = 50
-peer_sync_request_interval_ms       = 20
-cycle_sync_send_interval_ms         = 2
-share_inputs_send_interval_ms       = 1
-share_result_send_interval_ms       = 1
-send_ack_send_interval_ms           = 1
-error_management_send_interval_ms   = 2
-system_state_crc_send_interval_ms   = 1
-system_state_sync_send_interval_ms  = 20
-resync_send_interval_ms             = 50
-# ---- Misc ----
-# Drop frames older than this once time sync is valid.
+cycle_duration_ms = 20
+
+# In-Cycle Phase-Deadlines (Offsets ab Cycle-Anker).
+# Strikt monoton wachsend, < cycle_duration_ms.
+share_inputs_offset_ms  = 5
+share_result_offset_ms  = 10
+send_ack_offset_ms      = 14
+crc_offset_ms           = 17
+
+# Nicht-Cycle Phase-Timeouts (relativ zum Phaseneintritt).
+init_sync_timeout_ms   = 2000
+peer_sync_timeout_ms   = 500
+cycle_sync_timeout_ms  = 10
+error_mgmt_timeout_ms  = 20
+state_sync_timeout_ms  = 500
+resync_timeout_ms      = 5000
+
+# Universelles Retransmit-Intervall fuer alle collect_phase-Loops.
+# Muss < kleinster Timeout sein.
+send_interval_ms       = 1
+
+# Misc
 stale_frame_threshold_ms = 50
-# Trigger a PeerSync round every N cycles (~10 s at 20 ms/cycle).
 resync_interval_cycles   = 500
 
 [transport]
-interface = "lo"
+interface       = "lo"
 multicast_group = "239.10.0.1"
-port = 5555
+port            = 5555
 
 [diagnostic]
-enabled = true
-interface = "lo"
+enabled         = true
+interface       = "lo"
 multicast_group = "239.10.0.2"
-port = 6666
+port            = 6666

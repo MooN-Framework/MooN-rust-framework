@@ -59,6 +59,12 @@ impl ExclusionVotes {
                 }
             }
             let threshold = reporters / 2 + 1;
+            // SIL 2: no unilateral exclusion. A single reporter (self alone) is
+            // not authoritative — we could be the one that's wrong. If we can't
+            // hear anyone, EM should time out and route to Failsafe.
+            if reporters < 2 {
+                continue;
+            }
             if yes >= threshold {
                 confirmed.set(idx);
             }

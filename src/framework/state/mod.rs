@@ -745,15 +745,20 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
             if own_proposal.contains(idx) {
                 return false;
             }
-            let sent_result = self.cycle.peer_results[idx].is_some();
-            let sent_ack = self.cycle.peer_acks[idx].is_some();
-            if !sent_result && !sent_ack {
+            let sent_result    = self.cycle.peer_results[idx].is_some();
+            let sent_ack       = self.cycle.peer_acks[idx].is_some();
+            // A peer that sent a CycleSync State frame this cycle recorded
+            // its seen-mask into the buffer. Without this, EM entered from
+            // CycleSyncTimeout completes with no votes exchanged because
+            // neither result nor ack slots have been touched yet.
+            let sent_cycle_sync = self.obs.peer_seen[idx].is_some();
+            if !sent_result && !sent_ack && !sent_cycle_sync {
                 return false;
             }
             self.votes.proposals[idx].is_none()
         })
     }
-
+    
     /// Aggregate peer exclusion proposals + own vote into a confirmed mask.
     /// Rule 1a: target's own vote is ignored.
     pub fn aggregate_exclusion_votes(&self) -> PeerMask {

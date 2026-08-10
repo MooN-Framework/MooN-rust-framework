@@ -3,7 +3,7 @@ use crate::framework::diagnostic::{
 };
 use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 impl<C, V, S, T> super::Runner<C, V, S, T>
 where
@@ -13,8 +13,8 @@ where
     T: SelfTest,
     C::Input: for<'de> Deserialize<'de>,
 {
-    /// Drain incoming diagnostic telegrams. GetStatus is answered directly;
-    /// state-changing commands stage themselves inside `Diagnostic`.
+    /// Drain diagnostic telegrams. GetStatus is answered directly; other
+    /// commands are staged inside `Diagnostic`.
     pub(super) fn poll_diagnostic(&mut self) {
         let Some(mut diag) = self.diagnostic.take() else {
             return;
@@ -35,10 +35,37 @@ where
     }
 
     /// Apply staged diagnostic input and injection updates at cycle start.
+    /// Order matters:
+    /// 1. Shutdown check — fires irrevocably before any further work.
+    /// 2. Apply pending injection updates (drop counters, mute, delay).
+    /// 3. Tick per-cycle effects (mute, cycle_delay) → store on the runner
+    ///    so send paths and wait_for_next_cycle_tick can read them.
+    /// 4. Consume staged input.
     pub(super) fn apply_pending_diagnostic(&mut self) {
         let Some(diag) = self.diagnostic.as_mut() else {
             return;
         };
+
+        if diag.take_pending_shutdown() {
+            error!(
+                node_id = self.state.own_id(),
+                "InjectShutdown fired at cycle boundary, terminating process"
+            );
+            std::process::exit(0);
+        }
+
+        diag.apply_pending_injection();
+
+        let (mute_active, delay_ms) = diag.tick_cycle_effects();
+        self.mute_active = mute_active;
+        self.pending_cycle_delay_ms = delay_ms;
+        if mute_active {
+            warn!(node_id = self.state.own_id(), "muted this cycle");
+        }
+        if delay_ms > 0 {
+            warn!(delay_ms, "extra sleep this cycle for skew test");
+        }
+
         if let Some(json) = diag.take_pending_input() {
             match serde_json::from_value::<C::Input>(json) {
                 Ok(new_input) => {
@@ -50,10 +77,8 @@ where
                 }
             }
         }
-        diag.apply_pending_injection();
     }
 
-    /// Build a full status snapshot for a GetStatus reply.
     pub(super) fn build_status_response(&self, diag: &Diagnostic) -> StatusResponse {
         StatusResponse {
             node_id: self.state.own_id(),
@@ -76,8 +101,17 @@ where
                 })
                 .collect(),
             injection: InjectionSnapshot {
+                drop_next_n_inputs: diag.injection.drop_next_n_inputs,
                 drop_next_n_results: diag.injection.drop_next_n_results,
                 drop_next_n_acks: diag.injection.drop_next_n_acks,
+                drop_next_n_cyclesync: diag.injection.drop_next_n_cyclesync,
+                drop_next_n_crc: diag.injection.drop_next_n_crc,
+                drop_next_n_votes: diag.injection.drop_next_n_votes,
+                fake_crc_remaining: diag.injection.fake_crc_remaining,
+                divergent_publisher_remaining: diag.injection.divergent_publisher_remaining,
+                mute_cycles_remaining: diag.injection.mute_cycles_remaining,
+                cycle_delay_ms: diag.injection.cycle_delay_ms,
+                cycle_delay_remaining: diag.injection.cycle_delay_remaining,
             },
             pending_input: diag.pending.has_input(),
             pending_injection_update: diag.pending.has_injection_update(),
