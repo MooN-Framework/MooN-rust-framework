@@ -63,9 +63,10 @@ impl BrakeSelfTest {
     }
 }
 
+/// Default test vectors for the brake self-test.
+/// These are simple cases that exercise the braking curve computation.
 const DEFAULT_VECTORS: &[BrakeSelfTestVector] = &[
-    // Coasting stop from 5 m/s — inside the 0..10 m/s stage (a = 1.0).
-    // v^2 / (2a) = 25 / 2 = 12.5 m, plus 2.5 s buildup at 5 m/s = 12.5 m.
+    /// Simple case: 5 m/s → 0 m/s in 1000 m. Should brake to a stop in 25 m.
     BrakeSelfTestVector {
         input: BrakeInput {
             current_speed: 5.0,
@@ -75,7 +76,7 @@ const DEFAULT_VECTORS: &[BrakeSelfTestVector] = &[
         expected_distance: 25.0,
         tolerance: 1e-6,
     },
-    // Zero-delta case: already at target speed → no braking, just buildup.
+    /// Edge case: 3 m/s → 3 m/s in 100 m. Should brake to a stop in 7.5 m.
     BrakeSelfTestVector {
         input: BrakeInput {
             current_speed: 3.0,
@@ -87,6 +88,8 @@ const DEFAULT_VECTORS: &[BrakeSelfTestVector] = &[
     },
 ];
 
+/// Implement the SelfTest trait for BrakeSelfTest.
+/// This allows the framework to run the self-test at startup,
 impl SelfTest for BrakeSelfTest {
     type Error = SelfTestError;
 

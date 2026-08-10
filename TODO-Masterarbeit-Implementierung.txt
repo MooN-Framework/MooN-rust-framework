@@ -1,10 +1,11 @@
 |================|
 |  TO-DO	     |
 |================|
-- ResyncLostPeer timeouts in Config einarbeiten
+- Unterscheidung zwischen Isolation und Failsafe nachlegen
+- Tatsächliche Notbremse im Fall vom Reißen des Bremsweges => publish anpassen.
+- automatische Testfälle
 - GUI-Diagnosetool
 - Dokumentation + Refactoring
-- Off-By-One-State-Problem bei Ausfall Lösen? (Phase-Drift)
 
 |================|
 |Voter Impl  	 |
@@ -35,6 +36,9 @@
 - SendSystemstate nach Reynchonisierung von LostNode [x]
 - SelfTest umfunktionieren zu trait [X]
 - InputDaten sharen und vergleichen [X]
+- Off-By-One-State-Problem bei Ausfall Lösen? (Phase-Drift) => rendevouz in error management [x]
+- diagnose schnittstelle erweitern [x]
+- ResyncLostPeer timeouts in Config einarbeiten [x]
 
 |================|
 |Fehlermanagement|

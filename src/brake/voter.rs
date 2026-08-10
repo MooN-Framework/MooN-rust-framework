@@ -1,3 +1,6 @@
+//! This module implements the voter trait of the framework.
+//! It defines the `BrakeVoter` struct, which implements the `Voter` trait for the brake example.
+
 use crate::brake::braking_curve::BrakeResult;
 use crate::framework::config::{MAX_DISSENTERS, MAX_TOTAL_NODES};
 use crate::framework::traits::{CyclePayload, Voter, VotingOutcome};
@@ -5,6 +8,8 @@ use crate::framework::wire::{PayloadError, WireReader, WireWriter};
 use heapless::Vec;
 use tracing::error;
 
+/// Cycle Payload implementation for `BrakeResult`. 
+/// This allows the framework to serialize and deserialize `BrakeResult` instances for communication between nodes in the distributed system.
 /// Wire layout (10 bytes, little-endian):
 /// ```text
 ///   0..8   total_distance   (f64)
@@ -39,6 +44,8 @@ pub struct BrakeVoter {
 }
 
 impl BrakeVoter {
+    /// Create a new `BrakeVoter` with the specified minimum number of participants and distance tolerance.
+    /// Checks are performed to ensure that `min_participants` is at least 1 and `distance_tolerance` is non-negative and finite.
     pub fn new(min_participants: u8, distance_tolerance: f64) -> Self {
         assert!(min_participants >= 1, "min_participants must be >= 1");
         assert!(
@@ -79,29 +86,37 @@ impl BrakeVoter {
     }
 }
 
+/// Actual implementation of the `Voter` trait for `BrakeVoter`.
 impl Voter for BrakeVoter {
     type Payload = BrakeResult;
     type Decision = BrakeResult;
 
+    /// Return the minimum number of participants required for a valid vote.
     fn required_participants(&self) -> u8 {
         self.min_participants
     }
 
+    /// Decide on a `BrakeResult` based on the own value and the peer values.
+    /// Returns a `VotingOutcome` indicating whether a consensus was reached, there was a disagreement, or there were insufficient responses.
+    /// The decision is based on a strict majority of agreeing values, with the representative value being the median of the agreeing group.
     fn decide(
         &self,
         own: &BrakeResult,
         peers: &[Option<BrakeResult>],
     ) -> VotingOutcome<BrakeResult> {
+        // Count the number of expected participants and calculate the strict majority and minimum agreement required.
         let n_expected = 1 + peers.len();
         let strict_majority = n_expected / 2 + 1;
         let min_agreement = strict_majority.max(self.min_participants as usize);
 
+        // Collect all valid responses (own and peers) into a single vector for processing.
         let mut all: Vec<BrakeResult, MAX_TOTAL_NODES> = Vec::new();
         let _ = all.push(*own);
         for p in peers.iter().flatten() {
             let _ = all.push(*p);
         }
 
+        // If the number of valid responses is less than the minimum agreement required, return an InsufficientQuorum outcome.
         if all.len() < min_agreement {
             error!(
                 got = all.len(),
@@ -112,6 +127,9 @@ impl Voter for BrakeVoter {
             return VotingOutcome::InsufficientQuorum;
         }
 
+        // Iterate through each candidate value and group all agreeing values together.
+        // If a group meets or exceeds the minimum agreement threshold, 
+        // return a Consensus outcome with the representative value of that group.
         for candidate in all.iter() {
             let mut group: Vec<BrakeResult, MAX_TOTAL_NODES> = Vec::new();
             for other in all.iter() {
@@ -126,13 +144,19 @@ impl Voter for BrakeVoter {
         VotingOutcome::Disagreement
     }
 
+    /// Find dissenters among the peers based on the own value, peer values, and the final decision.
+    /// A decenter is a peer whose value does not agree with the final decision. 
+    /// The function returns a tuple containing a boolean indicating whether the own value dissented and 
+    /// a vector of peer indices that dissented.
     fn find_dissenters(
         &self,
         own: &BrakeResult,
         peers: &[Option<BrakeResult>],
         decision: &BrakeResult,
     ) -> (bool, Vec<u8, MAX_DISSENTERS>) {
+        // Determine if the own value dissented from the final decision and collect the indices of dissenting peers.
         let own_dissented = !self.agree(own, decision);
+        // Iterate through the peers and check if their values agree with the final decision.
         let mut dissenters: Vec<u8, MAX_DISSENTERS> = Vec::new();
         for (idx, peer) in peers.iter().enumerate() {
             if let Some(peer_value) = peer {
@@ -141,6 +165,7 @@ impl Voter for BrakeVoter {
                 }
             }
         }
+        // Return a tuple containing whether the own value dissented and the list of dissenting peer indices.
         (own_dissented, dissenters)
     }
 }

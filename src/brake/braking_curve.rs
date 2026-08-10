@@ -1,3 +1,9 @@
+//! This module implements the braking curve computation for a vehicle. 
+//! It defines the necessary data structures, constants, 
+//! and functions to calculate the total braking distance required to decelerate from a current speed to a target speed within 
+//! an available distance. The braking curve is based on a hardcoded deceleration table that specifies 
+//! different deceleration rates for various speed ranges.
+
 #![deny(unsafe_code)]
 
 use crate::framework::traits::CyclePayload;
@@ -5,6 +11,7 @@ use crate::framework::wire::{PayloadError, WireReader, WireWriter};
 use serde::Deserialize;
 use std::fmt;
 
+/// Hardcoded brake buildup time in seconds. This is the time it takes for the braking system to reach full effectiveness after the brake command is issued.
 pub const BRAKE_BUILDUP_TIME_S: f64 = 2.5;
 
 /// One speed band of the deceleration table.
@@ -15,6 +22,7 @@ pub struct DecelerationStage {
     pub a: f64,
 }
 
+/// Hardcoded deceleration table. Each stage defines a speed range and the corresponding deceleration rate. The table is ordered from lowest to highest speed.
 pub const DECELERATION_STAGES: &[DecelerationStage] = &[
     DecelerationStage {
         v_min: 0.0,
@@ -66,6 +74,10 @@ impl BrakeInput {
     }
 }
 
+/// Implementation of the `CyclePayload` trait for `BrakeInput`. 
+/// This allows `BrakeInput` to be serialized and deserialized for network transmission. 
+/// The wire layout is defined as 24 bytes in little-endian format, with each field represented as a 64-bit floating-point number (f64).
+/// 
 /// Wire layout (24 bytes, little-endian):
 /// ```text
 ///   0..8    current_speed       (f64)
@@ -91,7 +103,9 @@ impl CyclePayload for BrakeInput {
     }
 }
 
-/// Result of one brake curve computation.
+/// Result of a brake curve computation. 
+/// Contains the total distance required to brake to the target speed, whether an emergency brake is needed, #
+/// and whether the input was valid.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrakeResult {
     pub total_distance: f64,
@@ -109,7 +123,9 @@ impl BrakeResult {
     }
 }
 
-/// Input-validation errors. The computation itself is total on valid input.
+/// Error types for brake curve computation. 
+/// These errors indicate invalid input conditions, such as negative speeds or distances, 
+/// or a target speed that exceeds the current speed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BrakeError {
     NotFinite,
@@ -118,6 +134,7 @@ pub enum BrakeError {
     TargetAboveCurrent,
 }
 
+/// Implement the Display trait for BrakeError to provide user-friendly error messages.
 impl fmt::Display for BrakeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -131,6 +148,7 @@ impl fmt::Display for BrakeError {
     }
 }
 
+/// Implement the Error trait for BrakeError to integrate with the standard error handling in Rust.
 impl std::error::Error for BrakeError {}
 
 /// Compute total braking distance and the emergency-brake decision.
@@ -147,6 +165,7 @@ pub fn compute_braking_curve(input: BrakeInput) -> Result<BrakeResult, BrakeErro
     Ok(BrakeResult::new_valid(total, emergency))
 }
 
+/// Validate the brake input. Returns an error if any of the following conditions are met:
 fn validate(input: &BrakeInput) -> Result<(), BrakeError> {
     if !input.current_speed.is_finite()
         || !input.target_speed.is_finite()

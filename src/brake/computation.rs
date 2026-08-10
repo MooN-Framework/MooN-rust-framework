@@ -1,3 +1,9 @@
+//! This module implements the computation trait for the brake example.
+//! It defines the `BrakeComputation` struct, which wraps the `compute_braking_curve` function and 
+//! implements the `Computation` trait from the framework. 
+//! The computation takes a `BrakeInput` and produces a `BrakeResult`, 
+//! while also providing a mechanism to check if two inputs agree within specified tolerances.
+
 use crate::brake::braking_curve::{compute_braking_curve, BrakeError, BrakeInput, BrakeResult};
 use crate::framework::traits::Computation;
 
@@ -17,7 +23,7 @@ impl BrakeInputTolerance {
             distance_tolerance,
         }
     }
-
+    /// Check if two BrakeInput instances agree within the specified tolerances.
     fn matches(&self, own: &BrakeInput, peer: &BrakeInput) -> bool {
         (own.current_speed - peer.current_speed).abs() <= self.speed_tolerance
             && (own.target_speed - peer.target_speed).abs() <= self.speed_tolerance
@@ -25,8 +31,6 @@ impl BrakeInputTolerance {
     }
 }
 
-/// Adapter wrapping `compute_braking_curve` as a framework `Computation`.
-/// `tolerance` gates the ShareInputs divergence check.
 #[derive(Debug, Clone, Copy)]
 pub struct BrakeComputation {
     pub tolerance: BrakeInputTolerance,
@@ -38,6 +42,11 @@ impl BrakeComputation {
     }
 }
 
+/// Implement the Computation trait for BrakeComputation. 
+/// This allows the framework to use BrakeComputation as a computation unit that processes BrakeInput and produces BrakeResult, 
+/// while also handling input agreement checks based on defined tolerances.
+/// This allows to implement the framework for different use cases, as the computation can be swapped out with other implementations 
+/// that adhere to the Computation trait.
 impl Computation for BrakeComputation {
     type Input = BrakeInput;
     type Payload = BrakeResult;
