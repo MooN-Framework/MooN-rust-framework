@@ -71,6 +71,26 @@ impl ExclusionVotes {
         }
         confirmed
     }
+
+    pub fn self_excluded_by_peers(&self, roster: &PeerRoster, own_id: u8) -> bool {
+        let mut yes = 0usize;
+        let mut reporters = 0usize;
+        for (i, other) in roster.peers().iter().enumerate() {
+            if other.health == PeerHealth::Lost {
+                continue;
+            }
+            if let Some(mask) = self.proposals[i] {
+                reporters += 1;
+                if sender_marked_target(roster, own_id, other.id, mask, own_id) {
+                    yes += 1;
+                }
+            }
+        }
+        if reporters < 2 {
+            return false;
+        }
+        yes >= reporters / 2 + 1
+    }
 }
 
 /// Decode whether `sender_id` marked `target_id` in its proposal mask.

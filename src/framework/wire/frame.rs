@@ -76,17 +76,20 @@ pub enum FrameError {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailsafeReason {
-    Unspecified          = 0x00,
-    QuorumLost           = 0x01,
-    StateDivergence      = 0x02,
-    SelfTestFailed       = 0x03,
-    SinkSafetyViolation  = 0x04,
-    LocalFault           = 0x05,
-    PeerBroadcast        = 0x06,
+    Unspecified = 0x00,
+    QuorumLost = 0x01,
+    StateDivergence = 0x02,
+    SelfTestFailed = 0x03,
+    SinkSafetyViolation = 0x04,
+    LocalFault = 0x05,
+    PeerBroadcast = 0x06,
 }
 
 impl FailsafeReason {
-    #[inline] pub fn to_wire(self) -> u8 { self as u8 }
+    #[inline]
+    pub fn to_wire(self) -> u8 {
+        self as u8
+    }
 }
 
 impl From<PayloadError> for FrameError {
@@ -150,7 +153,9 @@ pub enum Payload<I: CyclePayload, R: CyclePayload> {
     SystemStateSnapshotAck {
         adopted_crc: u32,
     },
-    GoFailsafe { reason: u8 },
+    GoFailsafe {
+        reason: u8,
+    },
 }
 
 impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
@@ -232,7 +237,9 @@ impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
             Payload::SystemStateSnapshotAck { adopted_crc } => {
                 w.push_u32(*adopted_crc);
             }
-            Payload::GoFailsafe { reason } => { w.push_u8(*reason); }
+            Payload::GoFailsafe { reason } => {
+                w.push_u8(*reason);
+            }
         }
     }
 
@@ -284,7 +291,9 @@ impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
             DISC_SYSTEM_STATE_SNAPSHOT_ACK => Payload::SystemStateSnapshotAck {
                 adopted_crc: r.read_u32()?,
             },
-            DISC_GO_FAILSAFE => Payload::GoFailsafe { reason: r.read_u8()? },
+            DISC_GO_FAILSAFE => Payload::GoFailsafe {
+                reason: r.read_u8()?,
+            },
             _ => return Err(FrameError::UnknownDiscriminator),
         })
     }

@@ -1,13 +1,14 @@
 use super::PhaseOutcome;
+use crate::framework::config::MAX_TOTAL_NODES;
 use crate::framework::peer_sync::{extract_sync_fields, PeerSync, SyncFields, SAMPLES_PER_PEER};
 use crate::framework::state::{crc_from_snapshot_fields, PeerHealth, StoredSnapshot};
 use crate::framework::state_machine::{NodeState, StateEvent, SystemState};
+use crate::framework::traits::SinkVerdict;
 use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter, VotingOutcome};
 use crate::framework::transport::RecvOutcome;
 use crate::framework::types::PeerMask;
-use crate::framework::wire::Payload;
-use crate::framework::traits::SinkVerdict;
 use crate::framework::wire::FailsafeReason;
+use crate::framework::wire::Payload;
 use serde::Deserialize;
 use std::cell::Cell;
 use std::thread::sleep;
@@ -836,6 +837,8 @@ where
         }
     }
 
+    // runner/phases.rs — komplette Ersetzung fuer handle_system_state_crc.
+
     pub(super) fn handle_system_state_crc(&mut self) -> StateEvent {
         self.state.reset_crc_evidence();
         let _ = self.take_peer_in_error();
@@ -896,16 +899,50 @@ where
 
         match outcome {
             super::PhaseOutcome::Complete => {
-                // Divergence detection uses the REAL crc against peer values.
                 if self.state.crc_unanimous(real_crc) {
-                    StateEvent::CrcOk
-                } else {
-                    error!(real_crc, "crc divergence, failsafe");
-                    StateEvent::CrcDivergent
+                    return StateEvent::CrcOk;
+                }
+                // Divergenz: Mehrheit ueber own + peer CRCs ermitteln.
+                match self.state.identify_crc_majority(real_crc) {
+                    Some(majority_crc) => {
+                        if real_crc == majority_crc {
+                            // Wir sind in Majority — Minority-Peers zum
+                            // Ausschluss proposen. EM erledigt den Rest.
+                            let divergent = self.state.peers_with_crc_other_than(majority_crc);
+                            for peer_id in divergent {
+                                warn!(peer_id, "peer crc divergent, proposing exclude");
+                                let _ = self.state.propose_exclude(peer_id);
+                            }
+                        } else {
+                            // Wir sind in Minority — wir werden per
+                            // self_excluded_by_peers-Detektor in EM
+                            // isoliert.
+                            warn!(
+                                own_crc = real_crc,
+                                majority_crc, "own crc in minority, expect isolation via EM"
+                            );
+                        }
+                        StateEvent::CrcDivergent
+                    }
+                    None => {
+                        error!(
+                            real_crc,
+                            "crc divergence without recoverable majority, failsafe"
+                        );
+                        self.mark_failsafe(FailsafeReason::StateDivergence);
+                        StateEvent::Fault
+                    }
                 }
             }
-            super::PhaseOutcome::Timeout => StateEvent::CrcDivergent,
-            super::PhaseOutcome::Fault => StateEvent::Fault,
+            super::PhaseOutcome::Timeout => {
+                error!("crc phase timeout, failsafe");
+                self.mark_failsafe(FailsafeReason::QuorumLost);
+                StateEvent::Fault
+            }
+            super::PhaseOutcome::Fault => {
+                self.mark_failsafe(FailsafeReason::LocalFault);
+                StateEvent::Fault
+            }
         }
     }
 
@@ -928,31 +965,72 @@ where
                 let publisher = match self.state.publisher_consensus(own_pick) {
                     Some(id) => id,
                     None => {
-                        let picks: Vec<(u8, u8)> = self
-                            .state
-                            .peers()
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(idx, p)| {
+                        // Sammle alle picks (own + healthy peers) fuer das Bucketing.
+                        let picks_with_ids: heapless::Vec<(u8, u8), MAX_TOTAL_NODES> = {
+                            let mut v = heapless::Vec::new();
+                            let _ = v.push((self.state.own_id(), own_pick));
+                            for (idx, p) in self.state.peers().iter().enumerate() {
                                 if p.health == PeerHealth::Lost {
-                                    return None;
+                                    continue;
                                 }
-                                self.state.cycle().peer_acks[idx]
-                                    .map(|a| (p.id, a.publisher_candidate))
-                            })
-                            .collect();
-                        error!(
-                            own_id = self.state.own_id(),
-                            own_pick,
-                            peer_picks = ?picks,
-                            "publisher pick divergence, failsafe"
-                        );
-                        self.mark_failsafe(FailsafeReason::StateDivergence);
-                        return StateEvent::Fault;
+                                if let Some(ack) = self.state.cycle().peer_acks[idx] {
+                                    let _ = v.push((p.id, ack.publisher_candidate));
+                                }
+                            }
+                            v
+                        };
+                        let pick_values: heapless::Vec<u8, MAX_TOTAL_NODES> =
+                            picks_with_ids.iter().map(|(_, pick)| *pick).collect();
+
+                        match crate::framework::state::strict_majority(&pick_values) {
+                            Some(majority_pick) => {
+                                if own_pick == majority_pick {
+                                    // Wir sind in Majority: propose alle Peers mit
+                                    // abweichendem Pick.
+                                    for (peer_id, pick) in picks_with_ids.iter() {
+                                        if *peer_id == self.state.own_id() {
+                                            continue;
+                                        }
+                                        if *pick != majority_pick {
+                                            warn!(
+                                                peer_id,
+                                                peer_pick = *pick,
+                                                majority_pick,
+                                                "peer publisher pick divergent, proposing exclude"
+                                            );
+                                            let _ = self.state.propose_exclude(*peer_id);
+                                        }
+                                    }
+                                } else {
+                                    // Own pick ist Minority — wir werden per EM-Detektor
+                                    // isoliert werden.
+                                    warn!(
+                                        own_id = self.state.own_id(),
+                                        own_pick,
+                                        majority_pick,
+                                        "own publisher pick in minority, expect isolation via EM"
+                                    );
+                                }
+                                // Route ueber EM statt Failsafe.
+                                return StateEvent::DissenterDetected;
+                            }
+                            None => {
+                                // Keine Publisher-Mehrheit ermittelbar → echter
+                                // Byzantine → Failsafe wie bisher.
+                                error!(
+                                    own_id = self.state.own_id(),
+                                    own_pick,
+                                    peer_picks = ?picks_with_ids,
+                                    "publisher pick divergence without recoverable majority, failsafe"
+                                );
+                                self.mark_failsafe(FailsafeReason::StateDivergence);
+                                return StateEvent::Fault;
+                            }
+                        }
                     }
                 };
                 let own_id = self.state.own_id();
-    
+
                 let own_result = self.state.cycle().own_result;
                 let dissenter_analysis = own_result.map(|own| {
                     self.state.voter().find_dissenters(
@@ -961,7 +1039,7 @@ where
                         &decision,
                     )
                 });
-    
+
                 if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
                     if own_dissented {
                         error!(own_id, "own value dissented, failsafe");
@@ -973,7 +1051,7 @@ where
                             .iter()
                             .filter_map(|idx| self.state.peers().get(*idx as usize).map(|p| p.id))
                             .collect();
-    
+
                         if publisher == own_id {
                             warn!(
                                 publisher,
@@ -988,7 +1066,7 @@ where
                         return StateEvent::DissenterDetected;
                     }
                 }
-    
+
                 // Domain safety gate. Runs on every node, not only the
                 // publisher, so all nodes agree on the failsafe transition
                 // even before the GoFailsafe broadcast races through the
@@ -1004,19 +1082,19 @@ where
                     self.mark_failsafe(FailsafeReason::SinkSafetyViolation);
                     return StateEvent::Fault;
                 }
-    
+
                 if publisher == own_id {
                     info!(publisher, "consensus reached, publishing");
                     self.sink.publish(&decision);
                 } else {
                     debug!(publisher, own_id, "consensus reached, peer publishes");
                 }
-    
+
                 let promoted = self.state.tick_probation();
                 if promoted > 0 {
                     info!(promoted, "peers promoted from Probation to Alive");
                 }
-    
+
                 let confirmed_rejoin = self.state.aggregate_rejoin_votes();
                 if confirmed_rejoin.as_u8() != 0 {
                     warn!(
@@ -1026,7 +1104,7 @@ where
                     self.state.set_pending_rejoin(confirmed_rejoin);
                     return StateEvent::GoResyncLostPeer;
                 }
-    
+
                 self.cycles_since_last_sync = self.cycles_since_last_sync.saturating_add(1);
                 if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
                     info!(
@@ -1068,7 +1146,7 @@ where
     pub(super) fn handle_error_management(&mut self) -> StateEvent {
         self.state.reset_exclusion_proposals();
         let _ = self.take_peer_in_error();
-    
+
         let suppress = self.is_muted()
             || self
                 .diagnostic
@@ -1078,11 +1156,11 @@ where
         if suppress {
             warn!("injection: suppressing exclusion vote send");
         }
-    
+
         let own_proposal = self.state.proposed_exclusions();
         let node_state = self.state.node_state();
         let deadline = std::time::Instant::now() + self.timing.error_mgmt_timeout;
-    
+
         let outcome = self.collect_phase(
             "exclusion_vote",
             deadline,
@@ -1104,12 +1182,25 @@ where
             |this| this.state.healthy_peers_missing_vote().is_empty(),
             |this, frame| this.ingest_frame(frame),
         );
-    
+
         let _ = self.take_peer_in_error();
-    
+
         match outcome {
             super::PhaseOutcome::Complete => {
                 let no_buffer_before_vote = self.state.tolerable_failures_remaining() == 0;
+
+                if self.state.self_excluded_by_peers() {
+                    warn!(
+                        own_id = self.state.own_id(),
+                        "peer majority excluded self, entering isolation"
+                    );
+                    // Keine confirmed exclusions anwenden — die peer roster
+                    // aus unserer Sicht ist gleich, wir bewegen uns nur in
+                    // Isolation. mark_failsafe NICHT setzen; Isolation ist
+                    // kein Failsafe.
+                    return StateEvent::SelfExcluded;
+                }
+
                 let confirmed = self.state.aggregate_exclusion_votes();
                 let transitions = self.state.apply_confirmed_exclusions(confirmed);
                 if transitions > 0 {
@@ -1119,6 +1210,7 @@ where
                         "health transitions"
                     );
                 }
+
                 self.state.start_new_cycle(self.next_cycle_tick());
                 if !self.state.quorum_available() {
                     self.mark_failsafe(FailsafeReason::QuorumLost);

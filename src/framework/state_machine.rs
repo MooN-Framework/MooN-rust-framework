@@ -74,7 +74,7 @@ pub enum StateEvent {
     StateTimeout,
     TooFewNodes,
     Fault,
-
+    SelfExcluded,
     /// A healthy peer's frame carried a `node_state` of `ErrorManagement`
     /// while we were still in an earlier in-cycle phase. Rendezvous rule:
     /// follow the peer forward so both healthy nodes reach the exclusion
@@ -140,6 +140,7 @@ impl NodeState {
             (ErrorManagement, StateDiverged) => Failsafe,
             (ErrorManagement, StateTimeout) => Failsafe,
             (ErrorManagement, TooFewNodes) => Failsafe,
+            (ErrorManagement, SelfExcluded) => Isolation,
 
             (Failsafe, _) => Failsafe,
             (_, Fault) => Failsafe,

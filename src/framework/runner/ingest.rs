@@ -25,10 +25,13 @@ where
         let peer_id = frame.node_id();
 
         if let Payload::GoFailsafe { reason } = frame.payload() {
-            warn!(peer_id, reason, "Peer broadcast GoFailsafe, entering failsafe");
+            warn!(
+                peer_id,
+                reason, "Peer broadcast GoFailsafe, entering failsafe"
+            );
             self.peer_failsafe_seen = true;
             return;
-         }
+        }
 
         if self.state.discovery_locked() && self.state.peer_index(peer_id).is_none() {
             warn!(peer_id, "frame from unknown peer post-discovery, dropped");

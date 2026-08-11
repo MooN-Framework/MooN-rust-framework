@@ -454,6 +454,41 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         true
     }
 
+    /// Sammelt eigene + gesunde peer CRCs, ermittelt strikte Mehrheit.
+    /// Wird von handle_system_state_crc genutzt: bei ermittelbarer
+    /// Mehrheit werden alle Minority-Nodes exkludiert, sonst Failsafe.
+    pub fn identify_crc_majority(&self, own_crc: u32) -> Option<u32> {
+        let mut values: heapless::Vec<u32, MAX_TOTAL_NODES> = heapless::Vec::new();
+        let _ = values.push(own_crc);
+        for (idx, peer) in self.roster.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            if let Some(c) = self.peer_crcs[idx] {
+                let _ = values.push(c);
+            }
+        }
+        strict_majority(&values)
+    }
+
+    /// Peer-Ids deren gemeldete CRC nicht der uebergebenen Mehrheits-CRC
+    /// entspricht. Nutzung: nach identify_crc_majority alle mit
+    /// abweichender CRC in die eigene Exclusion-Proposal aufnehmen.
+    pub fn peers_with_crc_other_than(&self, majority: u32) -> heapless::Vec<u8, MAX_PEERS> {
+        let mut out: heapless::Vec<u8, MAX_PEERS> = heapless::Vec::new();
+        for (idx, peer) in self.roster.peers().iter().enumerate() {
+            if peer.health == PeerHealth::Lost {
+                continue;
+            }
+            if let Some(c) = self.peer_crcs[idx] {
+                if c != majority {
+                    let _ = out.push(peer.id);
+                }
+            }
+        }
+        out
+    }
+
     pub fn peer_index(&self, id: u8) -> Option<usize> {
         self.roster.peer_index(id)
     }
@@ -928,6 +963,10 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         true
     }
 
+    pub fn self_excluded_by_peers(&self) -> bool {
+        self.votes.self_excluded_by_peers(&self.roster, self.own_id)
+    }
+
     pub fn own_id(&self) -> u8 {
         self.own_id
     }
@@ -967,4 +1006,26 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
     pub fn set_was_lost(&mut self, lost: bool) {
         self.was_lost = lost;
     }
+}
+
+pub(crate) fn strict_majority<T: Eq + Copy>(values: &[T]) -> Option<T> {
+    let n = values.len();
+    if n == 0 {
+        return None;
+    }
+    let threshold = n / 2 + 1;
+    let mut best: Option<(T, usize)> = None;
+    for &v in values.iter() {
+        let count = values.iter().filter(|&&x| x == v).count();
+        if count >= threshold {
+            return Some(v);
+        }
+        match best {
+            Some((_, c)) if count <= c => {}
+            _ => best = Some((v, count)),
+        }
+    }
+    // Kein Wert erreicht threshold.
+    let _ = best;
+    None
 }
