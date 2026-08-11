@@ -62,11 +62,51 @@ pub trait Computation {
     fn inputs_agree(&self, own: &Self::Input, peer: &Self::Input) -> bool;
 }
 
+// ... alles davor unverändert ...
+
+/// Verdict returned by the sink for each voted decision, evaluated on
+/// every node (not only the publisher). `Failsafe` routes the whole
+/// system to fail-stop; the publisher still publishes the current
+/// decision so the physical actuator receives the safe reaction (e.g.
+/// emergency brake) before the runner terminates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkVerdict {
+    Deliver,
+    Failsafe,
+}
+
 /// Recipient of the voting decision. Called once per cycle on consensus.
+///
+/// Lifecycle hooks separate the two terminal-ish events:
+///
+/// - `on_isolation`: this node is out of consensus (e.g. wrong CRC,
+///   state-sync minority) but the *fabric* keeps operating with the
+///   remaining nodes. The local actuator wiring should freeze on the
+///   last delivered value or hand off to a peer's publisher.
+/// - `on_failsafe`: system-wide fail-stop. The actuator must be driven
+///   into its safe state. Called exactly once, right before the runner
+///   exits.
 pub trait DecisionSink {
     type Decision;
 
+    /// Domain-specific safety gate. Every node calls this after voting
+    /// consensus to decide whether the decision is safe to deliver. The
+    /// default assumes the decision is always deliverable; override for
+    /// safety-critical domains.
+    fn evaluate(&self, _decision: &Self::Decision) -> SinkVerdict {
+        SinkVerdict::Deliver
+    }
+
+    /// Push the decision to the actuator/log/diagnostic wiring. Only the
+    /// designated publisher calls this in the normal path.
     fn publish(&mut self, decision: &Self::Decision);
+
+    /// This node is entering `Isolation`. System operation continues on
+    /// the remaining nodes. Default is no-op.
+    fn on_isolation(&mut self) {}
+
+    /// System-wide fail-stop is being triggered. Default is no-op.
+    fn on_failsafe(&mut self) {}
 }
 
 /// Power-on self-test. Called once from the `Startup` phase before the

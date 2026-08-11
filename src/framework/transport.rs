@@ -1,7 +1,7 @@
-//! This module implements the transport layer of the framework,
+//! This module implements the transport layer of the framework, 
 //! which is responsible for sending and receiving messages between nodes in a distributed system.
-//! The transport layer uses UDP multicast to communicate with peers, and it provides mechanisms for framing, sequencing,
-//! and session management.
+//! The transport layer uses UDP multicast to communicate with peers, and it provides mechanisms for framing, sequencing, 
+//! and session management. 
 //! The transport layer is designed to be efficient and reliable, handling common issues such as packet loss, duplication, and reordering.
 
 use crate::framework::config::TransportConfig;
@@ -14,6 +14,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::OnceLock;
 use std::time::Instant;
+
 
 const HEADER_SIZE: usize = 23;
 const CRC_SIZE: usize = 4;

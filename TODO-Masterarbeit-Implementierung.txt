@@ -1,8 +1,10 @@
 |================|
 |  TO-DO	     |
 |================|
-- Unterscheidung zwischen Isolation und Failsafe nachlegen
-- Tatsächliche Notbremse im Fall vom Reißen des Bremsweges => publish anpassen.
+- Unterscheidung zwischen Isolation und Failsafe nachlegen [x]
+- Tatsächliche Notbremse im Fall vom Reißen des Bremsweges => publish anpassen. [x]
+- Failsafe Signal um die anderen Knoten zum failsafe zu bringen [x]
+
 - automatische Testfälle
 - GUI-Diagnosetool
 - Dokumentation + Refactoring => Document rest of framework

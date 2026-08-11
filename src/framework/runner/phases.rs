@@ -6,6 +6,8 @@ use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter, Votin
 use crate::framework::transport::RecvOutcome;
 use crate::framework::types::PeerMask;
 use crate::framework::wire::Payload;
+use crate::framework::traits::SinkVerdict;
+use crate::framework::wire::FailsafeReason;
 use serde::Deserialize;
 use std::cell::Cell;
 use std::thread::sleep;
@@ -32,15 +34,22 @@ where
             }
             Err(e) => {
                 error!(error = ?e, "self test failed");
+                self.mark_failsafe(FailsafeReason::SelfTestFailed);
                 StateEvent::SelfTestErr
             }
         }
     }
 
-    /// Isolation: park until external intervention.
+    /// Isolation: park until external intervention. The sink hook fires
+    /// exactly once so the local wiring can log / release its actuator
+    /// claim. No `transport.recv()` here: the node is already out of the
+    /// ack round and the publisher election, so a GoFailsafe from the
+    /// remaining fabric would not change the local actuator state. Only a
+    /// restart brings the node back.
     pub(super) fn handle_isolation(&mut self) -> StateEvent {
+        warn!("isolation entered, notifying sink");
+        self.sink.on_isolation();
         loop {
-            warn!("isolation entered, waiting for intervention");
             sleep(Duration::from_secs(1));
             self.poll_diagnostic();
         }
@@ -902,6 +911,15 @@ where
 
     /// PublishResult: run the vote, publish the decision if we're the
     /// designated publisher, route dissenters through ErrorManagement.
+    ///
+    /// Failsafe conditions handled here:
+    /// - Publisher-pick divergence across the fabric.
+    /// - Own value dissents from consensus.
+    /// - Sink evaluates the voted decision as unsafe (e.g. brake distance
+    ///   exceeded). In this case the publisher pushes the decision to the
+    ///   actuator one last time so the physical safe reaction (emergency
+    ///   brake) actually engages, then the node faults.
+    /// - Insufficient quorum on the vote.
     pub(super) fn handle_publish(&mut self) -> StateEvent {
         let outcome = self.state.run_vote();
         match outcome {
@@ -929,11 +947,12 @@ where
                             peer_picks = ?picks,
                             "publisher pick divergence, failsafe"
                         );
+                        self.mark_failsafe(FailsafeReason::StateDivergence);
                         return StateEvent::Fault;
                     }
                 };
                 let own_id = self.state.own_id();
-
+    
                 let own_result = self.state.cycle().own_result;
                 let dissenter_analysis = own_result.map(|own| {
                     self.state.voter().find_dissenters(
@@ -942,10 +961,11 @@ where
                         &decision,
                     )
                 });
-
+    
                 if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
                     if own_dissented {
                         error!(own_id, "own value dissented, failsafe");
+                        self.mark_failsafe(FailsafeReason::StateDivergence);
                         return StateEvent::Fault;
                     }
                     if !peer_dissenter_indices.is_empty() {
@@ -953,7 +973,7 @@ where
                             .iter()
                             .filter_map(|idx| self.state.peers().get(*idx as usize).map(|p| p.id))
                             .collect();
-
+    
                         if publisher == own_id {
                             warn!(
                                 publisher,
@@ -968,19 +988,35 @@ where
                         return StateEvent::DissenterDetected;
                     }
                 }
-
+    
+                // Domain safety gate. Runs on every node, not only the
+                // publisher, so all nodes agree on the failsafe transition
+                // even before the GoFailsafe broadcast races through the
+                // fabric.
+                if self.sink.evaluate(&decision) == SinkVerdict::Failsafe {
+                    error!(
+                        own_id,
+                        "sink rejected decision as unsafe, publishing then failsafe"
+                    );
+                    if publisher == own_id {
+                        self.sink.publish(&decision);
+                    }
+                    self.mark_failsafe(FailsafeReason::SinkSafetyViolation);
+                    return StateEvent::Fault;
+                }
+    
                 if publisher == own_id {
                     info!(publisher, "consensus reached, publishing");
                     self.sink.publish(&decision);
                 } else {
                     debug!(publisher, own_id, "consensus reached, peer publishes");
                 }
-
+    
                 let promoted = self.state.tick_probation();
                 if promoted > 0 {
                     info!(promoted, "peers promoted from Probation to Alive");
                 }
-
+    
                 let confirmed_rejoin = self.state.aggregate_rejoin_votes();
                 if confirmed_rejoin.as_u8() != 0 {
                     warn!(
@@ -990,7 +1026,7 @@ where
                     self.state.set_pending_rejoin(confirmed_rejoin);
                     return StateEvent::GoResyncLostPeer;
                 }
-
+    
                 self.cycles_since_last_sync = self.cycles_since_last_sync.saturating_add(1);
                 if self.cycles_since_last_sync >= self.timing.resync_interval_cycles {
                     info!(
@@ -1012,6 +1048,7 @@ where
                     peer_results = self.state.cycle().peer_results.len(),
                     "insufficient quorum"
                 );
+                self.mark_failsafe(FailsafeReason::QuorumLost);
                 StateEvent::Fault
             }
         }
@@ -1021,7 +1058,9 @@ where
     /// transitions, then decide on the next system state.
     ///
     /// Failsafe conditions:
-    /// - Vote timed out with a healthy peer silent (Rule 2b).
+    /// - Vote timed out with a healthy peer silent (Rule 2b) — tagged as
+    ///   `QuorumLost` because a silent healthy peer is indistinguishable
+    ///   from a lost one at this point.
     /// - Quorum lost after applying transitions.
     /// - Fabric now in degraded mode AND no peer evidence this cycle:
     ///   'we are blind' and 'peer is dead' are indistinguishable without a
@@ -1029,7 +1068,7 @@ where
     pub(super) fn handle_error_management(&mut self) -> StateEvent {
         self.state.reset_exclusion_proposals();
         let _ = self.take_peer_in_error();
-
+    
         let suppress = self.is_muted()
             || self
                 .diagnostic
@@ -1039,11 +1078,11 @@ where
         if suppress {
             warn!("injection: suppressing exclusion vote send");
         }
-
+    
         let own_proposal = self.state.proposed_exclusions();
         let node_state = self.state.node_state();
         let deadline = std::time::Instant::now() + self.timing.error_mgmt_timeout;
-
+    
         let outcome = self.collect_phase(
             "exclusion_vote",
             deadline,
@@ -1065,9 +1104,9 @@ where
             |this| this.state.healthy_peers_missing_vote().is_empty(),
             |this, frame| this.ingest_frame(frame),
         );
-
+    
         let _ = self.take_peer_in_error();
-
+    
         match outcome {
             super::PhaseOutcome::Complete => {
                 let no_buffer_before_vote = self.state.tolerable_failures_remaining() == 0;
@@ -1082,15 +1121,23 @@ where
                 }
                 self.state.start_new_cycle(self.next_cycle_tick());
                 if !self.state.quorum_available() {
+                    self.mark_failsafe(FailsafeReason::QuorumLost);
                     return StateEvent::TooFewNodes;
                 }
                 if no_buffer_before_vote {
+                    self.mark_failsafe(FailsafeReason::QuorumLost);
                     return StateEvent::TooFewNodes;
                 }
                 StateEvent::StateOk
             }
-            super::PhaseOutcome::Timeout => StateEvent::StateTimeout,
-            super::PhaseOutcome::Fault => StateEvent::Fault,
+            super::PhaseOutcome::Timeout => {
+                self.mark_failsafe(FailsafeReason::QuorumLost);
+                StateEvent::StateTimeout
+            }
+            super::PhaseOutcome::Fault => {
+                self.mark_failsafe(FailsafeReason::LocalFault);
+                StateEvent::Fault
+            }
         }
     }
 

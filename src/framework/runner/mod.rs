@@ -8,12 +8,13 @@ pub use collect::PhaseOutcome;
 use crate::framework::config::{CycleTiming, DiagnosticConfig};
 use crate::framework::diagnostic::Diagnostic;
 use crate::framework::state::RunState;
-use crate::framework::state_machine::NodeState;
+use crate::framework::state_machine::{NodeState, StateEvent};
+use crate::framework::wire::{FailsafeReason, Payload};
 use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
 use crate::framework::transport::UdpTransport;
 use serde::Deserialize;
 use std::time::Instant;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub struct Runner<C, V, S, T>
 where
@@ -48,6 +49,8 @@ where
     /// Used by InjectCycleDelay to test cycle-skew handling. Refreshed
     /// once per cycle in `apply_pending_diagnostic`.
     pub(super) pending_cycle_delay_ms: u32,
+    pub(super) peer_failsafe_seen: bool,
+    pub(super) pending_failsafe_reason: Option<FailsafeReason>,
 }
 
 impl<C, V, S, T> Runner<C, V, S, T>
@@ -96,6 +99,8 @@ where
             peer_in_error_seen: false,
             mute_active: false,
             pending_cycle_delay_ms: 0,
+            peer_failsafe_seen: false,
+            pending_failsafe_reason: None,
         }
     }
 
@@ -127,42 +132,78 @@ where
         core::mem::replace(&mut self.pending_cycle_delay_ms, 0)
     }
 
-    pub fn run(&mut self) {
-        info!(own_id = self.state.own_id(), "runner started");
-        loop {
-            let current = self.state.node_state();
-            debug!(state = ?current, seq = self.state.current_seq(), "phase enter");
+pub fn run(&mut self) {
+    info!(own_id = self.state.own_id(), "runner started");
+    loop {
+        let current = self.state.node_state();
+        debug!(state = ?current, seq = self.state.current_seq(), "phase enter");
+ 
+        let mut event = match current {
+            NodeState::Startup                => self.handle_startup(),
+            NodeState::InitSync               => self.handle_init_sync(),
+            NodeState::PeerSync               => self.handle_peer_sync(),
+            NodeState::CycleSync              => self.handle_cycle_sync(),
+            NodeState::ReadInputs             => self.handle_read_inputs(),
+            NodeState::ShareInputs            => self.handle_share_inputs(),
+            NodeState::ShareResult            => self.handle_share_result(),
+            NodeState::SendAck                => self.handle_send_ack(),
+            NodeState::PublishResult          => self.handle_publish(),
+            NodeState::ErrorManagement        => self.handle_error_management(),
+            NodeState::Isolation              => self.handle_isolation(),
+            NodeState::ResyncLostPeer         => self.handle_resync_lost_node(),
+            NodeState::SystemStateCrcExchange => self.handle_system_state_crc(),
+            NodeState::SystemStateSync        => self.handle_system_state_sync(),
+            NodeState::Failsafe => {
+                let reason = self.pending_failsafe_reason
+                    .unwrap_or(FailsafeReason::LocalFault);
+                self.enter_failsafe(reason);
+                return;
+            }
+        };
+ 
+        self.poll_diagnostic();
+ 
+        if self.peer_failsafe_seen {
+            warn!("peer_failsafe_seen set, forcing Fault");
+            self.mark_failsafe(FailsafeReason::PeerBroadcast);
+            event = StateEvent::Fault;
+        }
+ 
+        let next = current.next(event);
+        info!(from = ?current, event = ?event, to = ?next, "transition");
+        self.state.set_node_state(next);
+    }
+}
 
-            let event = match current {
-                NodeState::Startup => self.handle_startup(),
-                NodeState::InitSync => self.handle_init_sync(),
-                NodeState::PeerSync => self.handle_peer_sync(),
-                NodeState::CycleSync => self.handle_cycle_sync(),
-                NodeState::ReadInputs => self.handle_read_inputs(),
-                NodeState::ShareInputs => self.handle_share_inputs(),
-                NodeState::ShareResult => self.handle_share_result(),
-                NodeState::SendAck => self.handle_send_ack(),
-                NodeState::PublishResult => self.handle_publish(),
-                NodeState::ErrorManagement => self.handle_error_management(),
-                NodeState::Isolation => self.handle_isolation(),
-                NodeState::ResyncLostPeer => self.handle_resync_lost_node(),
-                NodeState::SystemStateCrcExchange => self.handle_system_state_crc(),
-                NodeState::SystemStateSync => self.handle_system_state_sync(),
-                NodeState::Failsafe => {
-                    self.enter_failsafe();
-                    return;
-                }
-            };
-
-            self.poll_diagnostic();
-
-            let next = current.next(event);
-            info!(from = ?current, event = ?event, to = ?next, "transition");
-            self.state.set_node_state(next);
+    #[inline]
+    pub(super) fn mark_failsafe(&mut self, reason: FailsafeReason) {
+        // Erster Grund gewinnt — spaetere Ueberschreibungen sind meist
+        // Folgefehler, die weniger informativ sind.
+        if self.pending_failsafe_reason.is_none() {
+            self.pending_failsafe_reason = Some(reason);
         }
     }
 
-    fn enter_failsafe(&mut self) {
-        error!(own_id = self.state.own_id(), "failsafe entered");
+    fn enter_failsafe(&mut self, reason: FailsafeReason) {
+        error!(
+            own_id = self.state.own_id(),
+            reason = ?reason,
+            "failsafe entered"
+        );
+    
+        // Best-effort GoFailsafe-Broadcast an alle Peers.
+        let node_state = self.state.node_state();
+        for _ in 0..3 {
+            if let Err(e) = self.transport.send(
+                node_state,
+                Payload::GoFailsafe { reason: reason.to_wire() },
+            ) {
+                error!(error = ?e, "GoFailsafe send failed");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    
+        // Aktor in sicheren Zustand.
+        self.sink.on_failsafe();
     }
 }

@@ -33,6 +33,7 @@ const SNAPSHOT_SCALARS: usize = 1 + 1 + 4 + 4;
 const SNAPSHOT_SLOT_SIZE: usize = 1 + 1 + 1 + 4;
 const SYSTEM_STATE_SNAPSHOT_BODY: usize = SNAPSHOT_SCALARS + SNAPSHOT_SLOT_SIZE * MAX_TOTAL_NODES;
 const SYSTEM_STATE_SNAPSHOT_ACK_BODY: usize = 4;
+const GO_FAILSAFE_BODY: usize = 1;
 
 const DISC_STATE: u8 = 0x00;
 const DISC_RESULT: u8 = 0x01;
@@ -44,6 +45,7 @@ const DISC_SYSTEM_STATE_CRC: u8 = 0x06;
 const DISC_SYSTEM_STATE_SNAPSHOT: u8 = 0x07;
 const DISC_SYSTEM_STATE_SNAPSHOT_ACK: u8 = 0x08;
 const DISC_INPUT: u8 = 0x09;
+const DISC_GO_FAILSAFE: u8 = 0x0A;
 
 pub const MAX_PAYLOAD_WIRE_SIZE: usize = 128;
 
@@ -69,6 +71,22 @@ pub enum FrameError {
     UnknownDiscriminator,
     InvalidPayload,
     CrcMismatch,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailsafeReason {
+    Unspecified          = 0x00,
+    QuorumLost           = 0x01,
+    StateDivergence      = 0x02,
+    SelfTestFailed       = 0x03,
+    SinkSafetyViolation  = 0x04,
+    LocalFault           = 0x05,
+    PeerBroadcast        = 0x06,
+}
+
+impl FailsafeReason {
+    #[inline] pub fn to_wire(self) -> u8 { self as u8 }
 }
 
 impl From<PayloadError> for FrameError {
@@ -132,6 +150,7 @@ pub enum Payload<I: CyclePayload, R: CyclePayload> {
     SystemStateSnapshotAck {
         adopted_crc: u32,
     },
+    GoFailsafe { reason: u8 },
 }
 
 impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
@@ -148,6 +167,7 @@ impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
             Payload::SystemStateCrc { .. } => DISC_SYSTEM_STATE_CRC,
             Payload::SystemStateSnapshot { .. } => DISC_SYSTEM_STATE_SNAPSHOT,
             Payload::SystemStateSnapshotAck { .. } => DISC_SYSTEM_STATE_SNAPSHOT_ACK,
+            Payload::GoFailsafe { .. } => DISC_GO_FAILSAFE,
         }
     }
 
@@ -212,6 +232,7 @@ impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
             Payload::SystemStateSnapshotAck { adopted_crc } => {
                 w.push_u32(*adopted_crc);
             }
+            Payload::GoFailsafe { reason } => { w.push_u8(*reason); }
         }
     }
 
@@ -263,6 +284,7 @@ impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
             DISC_SYSTEM_STATE_SNAPSHOT_ACK => Payload::SystemStateSnapshotAck {
                 adopted_crc: r.read_u32()?,
             },
+            DISC_GO_FAILSAFE => Payload::GoFailsafe { reason: r.read_u8()? },
             _ => return Err(FrameError::UnknownDiscriminator),
         })
     }
@@ -295,6 +317,7 @@ impl<I: CyclePayload, R: CyclePayload> UdpFrame<I, R> {
         let body = max_usize(body, SYSTEM_STATE_CRC_BODY);
         let body = max_usize(body, SYSTEM_STATE_SNAPSHOT_BODY);
         let body = max_usize(body, SYSTEM_STATE_SNAPSHOT_ACK_BODY);
+        let body = max_usize(body, GO_FAILSAFE_BODY);
         HEADER_SIZE + body + CRC_SIZE
     };
 
