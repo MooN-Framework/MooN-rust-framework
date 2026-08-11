@@ -1,5 +1,5 @@
 use super::PhaseOutcome;
-use crate::framework::config::MAX_TOTAL_NODES;
+use crate::framework::config::{MAX_PEERS,MAX_TOTAL_NODES};
 use crate::framework::peer_sync::{extract_sync_fields, PeerSync, SyncFields, SAMPLES_PER_PEER};
 use crate::framework::state::{crc_from_snapshot_fields, PeerHealth, StoredSnapshot};
 use crate::framework::state_machine::{NodeState, StateEvent, SystemState};
@@ -660,16 +660,58 @@ where
             super::PhaseOutcome::Complete => {}
         }
 
-        // Divergence gate.
+        let mut agree_count: usize = 1; // own zaehlt sich mit
+        let mut divergent_peers: heapless::Vec<u8, MAX_PEERS> = heapless::Vec::new();
         for (idx, slot) in self.state.peer_inputs().iter().enumerate() {
             if let Some(peer_input) = slot {
-                if !self.computation.inputs_agree(&own, peer_input) {
-                    let peer_id = self.state.peers()[idx].id;
-                    warn!(peer_id, "input divergence detected");
-                    return StateEvent::InputsDivergent;
+                if self.computation.inputs_agree(&own, peer_input) {
+                    agree_count += 1;
+                } else {
+                    let _ = divergent_peers.push(self.state.peers()[idx].id);
                 }
             }
         }
+        
+        if !divergent_peers.is_empty() {
+            let n_alive: usize = 1
+                + self
+                    .state
+                    .peers()
+                    .iter()
+                    .filter(|p| p.health != PeerHealth::Lost)
+                    .count();
+            let others = n_alive - agree_count;
+        
+            if 2 * agree_count > n_alive {
+                // Own in Majority: alle divergenten Peers proposen.
+                for peer_id in divergent_peers.iter().copied() {
+                    warn!(peer_id, "input divergence detected, proposing exclude");
+                    let _ = self.state.propose_exclude(peer_id);
+                }
+                return StateEvent::InputsDivergent;
+            }
+        
+            if 2 * others > n_alive {
+                // Alt: return InputsDivergent
+                warn!(
+                    agree_count,
+                    n_alive,
+                    "own input in minority, going straight to isolation"
+                );
+                return StateEvent::SelfExcluded;
+            }
+        
+            // Tie: kein klarer Konsens irgendwo. Byzantine → Failsafe.
+            error!(
+                agree_count,
+                others,
+                n_alive,
+                "input divergence without recoverable majority (tie split), failsafe"
+            );
+            self.mark_failsafe(FailsafeReason::StateDivergence);
+            return StateEvent::Fault;
+        }
+ 
 
         match self.computation.compute(own) {
             Ok(payload) => {
@@ -914,13 +956,13 @@ where
                                 let _ = self.state.propose_exclude(peer_id);
                             }
                         } else {
-                            // Wir sind in Minority — wir werden per
-                            // self_excluded_by_peers-Detektor in EM
-                            // isoliert.
+                            // Alt: warn + StateEvent::CrcDivergent → EM → StateTimeout → Failsafe
                             warn!(
                                 own_crc = real_crc,
-                                majority_crc, "own crc in minority, expect isolation via EM"
+                                majority_crc,
+                                "own crc in minority, going straight to isolation"
                             );
+                            return StateEvent::SelfExcluded;
                         }
                         StateEvent::CrcDivergent
                     }
@@ -1001,6 +1043,7 @@ where
                                             let _ = self.state.propose_exclude(*peer_id);
                                         }
                                     }
+                                    return StateEvent::DissenterDetected;
                                 } else {
                                     // Own pick ist Minority — wir werden per EM-Detektor
                                     // isoliert werden.
@@ -1010,9 +1053,8 @@ where
                                         majority_pick,
                                         "own publisher pick in minority, expect isolation via EM"
                                     );
+                                    return StateEvent::SelfExcluded;
                                 }
-                                // Route ueber EM statt Failsafe.
-                                return StateEvent::DissenterDetected;
                             }
                             None => {
                                 // Keine Publisher-Mehrheit ermittelbar → echter

@@ -17,6 +17,27 @@ import struct
 import time
 from typing import Any, Optional
 
+KNOWN_INJECTION_CMDS: frozenset[str] = frozenset({
+    # Frame drops
+    "inject_drop_inputs",
+    "inject_drop_results",
+    "inject_drop_acks",
+    "inject_drop_cyclesync",
+    "inject_drop_crc",
+    "inject_drop_votes",
+    # Value corruption
+    "inject_fake_crc",
+    "inject_divergent_publisher",
+    # Whole-node
+    "inject_shutdown",
+    "inject_mute",
+    "inject_cycle_delay",
+    "inject_targeted_input",
+    # Meta
+    "clear_injection",
+})
+ 
+
 
 class DiagClient:
     def __init__(
@@ -87,6 +108,46 @@ class DiagClient:
 
     # ---- Injection commands ----------------------------------------------
 
+    def fake_crc_multi(
+        self,
+        node_ids: list[int],
+        count: int,
+        ack_timeout: float = 3.0,
+    ) -> bool:
+        """
+        Aktiviert fake_crc auf MEHREREN Nodes gleichzeitig, in einem
+        einzigen Broadcast-Telegramm. Damit sind alle Nodes im gleichen
+        Zyklus scharf, statt sequentiell mit Latenz zwischen den RPCs.
+        Wichtig fuer Byzantine-Splittests (T20), wo zwei Nodes ihre
+        fake CRC im selben Zyklus senden muessen, um den 2/2-Split zu
+        triggern.
+    
+        Wartet auf Staged-Acks von ALLEN targets, wiederholt das
+        Telegramm periodisch (loopback verliert manchmal Pakete).
+        """
+        telegram = {
+            "type": "command",
+            "targets": list(node_ids),
+            "cmd": "inject_fake_crc",
+            "count": count,
+        }
+        needed = set(node_ids)
+        acked: set[int] = set()
+    
+        deadline = time.monotonic() + ack_timeout
+        while time.monotonic() < deadline and acked != needed:
+            self._send(telegram)
+            for resp in self._drain(0.3):
+                if (
+                    resp.get("type") == "staged"
+                    and resp.get("staged_kind") == "inject_fake_crc"
+                ):
+                    src = resp.get("source_node_id")
+                    if src in needed:
+                        acked.add(src)
+    
+        return acked == needed
+
     def _inject(
         self,
         node_id: int,
@@ -100,6 +161,16 @@ class DiagClient:
         Wir senden ein paar Mal weil Multicast auf loopback rare packet
         loss haben kann.
         """
+        if cmd not in KNOWN_INJECTION_CMDS:
+            # Fail fast statt still None zurueckzugeben. Ein unbekannter
+            # cmd bedeutet fast immer einen Tippfehler oder eine nicht
+            # existente Injection-Variante — dann sollen wir hier sofort
+            # abbrechen und nicht Minuten spaeter im Test-Timeout landen.
+            raise KeyError(
+                f"unbekanntes Injection-Command '{cmd}'. "
+                f"Bekannte Commands: {sorted(KNOWN_INJECTION_CMDS)}"
+            )
+    
         telegram = {
             "type": "command",
             "targets": [node_id],
@@ -109,7 +180,7 @@ class DiagClient:
         if not wait_ack:
             self._send(telegram)
             return None
-
+    
         deadline = time.monotonic() + ack_timeout
         while time.monotonic() < deadline:
             self._send(telegram)

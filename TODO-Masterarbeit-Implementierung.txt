@@ -1,11 +1,13 @@
-|================|
-|  TO-DO	     |
-|================|
-- Unterscheidung zwischen Isolation und Failsafe nachlegen [x]
-- Tatsächliche Notbremse im Fall vom Reißen des Bremsweges => publish anpassen. [x]
-- Failsafe Signal um die anderen Knoten zum failsafe zu bringen [x]
+|==========================|
+|  TO-DO test framework    |
+|==========================|
+- Testen ob bei 2 vs 2 verschiedene Ergebnisse in 2oo4 zu failsafe führen.
+- Sink testen ob bei eingabe zwangsbremse gezogen wird.
 
-- automatische Testfälle
+
+|================|
+|  TO-DO RUST    |
+|================|
 - GUI-Diagnosetool
 - Dokumentation + Refactoring => Document rest of framework
 - Clippy warnings nochmal fixen
@@ -43,6 +45,10 @@
 - diagnose schnittstelle erweitern [x]
 - ResyncLostPeer timeouts in Config einarbeiten [x]
 - Docs for brake implementation and main [x]
+- Unterscheidung zwischen Isolation und Failsafe nachlegen [x]
+- Tatsächliche Notbremse im Fall vom Reißen des Bremsweges => publish anpassen. [x]
+- Failsafe Signal um die anderen Knoten zum failsafe zu bringen [x]
+- automatische Testfälle [x]
 
 |================|
 |Fehlermanagement|

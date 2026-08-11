@@ -110,6 +110,7 @@ impl NodeState {
             (ShareInputs, ShareInputsTimeout) => ErrorManagement,
             (ShareInputs, InputsDivergent) => ErrorManagement,
             (ShareInputs, PeerInError) => ErrorManagement,
+            (ShareInputs, SelfExcluded) => Isolation,
 
             (ShareResult, ResultShared) => SendAck,
             (ShareResult, ShareResultTimeout) => ErrorManagement,
@@ -122,13 +123,15 @@ impl NodeState {
             (SystemStateCrcExchange, CrcOk) => PublishResult,
             (SystemStateCrcExchange, CrcDivergent) => ErrorManagement,
             (SystemStateCrcExchange, PeerInError) => ErrorManagement,
+            (SystemStateCrcExchange,  SelfExcluded) => Isolation,
 
             (PublishResult, ResultPublished) => CycleSync,
             (PublishResult, ResyncDue) => PeerSync,
             (PublishResult, GoResyncLostPeer) => ResyncLostPeer,
             (PublishResult, DissenterDetected) => ErrorManagement,
             (PublishResult, StateDiverged) => Failsafe,
-
+            (PublishResult, SelfExcluded) => Isolation,
+            
             (ResyncLostPeer, ResyncLostPeerTimeout) => ErrorManagement,
             (ResyncLostPeer, ResyncLostPeerOk) => SystemStateSync,
 

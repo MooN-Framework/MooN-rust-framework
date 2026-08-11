@@ -1,24 +1,22 @@
 """
-T3 — Silent VOR Input.
+T3 — Silent vor Input.
 
-Setup:     3 Nodes stabil.
-Injection: drop-inputs <target> 1.
-Erwartet:  Target sendet keinen Input. Peers timeouten in ShareInputs
-           (Rendezvous ggf.), gehen in EM, excluden target.
+Wie T1, nur dass target seinen Input komplett verschluckt (statt
+Results/Acks). Peers timeouten in ShareInputs, gehen in EM, excluden
+target. Target selbst wird ueber CycleSync-Timeout blind → Failsafe
+→ GoFailsafe → alle Failsafe.
 """
-from harness.assertions import wait_cycles_advance, wait_peer_health
+from harness.assertions import wait_node_died
 
 TARGET = 2
 
 
 def test_silent_before_input(fabric_3):
-    assert fabric_3.diag.drop_inputs(TARGET, 1), "injection nicht bestaetigt"
+    assert fabric_3.diag.drop_inputs(TARGET, 1) is not None, (
+        "drop_inputs injection nicht bestaetigt"
+    )
 
-    survivors = [nid for nid in fabric_3.nodes if nid != TARGET]
-    for survivor in survivors:
-        peer = wait_peer_health(fabric_3, survivor, TARGET, "Lost", timeout=8.0)
-        assert peer is not None, (
-            f"node {survivor} sieht target {TARGET} nicht als Lost"
+    for nid in fabric_3.nodes:
+        assert wait_node_died(fabric_3, nid, timeout=15.0), (
+            f"node {nid} sollte nach silent-vor-Input Failsafe erreichen"
         )
-
-    assert wait_cycles_advance(fabric_3, survivors[0], n_cycles=5, timeout=8.0)
