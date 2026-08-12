@@ -89,7 +89,7 @@ impl ExclusionVotes {
         if reporters < 2 {
             return false;
         }
-        yes >= reporters / 2 + 1
+        yes > reporters / 2
     }
 }
 

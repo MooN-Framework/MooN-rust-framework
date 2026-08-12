@@ -1,25 +1,23 @@
 """
 T6 — Result Divergence.
 
-Braucht eine Rust-Injection die den serialisierten Result vor dem Send
-korrumpiert. Der Payload-Typ ist generisch (`C::Payload`), sodass eine
-generische Bit-Flip-Injection ohne zusaetzlichen Trait-Bound nicht sauber
-machbar ist. Optionen fuer spaeter:
-
-  a) Trait `TestableCorruption` fuer den konkreten Voter-Payload, das
-     eine `corrupt(&mut self)` Methode bereitstellt. Dann eine neue
-     Injection `InjectCorruptResult { count }`.
-  b) Test-only Feature-Gate mit einer konkreten Impl fuer ETCS-Payload.
-
-Bis dahin: skip. Der Codepfad wird durch T5 (Input-Divergenz)
-weitgehend abgedeckt, weil beide durch Divergence-Gates laufen.
+Setup:     3 Nodes stabil.
+Injection: Node 2 sendet fuer count Cycles einen manipulierten
+           BrakeResult (grosse Distanzverschiebung + Emergency-Flip).
+Erwartet:  Nodes 0 und 1 einigen sich auf ihren gemeinsamen Wert,
+           erkennen Node 2 via find_dissenters, proposen ihn zum
+           Ausschluss. Nach EM sehen sie ihn auf Lost.
 """
-import pytest
+from harness.assertions import wait_peer_health
 
-pytestmark = pytest.mark.skip(
-    reason="Result-Corruption braucht generischen Payload-Trait — future work"
-)
+TARGET = 2
 
 
 def test_result_divergence(fabric_3):
-    pass
+    assert fabric_3.diag.corrupt_result(TARGET, count=3) is not None
+
+    for observer in (0, 1):
+        peer = wait_peer_health(fabric_3, observer, TARGET, "Lost", timeout=8.0)
+        assert peer is not None, (
+            f"observer {observer} hat Node {TARGET} nicht als Lost markiert"
+        )

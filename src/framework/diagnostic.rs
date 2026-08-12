@@ -29,6 +29,8 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use tracing::{debug, error, info, warn};
 
+
+
 /// Active fault-injection counters. Consulted by the runner at the
 /// relevant send/receive sites and decremented on effect.
 #[derive(Debug, Default, Clone, Copy)]
@@ -49,6 +51,7 @@ pub struct InjectionState {
     pub mute_cycles_remaining: u32,
     pub cycle_delay_ms: u32,
     pub cycle_delay_remaining: u32,
+    pub corrupt_result_remaining: u32,
 }
 
 /// Incoming telegram from the GUI.
@@ -151,6 +154,7 @@ pub struct InjectionSnapshot {
     pub mute_cycles_remaining: u32,
     pub cycle_delay_ms: u32,
     pub cycle_delay_remaining: u32,
+    pub corrupt_result_remaining: u32,
 }
 
 /// Staged changes to apply at the next cycle boundary. All optional
@@ -179,6 +183,7 @@ pub struct PendingChanges {
     pub clear_injection: bool,
     /// One-shot hard shutdown flag. Not affected by ClearInjection.
     pub shutdown: bool,
+    pub corrupt_result_remaining: Option<u32>,
 }
 
 impl PendingChanges {
@@ -373,7 +378,9 @@ impl Diagnostic {
     pub fn should_drop_vote(&mut self) -> bool {
         dec(&mut self.injection.drop_next_n_votes)
     }
-
+    pub fn should_corrupt_result(&mut self) -> bool {          // NEU
+        dec(&mut self.injection.corrupt_result_remaining)
+    }
     // --- Value corruption ------------------------------------------------
 
     /// Returns Some(bogus) if we should replace our CRC this cycle.

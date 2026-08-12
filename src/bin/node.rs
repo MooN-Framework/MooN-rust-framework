@@ -87,6 +87,7 @@ fn main() -> ExitCode {
         sink,
         self_test,
         cfg.timing(),
+        #[cfg(feature = "diagnostic")]
         cfg.diagnostic(),
     );
     runner.run();

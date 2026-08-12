@@ -169,3 +169,14 @@ impl Voter for BrakeVoter {
         (own_dissented, dissenters)
     }
 }
+
+#[cfg(feature = "diagnostic")]
+impl crate::framework::traits::Corruptible for BrakeResult {
+    fn corrupt(&mut self) {
+        // 10 km Verschiebung liegt garantiert ausserhalb jeder
+        // sinnvollen distance_tolerance. Emergency-Flag zusaetzlich
+        // flippen, damit auch bei tolerance=inf der Boolean-Gate greift.
+        self.total_distance += 10_000.0;
+        self.emergency_brake = !self.emergency_brake;
+    }
+}

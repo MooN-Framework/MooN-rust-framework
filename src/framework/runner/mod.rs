@@ -1,12 +1,11 @@
 mod collect;
+#[cfg(feature = "diagnostic")]
 mod diag;
 mod ingest;
 mod phases;
 
 pub use collect::PhaseOutcome;
-
-use crate::framework::config::{CycleTiming, DiagnosticConfig};
-use crate::framework::diagnostic::Diagnostic;
+use crate::framework::config::CycleTiming;
 use crate::framework::state::RunState;
 use crate::framework::state_machine::{NodeState, StateEvent};
 use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
@@ -15,6 +14,23 @@ use crate::framework::wire::{FailsafeReason, Payload};
 use serde::Deserialize;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
+#[cfg(feature = "diagnostic")]
+use crate::framework::config::DiagnosticConfig;
+#[cfg(feature = "diagnostic")]
+use crate::framework::diagnostic::Diagnostic;
+
+macro_rules! diag_bool_helper {
+    ($name:ident, $call:ident) => {
+        #[cfg(feature = "diagnostic")]
+        #[inline]
+        pub(super) fn $name(&mut self) -> bool {
+            self.diagnostic.as_mut().map(|d| d.$call()).unwrap_or(false)
+        }
+        #[cfg(not(feature = "diagnostic"))]
+        #[inline]
+        pub(super) fn $name(&mut self) -> bool { false }
+    };
+}
 
 pub struct Runner<C, V, S, T>
 where
@@ -34,6 +50,7 @@ where
     pub(super) last_cycle_us: Option<u128>,
     pub(super) next_cycle_deadline: Option<Instant>,
     pub(super) cycles_since_last_sync: u32,
+    #[cfg(feature = "diagnostic")]
     pub(super) diagnostic: Option<Diagnostic>,
 
     /// Rendezvous flag: set by ingest paths when a healthy peer's frame
@@ -69,9 +86,11 @@ where
         sink: S,
         self_test: T,
         timing: CycleTiming,
+        #[cfg(feature = "diagnostic")]
         diag_cfg: DiagnosticConfig,
     ) -> Self {
         info!(own_id = state.own_id(), "runner constructed");
+        #[cfg(feature = "diagnostic")]
         let diagnostic = if diag_cfg.enabled {
             match Diagnostic::new(&diag_cfg, state.own_id()) {
                 Ok(d) => Some(d),
@@ -95,6 +114,7 @@ where
             last_cycle_us: None,
             next_cycle_deadline: None,
             cycles_since_last_sync: 0,
+            #[cfg(feature = "diagnostic")]
             diagnostic,
             peer_in_error_seen: false,
             mute_active: false,
@@ -103,6 +123,53 @@ where
             pending_failsafe_reason: None,
         }
     }
+
+    diag_bool_helper!(should_drop_input, should_drop_input);
+    diag_bool_helper!(should_drop_result, should_drop_result);
+    diag_bool_helper!(should_drop_ack, should_drop_ack);
+    diag_bool_helper!(should_drop_cyclesync, should_drop_cyclesync);
+    diag_bool_helper!(should_drop_crc, should_drop_crc);
+    diag_bool_helper!(should_drop_vote, should_drop_vote);
+    diag_bool_helper!(should_send_divergent_publisher, should_send_divergent_publisher);
+
+
+    #[cfg(feature = "diagnostic")]
+    #[inline]
+    pub(super) fn should_fake_crc(&mut self) -> Option<u32> {
+        self.diagnostic.as_mut().and_then(|d| d.should_fake_crc())
+    }
+
+    #[cfg(not(feature = "diagnostic"))]
+    #[inline]
+    pub(super) fn should_fake_crc(&mut self) -> Option<u32> { None }
+
+    #[cfg(feature = "diagnostic")]
+    #[inline]
+    pub(super) fn should_corrupt_result(&mut self) -> bool {
+        self.diagnostic.as_mut().map(|d| d.should_corrupt_result()).unwrap_or(false)
+    }
+
+    #[cfg(feature = "diagnostic")]
+    #[inline]
+    pub(super) fn maybe_corrupt_result(&mut self, own: V::Payload) -> V::Payload
+    where
+        V::Payload: crate::framework::traits::Corruptible,
+    {
+        use crate::framework::traits::Corruptible;
+        let mut own = own;
+        if self.should_corrupt_result() {
+            tracing::warn!("injection: corrupting own result before send");
+            Corruptible::corrupt(&mut own);
+        }
+        own
+    }
+
+    #[cfg(not(feature = "diagnostic"))]
+    #[inline]
+    pub(super) fn maybe_corrupt_result(&mut self, own: V::Payload) -> V::Payload {
+        own
+    }
+
 
     pub fn set_input(&mut self, input: C::Input) {
         self.input = input;
@@ -132,7 +199,10 @@ where
         core::mem::replace(&mut self.pending_cycle_delay_ms, 0)
     }
 
-    pub fn run(&mut self) {
+        pub fn run(&mut self)
+        where
+            V::Payload: crate::framework::traits::Corruptible,
+        {
         info!(own_id = self.state.own_id(), "runner started");
         loop {
             let current = self.state.node_state();
@@ -162,6 +232,7 @@ where
                 }
             };
 
+            #[cfg(feature = "diagnostic")]
             self.poll_diagnostic();
 
             if self.peer_failsafe_seen {

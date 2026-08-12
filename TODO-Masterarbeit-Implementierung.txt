@@ -1,9 +1,12 @@
 |==========================|
 |  TO-DO test framework    |
 |==========================|
-- Testen ob bei 2 vs 2 verschiedene Ergebnisse in 2oo4 zu failsafe führen.
-- Sink testen ob bei eingabe zwangsbremse gezogen wird.
-
+- ausfall von nicht probation node während node probaten hat => failsafe
+- ausfall von probation node im resynchrosnierenten betrieb => isolation => 2 nodes laufen weiter
+- Sequentieller ausfall 2oo4 [x]
+- Doppelter ausfall 2oo4 [x]
+- Testen ob bei 2 vs 2 verschiedene Ergebnisse in 2oo4 zu failsafe führen.[x]
+- Sink testen ob bei eingabe zwangsbremse gezogen wird. [x]
 
 |================|
 |  TO-DO RUST    |
@@ -49,6 +52,7 @@
 - Tatsächliche Notbremse im Fall vom Reißen des Bremsweges => publish anpassen. [x]
 - Failsafe Signal um die anderen Knoten zum failsafe zu bringen [x]
 - automatische Testfälle [x]
+- Compile feature guards für diagnose schnittstelle [x]
 
 |================|
 |Fehlermanagement|

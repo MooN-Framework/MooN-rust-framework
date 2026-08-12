@@ -98,6 +98,36 @@ class Fabric:
     def alive_ids(self) -> list[int]:
         return [nid for nid, node in self.nodes.items() if node.is_running()]
 
+    def restart_node(self, node_id: int, wait_operational: float = 8.0) -> None:
+        """
+        Killt (falls noch lebendig) und respawnt den Node mit derselben
+        config. Der neue Prozess bindet die gleichen Multicast-Sockets;
+        das appended Log geht in dieselbe Datei (Node._read_loop
+        verwendet Append-Mode).
+    
+        Kein wait_operational-Check: der rejoin-Prozess laeuft nicht
+        ueber CycleSyncOk, sondern ueber ResyncLostPeer. Der Test soll
+        selbst mit wait_peer_health(target, "Probation") warten.
+        """
+        if node_id not in self.nodes:
+            raise KeyError(f"unknown node_id {node_id}")
+    
+        old = self.nodes[node_id]
+        if old.is_running():
+            old.stop(timeout=2.0)
+    
+        from .node import Node  # local import um circular zu vermeiden
+        new_node = Node(
+            node_id=node_id,
+            binary=old.binary,
+            config_path=old.config_path,
+            log_dir=old.log_dir,
+            rust_log=old.rust_log,
+        )
+        new_node.start()
+        self.nodes[node_id] = new_node
+        _ = wait_operational  # reserviert fuer zukuenftigen "warte bis Alive"-Modus
+
 
 @contextmanager
 def fabric(opts: FabricOptions) -> Iterator[Fabric]:

@@ -110,6 +110,7 @@ where
                 mute_cycles_remaining: diag.injection.mute_cycles_remaining,
                 cycle_delay_ms: diag.injection.cycle_delay_ms,
                 cycle_delay_remaining: diag.injection.cycle_delay_remaining,
+                corrupt_result_remaining: diag.injection.corrupt_result_remaining,
             },
             pending_input: diag.pending.has_input(),
             pending_injection_update: diag.pending.has_injection_update(),

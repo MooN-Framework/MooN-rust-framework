@@ -3,6 +3,7 @@ use crate::framework::wire::{PayloadError, WireReader, WireWriter};
 use core::fmt;
 use heapless::Vec;
 
+
 /// Value each node computes and shares per cycle. Wire size is fixed for
 /// deterministic memory use on safety-critical paths.
 pub trait CyclePayload: Copy + PartialEq + core::fmt::Debug {
@@ -10,6 +11,15 @@ pub trait CyclePayload: Copy + PartialEq + core::fmt::Debug {
 
     fn to_wire(&self, w: &mut WireWriter<'_>);
     fn from_wire(r: &mut WireReader<'_>) -> Result<Self, PayloadError>;
+}
+
+pub trait Corruptible: CyclePayload {
+    fn corrupt(&mut self);
+}
+
+#[cfg(not(feature = "diagnostic"))]
+impl<T: CyclePayload> Corruptible for T {
+    fn corrupt(&mut self) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -28,7 +28,7 @@ def binary() -> Path:
     print("\n[fixture] cargo build...")
     t0 = time.monotonic()
     subprocess.run(
-        ["cargo", "build", "--bin", "node"],
+        ["cargo", "build", "--bin", "node", "--features", "diagnostic"],
         cwd=REPO_ROOT,
         check=True,
     )

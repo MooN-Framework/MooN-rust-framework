@@ -35,6 +35,7 @@ KNOWN_INJECTION_CMDS: frozenset[str] = frozenset({
     "inject_targeted_input",
     # Meta
     "clear_injection",
+    "inject_corrupt_result",
 })
  
 
@@ -215,6 +216,9 @@ class DiagClient:
     def divergent_publisher(self, node_id: int, count: int) -> Optional[dict]:
         return self._inject(node_id, "inject_divergent_publisher", count=count)
 
+    def corrupt_result(self, node_id: int, count: int) -> Optional[dict]:
+        return self._inject(node_id, "inject_corrupt_result", count=count)
+    
     # Whole-node
     def shutdown(self, node_id: int) -> Optional[dict]:
         return self._inject(node_id, "inject_shutdown")

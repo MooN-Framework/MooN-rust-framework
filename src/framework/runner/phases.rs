@@ -1,5 +1,5 @@
 use super::PhaseOutcome;
-use crate::framework::config::{MAX_PEERS,MAX_TOTAL_NODES};
+use crate::framework::config::{MAX_PEERS, MAX_TOTAL_NODES};
 use crate::framework::peer_sync::{extract_sync_fields, PeerSync, SyncFields, SAMPLES_PER_PEER};
 use crate::framework::state::{crc_from_snapshot_fields, PeerHealth, StoredSnapshot};
 use crate::framework::state_machine::{NodeState, StateEvent, SystemState};
@@ -52,6 +52,7 @@ where
         self.sink.on_isolation();
         loop {
             sleep(Duration::from_secs(1));
+            #[cfg(feature = "diagnostic")]
             self.poll_diagnostic();
         }
     }
@@ -494,12 +495,7 @@ where
         self.state.reset_cycle_sync_evidence();
         self.state.log_system_state_crc_contents();
 
-        let suppress = self.is_muted()
-            || self
-                .diagnostic
-                .as_mut()
-                .map(|d| d.should_drop_cyclesync())
-                .unwrap_or(false);
+        let suppress = self.is_muted() || self.should_drop_cyclesync();
         if suppress {
             warn!("injection: suppressing cyclesync send");
         }
@@ -566,6 +562,7 @@ where
     /// this point via the CycleSync barrier, so the anchor is aligned to
     /// within the peer-sync epsilon across the fabric.
     pub(super) fn handle_read_inputs(&mut self) -> StateEvent {
+        #[cfg(feature = "diagnostic")]
         self.apply_pending_diagnostic();
 
         // Optional per-cycle extra sleep, taken from InjectCycleDelay.
@@ -612,12 +609,7 @@ where
         // Injection decisions latched per-phase (not per-send-attempt) so
         // that a `count=1` drops the entire cycle's transmit, not just the
         // first retransmit.
-        let suppress = self.is_muted()
-            || self
-                .diagnostic
-                .as_mut()
-                .map(|d| d.should_drop_input())
-                .unwrap_or(false);
+        let suppress = self.is_muted() || self.should_drop_input();
         if suppress {
             warn!("injection: suppressing input send");
         }
@@ -671,7 +663,7 @@ where
                 }
             }
         }
-        
+
         if !divergent_peers.is_empty() {
             let n_alive: usize = 1
                 + self
@@ -681,7 +673,7 @@ where
                     .filter(|p| p.health != PeerHealth::Lost)
                     .count();
             let others = n_alive - agree_count;
-        
+
             if 2 * agree_count > n_alive {
                 // Own in Majority: alle divergenten Peers proposen.
                 for peer_id in divergent_peers.iter().copied() {
@@ -690,7 +682,7 @@ where
                 }
                 return StateEvent::InputsDivergent;
             }
-        
+
             if 2 * others > n_alive {
                 // Alt: return InputsDivergent
                 warn!(
@@ -700,7 +692,7 @@ where
                 );
                 return StateEvent::SelfExcluded;
             }
-        
+
             // Tie: kein klarer Konsens irgendwo. Byzantine → Failsafe.
             error!(
                 agree_count,
@@ -711,7 +703,6 @@ where
             self.mark_failsafe(FailsafeReason::StateDivergence);
             return StateEvent::Fault;
         }
- 
 
         match self.computation.compute(own) {
             Ok(payload) => {
@@ -731,15 +722,17 @@ where
     /// Rendezvous: same as ShareInputs — a peer already in ErrorManagement
     /// pulls us forward. We attribute both input- and result-phase evidence
     /// before following.
-    pub(super) fn handle_share_result(&mut self) -> StateEvent {
+    ///
+    /// Test-hook: `Corruptible::corrupt` on the outgoing payload is applied
+    /// once per phase when `should_corrupt_result` returns true. Only
+    /// compiled under `feature = "diagnostic"`.
+    pub(super) fn handle_share_result(&mut self) -> StateEvent
+    where
+        V::Payload: crate::framework::traits::Corruptible,
+    {
         let _ = self.take_peer_in_error();
 
-        let suppress = self.is_muted()
-            || self
-                .diagnostic
-                .as_mut()
-                .map(|d| d.should_drop_result())
-                .unwrap_or(false);
+        let suppress = self.is_muted() || self.should_drop_result();
         if suppress {
             warn!("injection: suppressing result send");
         }
@@ -748,6 +741,9 @@ where
             Some(r) => r,
             None => return StateEvent::Fault,
         };
+
+        let own = self.maybe_corrupt_result(own);
+
         let deadline = self.cycle_anchor() + self.timing.share_result_offset;
         let node_state = self.state.node_state();
 
@@ -799,17 +795,8 @@ where
     pub(super) fn handle_send_ack(&mut self) -> StateEvent {
         let _ = self.take_peer_in_error();
 
-        let suppress = self.is_muted()
-            || self
-                .diagnostic
-                .as_mut()
-                .map(|d| d.should_drop_ack())
-                .unwrap_or(false);
-        let corrupt_pub = self
-            .diagnostic
-            .as_mut()
-            .map(|d| d.should_send_divergent_publisher())
-            .unwrap_or(false);
+        let suppress = self.is_muted() || self.should_drop_ack();
+        let corrupt_pub = self.should_send_divergent_publisher();
         if suppress {
             warn!("injection: suppressing ack send");
         }
@@ -879,25 +866,18 @@ where
         }
     }
 
-    // runner/phases.rs — komplette Ersetzung fuer handle_system_state_crc.
-
     pub(super) fn handle_system_state_crc(&mut self) -> StateEvent {
         self.state.reset_crc_evidence();
         let _ = self.take_peer_in_error();
 
         let real_crc = self.state.compute_system_state_crc();
-        let fake = self.diagnostic.as_mut().and_then(|d| d.should_fake_crc());
+        let fake = self.should_fake_crc();
         let own_crc_on_wire = fake.unwrap_or(real_crc);
         if fake.is_some() {
             warn!(real_crc, own_crc_on_wire, "injection: sending fake crc");
         }
 
-        let suppress = self.is_muted()
-            || self
-                .diagnostic
-                .as_mut()
-                .map(|d| d.should_drop_crc())
-                .unwrap_or(false);
+        let suppress = self.is_muted() || self.should_drop_crc();
         if suppress {
             warn!("injection: suppressing crc send");
         }
@@ -1189,12 +1169,7 @@ where
         self.state.reset_exclusion_proposals();
         let _ = self.take_peer_in_error();
 
-        let suppress = self.is_muted()
-            || self
-                .diagnostic
-                .as_mut()
-                .map(|d| d.should_drop_vote())
-                .unwrap_or(false);
+        let suppress = self.is_muted() || self.should_drop_vote();
         if suppress {
             warn!("injection: suppressing exclusion vote send");
         }
