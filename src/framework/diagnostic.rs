@@ -21,6 +21,19 @@
 //! - mute_cycles_remaining      → soft shutdown, reversible via clear
 //! - shutdown (one-shot)        → hard process exit at cycle boundary
 //! - targeted_input             → apply a distinct input only to this node
+//! - corrupt_result_remaining   → perturb own Result before send (T6)
+//! - drop_from_peers_mask       → drop all incoming frames from the given
+//!                                 peer node ids (mask bit N ⇔ node id N).
+//!                                 Persistent until ClearInjection; used
+//!                                 by T10 to force an asymmetric-view
+//!                                 scenario without a real partitioner.
+//! - fake_phase_header_remaining / _value → for N sends, replace the
+//!                                 outgoing frame's node_state_wire byte
+//!                                 with `wire_value`. Verifies the
+//!                                 phase-header guards in CycleSync,
+//!                                 Resync, and the ingest rendezvous
+//!                                 path (T16). `wire_value` must map to
+//!                                 a valid NodeState variant.
 
 use crate::framework::config::DiagnosticConfig;
 use serde::{Deserialize, Serialize};
@@ -28,8 +41,6 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use tracing::{debug, error, info, warn};
-
-
 
 /// Active fault-injection counters. Consulted by the runner at the
 /// relevant send/receive sites and decremented on effect.
@@ -52,6 +63,16 @@ pub struct InjectionState {
     pub cycle_delay_ms: u32,
     pub cycle_delay_remaining: u32,
     pub corrupt_result_remaining: u32,
+
+    /// Bit N set means: drop every incoming frame whose sender node id
+    /// is N. Persistent until ClearInjection; NOT a per-cycle decrement.
+    pub drop_from_peers_mask: u8,
+
+    /// For the next `fake_phase_header_remaining` outbound frames, the
+    /// runner replaces the node_state_wire byte with
+    /// `fake_phase_header_value`. Decremented once per send.
+    pub fake_phase_header_remaining: u32,
+    pub fake_phase_header_value: u8,
 }
 
 /// Incoming telegram from the GUI.
@@ -93,6 +114,17 @@ pub enum Command {
     InjectMute { cycles: u32 },
     InjectCycleDelay { ms: u32, count: u32 },
     InjectTargetedInput { value: serde_json::Value },
+    InjectCorruptResult { count: u32 },
+
+    /// T10 — asymmetric view. `peers_mask` bit N = drop frames whose
+    /// sender node id is N. Persistent until ClearInjection.
+    InjectDropFromPeer { peers_mask: u8 },
+
+    /// T16 — phase-header spoof. For `count` outgoing frames, replace
+    /// the node_state_wire byte with `wire_value`. `wire_value` should
+    /// decode to a valid NodeState variant, otherwise the runner logs
+    /// a warning and falls back to the real state.
+    InjectFakePhaseHeader { count: u32, wire_value: u8 },
 
     ClearInjection,
 }
@@ -155,16 +187,16 @@ pub struct InjectionSnapshot {
     pub cycle_delay_ms: u32,
     pub cycle_delay_remaining: u32,
     pub corrupt_result_remaining: u32,
+    pub drop_from_peers_mask: u8,
+    pub fake_phase_header_remaining: u32,
+    pub fake_phase_header_value: u8,
 }
 
 /// Staged changes to apply at the next cycle boundary. All optional
 /// fields have overwrite semantics.
 #[derive(Debug, Default)]
 pub struct PendingChanges {
-    // Broadcast input (applied to any node that receives it).
     pub input_json: Option<serde_json::Value>,
-    // Targeted input (applied only if the receiving node was in the
-    // command's target list — that check happens in try_recv).
     pub targeted_input_json: Option<serde_json::Value>,
 
     pub drop_next_n_inputs: Option<u32>,
@@ -181,9 +213,13 @@ pub struct PendingChanges {
     pub cycle_delay: Option<(u32, u32)>, // (ms, count)
 
     pub clear_injection: bool,
-    /// One-shot hard shutdown flag. Not affected by ClearInjection.
     pub shutdown: bool,
     pub corrupt_result_remaining: Option<u32>,
+
+    /// T10 staging.
+    pub drop_from_peers_mask: Option<u8>,
+    /// T16 staging: (count, wire_value).
+    pub fake_phase_header: Option<(u32, u8)>,
 }
 
 impl PendingChanges {
@@ -202,6 +238,9 @@ impl PendingChanges {
             || self.divergent_publisher_remaining.is_some()
             || self.mute_cycles_remaining.is_some()
             || self.cycle_delay.is_some()
+            || self.corrupt_result_remaining.is_some()
+            || self.drop_from_peers_mask.is_some()
+            || self.fake_phase_header.is_some()
             || self.clear_injection
     }
 }
@@ -294,7 +333,6 @@ impl Diagnostic {
     }
 
     /// Apply staged injection updates. Called by the runner at cycle start.
-    /// Also ticks per-cycle counters (mute, cycle_delay).
     pub fn apply_pending_injection(&mut self) {
         if self.pending.clear_injection {
             // Note: shutdown is NOT cleared here — it fires regardless.
@@ -307,7 +345,6 @@ impl Diagnostic {
             return;
         }
 
-        // Simple setters.
         if let Some(n) = self.pending.drop_next_n_inputs.take() {
             self.injection.drop_next_n_inputs = n;
         }
@@ -339,15 +376,19 @@ impl Diagnostic {
             self.injection.cycle_delay_ms = ms;
             self.injection.cycle_delay_remaining = count;
         }
-
-        // Per-cycle decrements for time-based counters happen inside the
-        // relevant `should_*`/`take_*` accessors so that the count reflects
-        // remaining EFFECTS, not remaining cycle boundaries.
+        if let Some(n) = self.pending.corrupt_result_remaining.take() {
+            self.injection.corrupt_result_remaining = n;
+        }
+        if let Some(m) = self.pending.drop_from_peers_mask.take() {
+            self.injection.drop_from_peers_mask = m;
+        }
+        if let Some((count, value)) = self.pending.fake_phase_header.take() {
+            self.injection.fake_phase_header_remaining = count;
+            self.injection.fake_phase_header_value = value;
+        }
     }
 
     pub fn take_pending_input(&mut self) -> Option<serde_json::Value> {
-        // Targeted takes precedence — a per-node override wins over a
-        // broadcast in the same cycle.
         self.pending
             .targeted_input_json
             .take()
@@ -378,9 +419,30 @@ impl Diagnostic {
     pub fn should_drop_vote(&mut self) -> bool {
         dec(&mut self.injection.drop_next_n_votes)
     }
-    pub fn should_corrupt_result(&mut self) -> bool {          // NEU
+    pub fn should_corrupt_result(&mut self) -> bool {
         dec(&mut self.injection.corrupt_result_remaining)
     }
+
+    /// T10 — persistent, not decremented. Cleared only via ClearInjection.
+    /// `peer_node_id` is the frame sender's node id.
+    pub fn should_drop_from(&self, peer_node_id: u8) -> bool {
+        if peer_node_id > 7 {
+            return false;
+        }
+        (self.injection.drop_from_peers_mask & (1u8 << peer_node_id)) != 0
+    }
+
+    /// T16 — returns Some(wire_value) if we should replace the outgoing
+    /// frame's node_state_wire this cycle. Decremented on consumption.
+    pub fn should_fake_phase_header(&mut self) -> Option<u8> {
+        if self.injection.fake_phase_header_remaining > 0 {
+            self.injection.fake_phase_header_remaining -= 1;
+            Some(self.injection.fake_phase_header_value)
+        } else {
+            None
+        }
+    }
+
     // --- Value corruption ------------------------------------------------
 
     /// Returns Some(bogus) if we should replace our CRC this cycle.
@@ -486,6 +548,22 @@ impl Diagnostic {
             Command::InjectTargetedInput { value } => {
                 self.pending.targeted_input_json = Some(value);
                 self.stage_ack("inject_targeted_input");
+                None
+            }
+
+            Command::InjectCorruptResult { count } => {
+                self.pending.corrupt_result_remaining = Some(count);
+                self.stage_ack("inject_corrupt_result");
+                None
+            }
+            Command::InjectDropFromPeer { peers_mask } => {
+                self.pending.drop_from_peers_mask = Some(peers_mask);
+                self.stage_ack("inject_drop_from_peer");
+                None
+            }
+            Command::InjectFakePhaseHeader { count, wire_value } => {
+                self.pending.fake_phase_header = Some((count, wire_value));
+                self.stage_ack("inject_fake_phase_header");
                 None
             }
 

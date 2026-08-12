@@ -21,8 +21,22 @@ where
     /// Also detects the rendezvous condition: a frame from a healthy peer
     /// whose header carries `node_state == ErrorManagement`. The flag is
     /// consumed by the four in-cycle phase handlers.
+    ///
+    /// T10 hook: `should_drop_frame_from_peer` is consulted first. When
+    /// active, the frame is dropped silently before any state mutation,
+    /// realising the asymmetric-view scenario without touching the
+    /// network stack.
     pub(super) fn ingest_frame(&mut self, frame: UdpFrame<C::Input, V::Payload>) {
         let peer_id = frame.node_id();
+
+        // T10: asymmetric-view injection. Silent drop, no state effect.
+        if self.should_drop_frame_from_peer(peer_id) {
+            debug!(
+                peer_id,
+                "injection: dropping frame from peer (drop_from_peers_mask)"
+            );
+            return;
+        }
 
         if let Payload::GoFailsafe { reason } = frame.payload() {
             warn!(

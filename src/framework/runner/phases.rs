@@ -96,7 +96,7 @@ where
                     let pending = this.state.pending_rejoin().as_u8().count_ones() as u8;
                     this.state.active_count_including_self() + pending
                 };
-                if let Err(e) = this.transport.send(
+                if let Err(e) = this.send_frame(
                     node_state,
                     Payload::State {
                         seen_mask: mask,
@@ -184,7 +184,7 @@ where
             deadline,
             self.timing.send_interval,
             |this| {
-                if let Err(e) = this.transport.send(
+                if let Err(e) = this.send_frame(
                     node_state,
                     Payload::State {
                         seen_mask: PeerMask::EMPTY,
@@ -397,7 +397,7 @@ where
                     }
                 } else {
                     // Sender: broadcast snapshot.
-                    if let Err(e) = this.transport.send(
+                    if let Err(e) = this.send_frame(
                         node_state,
                         Payload::SystemStateSnapshot {
                             nominal_participants: nom,
@@ -513,7 +513,7 @@ where
                     return Ok(());
                 }
                 let mask = this.state.own_seen_mask();
-                if let Err(e) = this.transport.send(
+                if let Err(e) = this.send_frame(
                     node_state,
                     Payload::State {
                         seen_mask: mask,
@@ -622,7 +622,7 @@ where
                 if suppress {
                     return Ok(());
                 }
-                if let Err(e) = this.transport.send(node_state, Payload::Input(own)) {
+                if let Err(e) = this.send_frame(node_state, Payload::Input(own)) {
                     error!(error = ?e, "send_input failed");
                 }
                 Ok(())
@@ -755,7 +755,7 @@ where
                 if suppress {
                     return Ok(());
                 }
-                if let Err(e) = this.transport.send(node_state, Payload::Result(own)) {
+                if let Err(e) = this.send_frame(node_state, Payload::Result(own)) {
                     error!(error = ?e, "send_result failed");
                 }
                 Ok(())
@@ -821,7 +821,7 @@ where
                 if suppress {
                     return Ok(());
                 }
-                if let Err(e) = this.transport.send(
+                if let Err(e) = this.send_frame(
                     node_state,
                     Payload::Ack {
                         received_from: mask,
@@ -893,7 +893,7 @@ where
                 if suppress {
                     return Ok(());
                 }
-                if let Err(e) = this.transport.send(
+                if let Err(e) = this.send_frame(
                     node_state,
                     Payload::SystemStateCrc {
                         crc: own_crc_on_wire,
@@ -1186,7 +1186,7 @@ where
                 if suppress {
                     return Ok(());
                 }
-                if let Err(e) = this.transport.send(
+                if let Err(e) = this.send_frame(
                     node_state,
                     Payload::ExclusionProposal {
                         propose_exclude: own_proposal,

@@ -9,7 +9,7 @@ use crate::framework::config::CycleTiming;
 use crate::framework::state::RunState;
 use crate::framework::state_machine::{NodeState, StateEvent};
 use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
-use crate::framework::transport::UdpTransport;
+use crate::framework::transport::{TransportError, UdpTransport};
 use crate::framework::wire::{FailsafeReason, Payload};
 use serde::Deserialize;
 use std::time::Instant;
@@ -170,6 +170,67 @@ where
         own
     }
 
+    // ---------------------------------------------------------------------
+    // T10 — asymmetric view. Called from ingest_frame before any recording.
+    // ---------------------------------------------------------------------
+    #[cfg(feature = "diagnostic")]
+    #[inline]
+    pub(super) fn should_drop_frame_from_peer(&self, peer_node_id: u8) -> bool {
+        self.diagnostic
+            .as_ref()
+            .map(|d| d.should_drop_from(peer_node_id))
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(feature = "diagnostic"))]
+    #[inline]
+    pub(super) fn should_drop_frame_from_peer(&self, _peer_node_id: u8) -> bool {
+        false
+    }
+
+    // ---------------------------------------------------------------------
+    // T16 — phase-header spoof. `send_frame` is the single choke point
+    // through which every phase's outgoing frame flows. Without the
+    // feature it's a plain forward to `transport.send`.
+    // ---------------------------------------------------------------------
+    #[cfg(feature = "diagnostic")]
+    #[inline]
+    pub(super) fn send_frame(
+        &mut self,
+        real_state: NodeState,
+        payload: Payload<C::Input, V::Payload>,
+    ) -> Result<u32, TransportError> {
+        let fake = self.diagnostic.as_mut().and_then(|d| d.should_fake_phase_header());
+        if let Some(wire) = fake {
+            match NodeState::from_wire(wire) {
+                Ok(faked_state) => {
+                    warn!(
+                        real = ?real_state,
+                        faked = ?faked_state,
+                        "injection: sending with faked phase header"
+                    );
+                    return self.transport.send(faked_state, payload);
+                }
+                Err(_) => {
+                    warn!(
+                        wire,
+                        "fake_phase_header value does not decode to a NodeState, falling back to real state"
+                    );
+                }
+            }
+        }
+        self.transport.send(real_state, payload)
+    }
+
+    #[cfg(not(feature = "diagnostic"))]
+    #[inline]
+    pub(super) fn send_frame(
+        &mut self,
+        real_state: NodeState,
+        payload: Payload<C::Input, V::Payload>,
+    ) -> Result<u32, TransportError> {
+        self.transport.send(real_state, payload)
+    }
 
     pub fn set_input(&mut self, input: C::Input) {
         self.input = input;
@@ -263,7 +324,9 @@ where
             "failsafe entered"
         );
 
-        // Best-effort GoFailsafe-Broadcast an alle Peers.
+        // Best-effort GoFailsafe-Broadcast an alle Peers. Bypasst
+        // absichtlich send_frame — im Failsafe-Pfad wollen wir keine
+        // Injection-Effekte auf die GoFailsafe-Semantik.
         let node_state = self.state.node_state();
         for _ in 0..3 {
             if let Err(e) = self.transport.send(

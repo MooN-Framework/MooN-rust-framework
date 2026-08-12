@@ -36,8 +36,27 @@ KNOWN_INJECTION_CMDS: frozenset[str] = frozenset({
     # Meta
     "clear_injection",
     "inject_corrupt_result",
+    "inject_drop_from_peer",       # NEU (T10)
+    "inject_fake_phase_header",    # NEU (T16)
 })
  
+NODE_STATE_WIRE = {
+    "Startup":                 0x01,
+    "InitSync":                0x02,
+    "CycleSync":               0x03,
+    "ReadInputs":              0x04,
+    "ShareResult":             0x05,
+    "SendAck":                 0x06,
+    "PublishResult":           0x07,
+    "ErrorManagement":         0x08,
+    "Isolation":               0x09,
+    "PeerSync":                0x0A,
+    "ResyncLostPeer":          0x0B,
+    "SystemStateCrcExchange":  0x0C,
+    "SystemStateSync":         0x0D,
+    "ShareInputs":             0x0E,
+    "Failsafe":                0xFF,
+}
 
 
 class DiagClient:
@@ -189,6 +208,34 @@ class DiagClient:
                 if resp.get("type") == "staged" and resp.get("source_node_id") == node_id:
                     return resp
         return None
+
+    def drop_from_peer(self, node_id: int, peers_mask: int):
+        """
+        T10 — Weist `node_id` an, alle eingehenden Frames zu verwerfen,
+        deren Absender-Node-ID im `peers_mask` gesetzt ist (Bit N = Node N).
+        Persistent bis ClearInjection.
+
+        Beispiel: `drop_from_peer(2, 0b0000_0001)` laesst Node 2 alle Frames
+        von Node 0 verwerfen.
+        """
+        return self._inject(node_id, "inject_drop_from_peer", peers_mask=peers_mask)
+
+
+    def fake_phase_header(self, node_id: int, count: int, wire_value: int):
+        """
+        T16 — Weist `node_id` an, die naechsten `count` ausgehenden Frames
+        mit einem gefaelschten node_state_wire-Byte zu senden. `wire_value`
+        muss zu einer gueltigen NodeState-Variante decodieren; sonst
+        faellt der Runner auf den echten State zurueck und loggt.
+
+        Verwende die NODE_STATE_WIRE-Konstante fuer symbolische Werte:
+            fake_phase_header(2, count=5, wire_value=NODE_STATE_WIRE["Isolation"])
+        """
+        return self._inject(
+            node_id, "inject_fake_phase_header",
+            count=count, wire_value=wire_value,
+        )
+
 
     # Frame drops
     def drop_inputs(self, node_id: int, count: int) -> Optional[dict]:
