@@ -1,8 +1,21 @@
+|========================|
+|  TO-DO Diagnosetool    |
+|========================|
+- logs einsehen von tests etc. machbar machen.
+- einbauen
+- Im inject tab sind targets und command nebeneinander aber nicht even geleveled. [x]
+- Test output sollte farben enthalten green für passed z.B. [x]
+- Im status tab können die sequenz nummern noch nicht stimmen, außerdem ein node nach 10 sekunden ohne signal ist lost [x]
+- Farb fehler beim letzten knoten der joint, entweder rot oder grau [x]
+- Bei registry leerung verlieren knoten ihre farbe.. [x]
+
 |==========================|
 |  TO-DO test framework    |
 |==========================|
 - ausfall von nicht probation node während node probaten hat => failsafe
 - ausfall von probation node im resynchrosnierenten betrieb => isolation => 2 nodes laufen weiter
+- Langzeit test
+=========
 - Sequentieller ausfall 2oo4 [x]
 - Doppelter ausfall 2oo4 [x]
 - Testen ob bei 2 vs 2 verschiedene Ergebnisse in 2oo4 zu failsafe führen.[x]
@@ -11,9 +24,11 @@
 |================|
 |  TO-DO RUST    |
 |================|
-- GUI-Diagnosetool
-- Dokumentation + Refactoring => Document rest of framework
-- Clippy warnings nochmal fixen
+- Signaturen für konfigfiles einführen.
+- Ausfall von probation node sorgt für total ausfall sollte nicht sein.
+- Dokumentation + Refactoring => Document rest of framework.
+- Clippy warnings nochmal fixen.
+
 
 |================|
 |Voter Impl  	 |

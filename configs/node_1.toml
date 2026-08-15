@@ -8,7 +8,7 @@ minimum          = 2
 probation_cycles = 10
 
 [timing]
-cycle_duration_ms = 20
+cycle_duration_ms = 200
 
 # In-Cycle Phase-Deadlines (Offsets ab Cycle-Anker).
 # Strikt monoton wachsend, < cycle_duration_ms.
