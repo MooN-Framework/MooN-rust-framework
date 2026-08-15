@@ -1177,7 +1177,7 @@ where
         let own_proposal = self.state.proposed_exclusions();
         let node_state = self.state.node_state();
         let deadline = std::time::Instant::now() + self.timing.error_mgmt_timeout;
-
+        let voting_pool_before = 1 + self.state.active_peer_count_alive_only();
         let outcome = self.collect_phase(
             "exclusion_vote",
             deadline,
@@ -1233,9 +1233,12 @@ where
                     self.mark_failsafe(FailsafeReason::QuorumLost);
                     return StateEvent::TooFewNodes;
                 }
-                if no_buffer_before_vote {
-                    self.mark_failsafe(FailsafeReason::QuorumLost);
-                    return StateEvent::TooFewNodes;
+                
+                let voting_pool_after = 1 + self.state.active_peer_count_alive_only();
+                let voting_pool_shrank = voting_pool_after < voting_pool_before;
+                if no_buffer_before_vote && voting_pool_shrank {
+                     self.mark_failsafe(FailsafeReason::QuorumLost);
+                     return StateEvent::TooFewNodes;
                 }
                 StateEvent::StateOk
             }

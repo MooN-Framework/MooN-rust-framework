@@ -6,30 +6,23 @@ minimum          = 2
 probation_cycles = 10
 
 [timing]
-cycle_duration_ms = 200
+cycle_duration_ms = 20
 
-# In-Cycle Phase-Deadlines (Offsets ab Cycle-Anker).
-# Strikt monoton wachsend, < cycle_duration_ms.
 share_inputs_offset_ms  = 5
 share_result_offset_ms  = 10
 send_ack_offset_ms      = 14
 crc_offset_ms           = 17
 
-# Nicht-Cycle Phase-Timeouts (relativ zum Phaseneintritt).
-init_sync_timeout_ms   = 10000
-peer_sync_timeout_ms   = 500
-cycle_sync_timeout_ms  = 10
-error_mgmt_timeout_ms  = 20
-state_sync_timeout_ms  = 500
+init_sync_timeout_ms        = 2000
+peer_sync_timeout_ms        = 500
+cycle_sync_timeout_ms       = 10
+error_mgmt_timeout_ms       = 20
+state_sync_timeout_ms       = 500
 resync_returning_timeout_ms = 5000
 resync_healthy_timeout_ms   = 500
 
-# Universelles Retransmit-Intervall fuer alle collect_phase-Loops.
-# Muss < kleinster Timeout sein.
-send_interval_ms       = 1
-
-# Misc
-stale_frame_threshold_ms = 50
+send_interval_ms         = 1
+stale_frame_threshold_ms = 100
 resync_interval_cycles   = 500
 
 [transport]
@@ -42,3 +35,9 @@ enabled         = true
 interface       = "lo"
 multicast_group = "239.10.0.2"
 port            = 6666
+
+# Do not edit the [integrity] section by hand — regenerate with
+# python -m harness.config_gen if you change anything above.
+[integrity]
+algo     = "sha256"
+checksum = "0af3699dd75a58d61107c68f76f6590fcb4cc87a15961e29d2d0e0d6053e72fb"

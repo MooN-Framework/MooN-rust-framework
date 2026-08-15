@@ -117,7 +117,7 @@ fn parse_config_path() -> Result<PathBuf, String> {
 /// Read the TOML file and parse it into a `NodeConfig`.
 fn load_config(path: &PathBuf) -> Result<NodeConfig, Box<dyn std::error::Error>> {
     let bytes = fs::read_to_string(path)?;
-    Ok(toml::from_str(&bytes)?)
+    NodeConfig::verify_and_parse(&bytes).map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))
 }
 
 /// Fresh session id from the wall clock (nanoseconds since epoch).

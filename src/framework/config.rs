@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::net::Ipv4Addr;
 use std::time::Duration;
+use sha2::{Digest, Sha256};
 
 pub const MAX_TOTAL_NODES: usize = 8;
 pub const MAX_PEERS: usize = MAX_TOTAL_NODES - 1;
@@ -222,6 +223,50 @@ impl NodeConfig {
         )
     }
 
+        pub fn verify_and_parse(text: &str) -> Result<Self, ConfigError> {
+        // 1. Parse into a generic toml::Value so we can walk the tree
+        //    for the canonical form BEFORE deserializing.
+        let value: toml::Value = toml::from_str(text)
+            .map_err(|e| ConfigError::Parse(e.to_string()))?;
+
+        // 2. Read the integrity section.
+        let integrity = value
+            .get("integrity")
+            .and_then(|v| v.as_table())
+            .ok_or(ConfigError::MissingIntegrity)?;
+        let algo = integrity
+            .get("algo")
+            .and_then(|v| v.as_str())
+            .ok_or(ConfigError::MissingIntegrityField("algo"))?;
+        if algo != "sha256" {
+            return Err(ConfigError::UnsupportedAlgo(algo.to_string()));
+        }
+        let expected_digest = integrity
+            .get("checksum")
+            .and_then(|v| v.as_str())
+            .ok_or(ConfigError::MissingIntegrityField("checksum"))?;
+
+        // 3. Compute canonical form + digest, excluding [integrity].
+        let canonical = canonical_bytes(&value);
+        let mut hasher = Sha256::new();
+        hasher.update(&canonical);
+        let actual_digest = hex_lower(&hasher.finalize());
+
+        if actual_digest != expected_digest {
+            return Err(ConfigError::ChecksumMismatch {
+                expected: expected_digest.to_string(),
+                actual: actual_digest,
+            });
+        }
+
+        // 4. Real deserialize into NodeConfig.
+        //    NodeConfig doesn't include the integrity field so serde
+        //    will happily ignore it (deny_unknown_fields would need to
+        //    be off, which is the default).
+        toml::from_str::<NodeConfig>(text)
+            .map_err(|e| ConfigError::Parse(e.to_string()))
+    }
+
     pub fn timing(&self) -> CycleTiming {
         let t = &self.timing;
         let ms = Duration::from_millis;
@@ -270,3 +315,124 @@ impl NodeConfig {
         }
     }
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IntegritySection {
+    pub algo: String,
+    pub checksum: String,
+}
+
+/// Walk the toml::Value tree, produce the canonical bytes.
+/// Excludes the top-level `integrity` key.
+fn canonical_bytes(root: &toml::Value) -> Vec<u8> {
+    let mut leaves: Vec<(String, String)> = Vec::new();
+    if let Some(t) = root.as_table() {
+        for (k, v) in t.iter() {
+            if k == "integrity" {
+                continue;
+            }
+            flatten(k, v, &mut leaves);
+        }
+    }
+    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::new();
+    for (i, (k, v)) in leaves.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+    }
+    out.into_bytes()
+}
+
+fn flatten(prefix: &str, v: &toml::Value, out: &mut Vec<(String, String)>) {
+    match v {
+        toml::Value::Table(t) => {
+            for (k, sub) in t.iter() {
+                let path = format!("{prefix}.{k}");
+                flatten(&path, sub, out);
+            }
+        }
+        _ => out.push((prefix.to_string(), value_to_json(v))),
+    }
+}
+
+/// JSON-encode a scalar toml::Value the same way `json.dumps` would.
+fn value_to_json(v: &toml::Value) -> String {
+    match v {
+        toml::Value::String(s) => {
+            // JSON string with standard escaping.
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if (c as u32) < 0x20 => {
+                        out.push_str(&format!("\\u{:04x}", c as u32));
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+            out
+        }
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Float(f) => {
+            // Match Python json.dumps behaviour: no unnecessary trailing zeros,
+            // but always include a decimal point / exponent.
+            let s = format!("{}", f);
+            if s.contains('.') || s.contains('e') || s.contains('E') {
+                s
+            } else {
+                format!("{}.0", s)
+            }
+        }
+        toml::Value::Datetime(dt) => format!("\"{}\"", dt),  // rare in configs
+        toml::Value::Array(_) | toml::Value::Table(_) => {
+            unreachable!("flatten already peeled tables; arrays not used in our schema")
+        }
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+#[derive(Debug)]
+pub enum ConfigError {
+    Parse(String),
+    MissingIntegrity,
+    MissingIntegrityField(&'static str),
+    UnsupportedAlgo(String),
+    ChecksumMismatch { expected: String, actual: String },
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Parse(msg) => write!(f, "config parse failed: {msg}"),
+            Self::MissingIntegrity => write!(f, "missing [integrity] section"),
+            Self::MissingIntegrityField(name) => {
+                write!(f, "[integrity].{name} missing or wrong type")
+            }
+            Self::UnsupportedAlgo(a) => write!(f, "unsupported checksum algo: {a}"),
+            Self::ChecksumMismatch { expected, actual } => write!(
+                f,
+                "checksum mismatch: file says {expected}, computed {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
