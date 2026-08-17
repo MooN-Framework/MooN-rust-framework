@@ -500,6 +500,8 @@ where
             warn!("injection: suppressing cyclesync send");
         }
 
+        self.state.log_system_state_crc_contents();
+
         let node_state = self.state.node_state();
         let expected_mask = self.state.expected_sync_mask();
         let deadline = std::time::Instant::now() + self.timing.cycle_sync_timeout;

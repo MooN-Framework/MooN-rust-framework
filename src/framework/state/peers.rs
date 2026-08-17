@@ -67,6 +67,22 @@ impl PeerRoster {
         false
     }
 
+    pub fn set_peer_from_snapshot(
+    &mut self,
+    id: u8,
+    health: PeerHealth,
+    probation_cycles_ok: u32,
+) -> bool {
+    for peer in self.peers.iter_mut() {
+        if peer.id == id {
+            peer.health = health;
+            peer.probation_cycles_ok = probation_cycles_ok;
+            return true;
+        }
+    }
+    false
+}
+
     pub fn peers(&self) -> &[PeerInfo] {
         &self.peers
     }

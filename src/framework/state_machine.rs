@@ -53,12 +53,9 @@ pub enum StateEvent {
     AckTimeout,
     ResultPublished,
     ResyncDue,
-
     GoResyncLostPeer,
     ResyncLostPeerTimeout,
     ResyncLostPeerOk,
-    /// Consensus reached but at least one peer diverged. Routed through
-    /// ErrorManagement so the divergent peer can be reconfigured centrally.
     DissenterDetected,
     StateOk,
     StateDiverged,
@@ -124,6 +121,9 @@ impl NodeState {
             (SystemStateCrcExchange, CrcDivergent) => ErrorManagement,
             (SystemStateCrcExchange, PeerInError) => ErrorManagement,
             (SystemStateCrcExchange,  SelfExcluded) => Isolation,
+
+            (SystemStateCrcExchange, CrcOk) => PublishResult,
+            (SystemStateCrcExchange, CrcDivergent) => ErrorManagement,
 
             (PublishResult, ResultPublished) => CycleSync,
             (PublishResult, ResyncDue) => PeerSync,
