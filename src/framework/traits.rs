@@ -130,3 +130,120 @@ pub trait SelfTest {
 
     fn run(&mut self) -> Result<(), Self::Error>;
 }
+
+/// Source of per-cycle sensor input. Called once per cycle from
+/// `handle_read_inputs`. Implementations may block on hardware, poll a
+/// ring buffer written by a background thread, or return a latched
+/// value — the runner treats the returned value as the cycle's input
+/// and forwards it to `Computation::compute` after `inputs_agree`.
+///
+/// `set` is a hook for external overrides (diagnostic input injection,
+/// externally-driven simulations). Impls without an external-push story
+/// can leave the default no-op.
+pub trait InputSource {
+    type Input: CyclePayload;
+
+    /// Fetch the current sensor value for this cycle.
+    fn read(&mut self) -> Self::Input;
+
+    /// Override the current input from outside (diagnostic staged
+    /// input, external push). Default is a no-op — impls that only
+    /// pull from hardware can ignore this.
+    fn set(&mut self, _input: Self::Input) {}
+}
+
+/// Trivial `InputSource` that just latches a value and returns it every
+/// cycle. Matches the original runner behaviour where a single
+/// `C::Input` field was polled each cycle.
+#[derive(Debug, Clone, Copy)]
+pub struct LatchedInput<T: CyclePayload> {
+    current: T,
+}
+
+impl<T: CyclePayload> LatchedInput<T> {
+    pub fn new(initial: T) -> Self {
+        Self { current: initial }
+    }
+
+    pub fn current(&self) -> T {
+        self.current
+    }
+}
+
+impl<T: CyclePayload> InputSource for LatchedInput<T> {
+    type Input = T;
+
+    fn read(&mut self) -> T {
+        self.current
+    }
+
+    fn set(&mut self, input: T) {
+        self.current = input;
+    }
+}
+
+/// Domain-specific application state that participates in the
+/// SystemStateCrc and SystemStateSync exchanges.
+///
+/// Any bytes returned by `to_wire` are folded into the system-state CRC
+/// on every node, so a divergence in application state raises the same
+/// `CrcDivergent` verdict as a divergence in roster or sequence
+/// number. During SystemStateSync the same bytes are shipped inside the
+/// snapshot payload, so a rejoining or newly promoted node can adopt
+/// the sender's state via `ApplicationStateProvider::apply`.
+///
+/// `WIRE_SIZE` is checked at compile time against
+/// `MAX_APPLICATION_DATA_SIZE` in `framework::config`.
+pub trait ApplicationData: Copy + PartialEq + fmt::Debug {
+    const WIRE_SIZE: usize;
+
+    fn to_wire(&self, w: &mut WireWriter<'_>);
+    fn from_wire(r: &mut WireReader<'_>) -> Result<Self, PayloadError>;
+}
+
+/// Owner of the application state that gets CRC'd and synced.
+///
+/// `snapshot` is called at CrcExchange (to hash into the CRC) and, on
+/// the sender side, at SystemStateSync (to broadcast). `apply` is
+/// called on the receiver side of SystemStateSync once the majority
+/// snapshot has been picked, so the local application state adopts the
+/// fabric-agreed values.
+///
+/// Use `NoApplicationData` + `NoAppState` for use cases without any
+/// per-node domain state that needs syncing.
+pub trait ApplicationStateProvider {
+    type Data: ApplicationData;
+
+    fn snapshot(&self) -> Self::Data;
+    fn apply(&mut self, data: &Self::Data);
+}
+
+/// Zero-sized application data. Use when the domain has no state that
+/// needs to participate in CRC / state sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NoApplicationData;
+
+impl ApplicationData for NoApplicationData {
+    const WIRE_SIZE: usize = 0;
+
+    fn to_wire(&self, _w: &mut WireWriter<'_>) {}
+
+    fn from_wire(_r: &mut WireReader<'_>) -> Result<Self, PayloadError> {
+        Ok(Self)
+    }
+}
+
+/// Provider that carries no application state — `snapshot` always
+/// returns the unit value, `apply` is a no-op.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoAppState;
+
+impl ApplicationStateProvider for NoAppState {
+    type Data = NoApplicationData;
+
+    fn snapshot(&self) -> NoApplicationData {
+        NoApplicationData
+    }
+
+    fn apply(&mut self, _data: &NoApplicationData) {}
+}

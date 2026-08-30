@@ -7,6 +7,17 @@ pub const MAX_TOTAL_NODES: usize = 8;
 pub const MAX_PEERS: usize = MAX_TOTAL_NODES - 1;
 pub const MAX_DISSENTERS: usize = 16;
 
+/// Upper bound on the wire size of a single `ApplicationData` snapshot.
+/// The framework carries application data inside the SystemStateSnapshot
+/// payload as a fixed-size byte buffer plus a length prefix, so this
+/// value caps how much domain state can ride along with the state-sync
+/// exchange. Increase if the domain needs to sync larger blobs — the
+/// only cost is a bigger `MAX_FRAME_SIZE` at the wire layer.
+///
+/// `ApplicationData::WIRE_SIZE` is asserted against this bound at
+/// compile time inside `UdpFrame`.
+pub const MAX_APPLICATION_DATA_SIZE: usize = 64;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ParticipantConfig {
     pub nominal_participants: u8,

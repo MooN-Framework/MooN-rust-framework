@@ -1,6 +1,8 @@
 use crate::framework::peer_sync::{extract_sync_fields, SyncFields};
 use crate::framework::state::PeerHealth;
-use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
+use crate::framework::traits::{
+    ApplicationStateProvider, Computation, DecisionSink, InputSource, SelfTest, Voter,
+};
 use crate::framework::transport::RecvOutcome;
 use crate::framework::wire::UdpFrame;
 use serde::Deserialize;
@@ -17,12 +19,14 @@ pub enum PhaseOutcome {
     Fault,
 }
 
-impl<C, V, S, T> super::Runner<C, V, S, T>
+impl<C, V, S, T, IS, A> super::Runner<C, V, S, T, IS, A>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
     T: SelfTest,
+    IS: InputSource<Input = C::Input>,
+    A: ApplicationStateProvider,
     C::Input: for<'de> Deserialize<'de>,
 {
     /// Generic phase driver: periodically send until the completion

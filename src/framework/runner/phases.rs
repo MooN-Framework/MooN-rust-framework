@@ -1,10 +1,15 @@
 use super::PhaseOutcome;
 use crate::framework::config::{MAX_PEERS, MAX_TOTAL_NODES};
 use crate::framework::peer_sync::{extract_sync_fields, PeerSync, SyncFields, SAMPLES_PER_PEER};
-use crate::framework::state::{crc_from_snapshot_fields, PeerHealth, StoredSnapshot};
+use crate::framework::state::{
+    crc_from_snapshot_fields, serialize_app_data, PeerHealth, StoredSnapshot,
+};
 use crate::framework::state_machine::{NodeState, StateEvent, SystemState};
 use crate::framework::traits::SinkVerdict;
-use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter, VotingOutcome};
+use crate::framework::traits::{
+    ApplicationStateProvider, Computation, DecisionSink, InputSource, SelfTest, Voter,
+    VotingOutcome,
+};
 use crate::framework::transport::RecvOutcome;
 use crate::framework::types::PeerMask;
 use crate::framework::wire::FailsafeReason;
@@ -15,12 +20,14 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-impl<C, V, S, T> super::Runner<C, V, S, T>
+impl<C, V, S, T, IS, A> super::Runner<C, V, S, T, IS, A>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
     T: SelfTest,
+    IS: InputSource<Input = C::Input>,
+    A: ApplicationStateProvider,
     C::Input: for<'de> Deserialize<'de>,
 {
     /// Startup: delegate to the user-supplied `SelfTest`. On `Ok` the
@@ -28,6 +35,23 @@ where
     /// via `SelfTestErr`.
     pub(super) fn handle_startup(&mut self) -> StateEvent {
         self.state.set_system_state(SystemState::Startup);
+
+        // Test hook: `MOON_INJECT_SELFTEST_FAIL=1` in the environment
+        // forces this to take the SelfTestFailed path. Only compiled
+        // under `feature = "diagnostic"`; production builds ignore
+        // the variable entirely.
+        #[cfg(feature = "diagnostic")]
+        {
+            if std::env::var("MOON_INJECT_SELFTEST_FAIL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+            {
+                error!("injection: MOON_INJECT_SELFTEST_FAIL set, forcing self-test failure");
+                self.mark_failsafe(FailsafeReason::SelfTestFailed);
+                return StateEvent::SelfTestErr;
+            }
+        }
+
         match self.self_test.run() {
             Ok(()) => {
                 info!("self test passed");
@@ -255,15 +279,42 @@ where
             return StateEvent::Fault;
         }
 
-        let mut peer_sync = PeerSync::new(&peer_ids);
+        // Liveness threshold for excluding silent peers. Set to
+        // ~10% of the phase deadline so a peer that dies mid-phase
+        // (e.g. rejoin race: probation node killed shortly after
+        // readmit — see T21) gets flagged well before the whole phase
+        // has to time out, while still tolerating short bursts of
+        // packet loss on multicast. Clamped to a floor of 50 ms so
+        // very tight configs don't false-positive.
+        let unreachable_threshold =
+            self.timing.peer_sync_timeout / 10;
+        let unreachable_threshold = unreachable_threshold.max(Duration::from_millis(50));
+        let unreachable_threshold_ns = unreachable_threshold.as_nanos() as u64;
+
+        let phase_start_ns = crate::framework::transport::now_monotonic_ns();
+        let mut peer_sync = PeerSync::new(&peer_ids, phase_start_ns);
         let node_state = self.state.node_state();
         let deadline = Instant::now() + self.timing.peer_sync_timeout;
         let mut next_request = Instant::now();
 
         loop {
+            // Cheap to call every iteration — it's a linear scan of
+            // at most MAX_PEERS entries with a saturating subtract.
+            peer_sync.mark_unreachable_if_stale(
+                crate::framework::transport::now_monotonic_ns(),
+                unreachable_threshold_ns,
+            );
+
             if peer_sync.is_complete() {
                 let clocks = peer_sync.finalize();
                 let epsilon = peer_sync.max_error_bound().unwrap_or(0);
+                let unreachable = peer_sync.unreachable_peers();
+                if !unreachable.is_empty() {
+                    warn!(
+                        unreachable = ?unreachable.as_slice(),
+                        "peer sync complete with unreachable peers — they'll be dropped by the normal missed-frame path next cycle"
+                    );
+                }
                 info!(
                     epsilon_ns = epsilon,
                     count = clocks.len(),
@@ -284,6 +335,7 @@ where
                     found = peer_sync.finalize().len(),
                     total = peer_ids.len(),
                     target = SAMPLES_PER_PEER,
+                    unreachable = ?peer_sync.unreachable_peers().as_slice(),
                     "peer sync deadline exceeded"
                 );
                 return StateEvent::PeerSyncTimeout;
@@ -350,6 +402,14 @@ where
         // Receiver-Rolle: eigener Snapshot unbekannt bis Anwendung, nichts zu senden.
         let (nom, min, pc, cs, entries) = self.state.build_snapshot();
 
+        // Application-data snapshot for the sender. Frozen at phase
+        // entry so the same bytes ride in every retransmit and match
+        // the CRC we compare against incoming acks. Receivers ignore
+        // this pair — their own app_state will be overwritten via
+        // `ApplicationStateProvider::apply` once the majority
+        // snapshot has been picked.
+        let (own_app_len, own_app_buf) = serialize_app_data(&self.app_state.snapshot());
+
         // Für den Sender: Empfänger-Liste = alle non-Lost Peers (der Receiver
         // ist einer davon; die anderen Sender ackn nicht, aber schicken auch
         // keinen Snapshot der ein Ack erwartet, weil sie nicht Empfänger sind).
@@ -385,7 +445,32 @@ where
                                 error!(error = ?e, "apply_snapshot failed");
                                 return Err(());
                             }
-                            let adopted_crc = this.state.compute_system_state_crc();
+                            // Adopt the winner's application state.
+                            // Decoding must succeed — the bytes were
+                            // produced by an `ApplicationData` impl of
+                            // the same type on the sender. A decode
+                            // failure means wire corruption slipped
+                            // past the frame CRC or the sender
+                            // shipped a different `A::Data` type, both
+                            // of which are unrecoverable here.
+                            match winner.decode_app_data::<A::Data>() {
+                                Ok(decoded) => this.app_state.apply(&decoded),
+                                Err(e) => {
+                                    error!(
+                                        error = ?e,
+                                        "decode_app_data on winner snapshot failed"
+                                    );
+                                    return Err(());
+                                }
+                            }
+                            // Re-serialize the now-applied application
+                            // state so the ack CRC folds in the
+                            // adopted bytes, not our pre-sync ones.
+                            let (adopted_app_len, adopted_app_buf) =
+                                serialize_app_data(&this.app_state.snapshot());
+                            let adopted_crc = this
+                                .state
+                                .compute_system_state_crc(adopted_app_len, &adopted_app_buf);
                             if let Err(e) = this
                                 .transport
                                 .send(node_state, Payload::SystemStateSnapshotAck { adopted_crc })
@@ -396,7 +481,8 @@ where
                         }
                     }
                 } else {
-                    // Sender: broadcast snapshot.
+                    // Sender: broadcast snapshot including the frozen
+                    // application-data trailer.
                     if let Err(e) = this.send_frame(
                         node_state,
                         Payload::SystemStateSnapshot {
@@ -405,6 +491,8 @@ where
                             probation_cycles: pc,
                             current_seq: cs,
                             entries,
+                            app_data_len: own_app_len,
+                            app_data: own_app_buf,
                         },
                     ) {
                         error!(error = ?e, "send_snapshot failed");
@@ -424,7 +512,9 @@ where
                 } else {
                     // Sender: Ack von mindestens einem Peer der needs_state_sync
                     // hatte, und CRC stimmt mit unserem überein.
-                    let own_crc = crc_from_snapshot_fields(nom, min, pc, cs, &entries);
+                    let own_crc = crc_from_snapshot_fields(
+                        nom, min, pc, cs, &entries, own_app_len, &own_app_buf,
+                    );
                     this.state.sync_acks().iter().any(|(_, c)| *c == own_crc)
                 }
             },
@@ -437,6 +527,8 @@ where
                         probation_cycles,
                         current_seq,
                         entries,
+                        app_data_len,
+                        app_data,
                     } => {
                         let snap = StoredSnapshot {
                             nominal: nominal_participants,
@@ -444,6 +536,8 @@ where
                             probation_cycles,
                             current_seq,
                             entries,
+                            app_data_len,
+                            app_data,
                         };
                         this.state.record_sync_snapshot(peer_id, snap);
                     }
@@ -464,7 +558,9 @@ where
                     info!("state sync complete as receiver");
                 } else {
                     // Prüfen: wurde unser CRC von den Empfängern akzeptiert?
-                    let own_crc = crc_from_snapshot_fields(nom, min, pc, cs, &entries);
+                    let own_crc = crc_from_snapshot_fields(
+                        nom, min, pc, cs, &entries, own_app_len, &own_app_buf,
+                    );
                     let all_match = self.state.sync_acks().iter().all(|(_, c)| *c == own_crc);
                     if !all_match {
                         error!(own_crc, "our snapshot was minority, failsafe");
@@ -493,7 +589,9 @@ where
     /// out.
     pub(super) fn handle_cycle_sync(&mut self) -> StateEvent {
         self.state.reset_cycle_sync_evidence();
-        self.state.log_system_state_crc_contents();
+        let (dbg_app_len, dbg_app_buf) = serialize_app_data(&self.app_state.snapshot());
+        self.state
+            .log_system_state_crc_contents(dbg_app_len, &dbg_app_buf);
 
         let suppress = self.is_muted() || self.should_drop_cyclesync();
         if suppress {
@@ -581,7 +679,17 @@ where
         }
         self.last_cycle_start = Some(now);
 
-        self.state.record_own_input(self.input);
+        #[cfg(feature = "diagnostic")]
+        {
+            if self.inject_input_provider_fail_next {
+                self.inject_input_provider_fail_next = false;
+                warn!("injection: skipping record_own_input (InjectInputProviderFail)");
+                return StateEvent::InputsRead;
+            }
+        }
+
+        let input = self.input_source.read();
+        self.state.record_own_input(input);
         StateEvent::InputsRead
     }
 
@@ -702,6 +810,16 @@ where
             );
             self.mark_failsafe(FailsafeReason::StateDivergence);
             return StateEvent::Fault;
+        }
+
+        #[cfg(feature = "diagnostic")]
+        {
+            if self.inject_computation_fail_next {
+                self.inject_computation_fail_next = false;
+                error!("injection: forcing computation failure (InjectComputationFail)");
+                self.mark_failsafe(FailsafeReason::LocalFault);
+                return StateEvent::Fault;
+            }
         }
 
         match self.computation.compute(own) {
@@ -870,7 +988,11 @@ where
         self.state.reset_crc_evidence();
         let _ = self.take_peer_in_error();
 
-        let real_crc = self.state.compute_system_state_crc();
+        // Snapshot the application state once at phase entry — same
+        // bytes must flow into both the CRC we broadcast and any later
+        // consistency check within this handler.
+        let (app_len, app_buf) = serialize_app_data(&self.app_state.snapshot());
+        let real_crc = self.state.compute_system_state_crc(app_len, &app_buf);
         let fake = self.should_fake_crc();
         let own_crc_on_wire = fake.unwrap_or(real_crc);
         if fake.is_some() {
@@ -1064,9 +1186,16 @@ where
 
                 if let Some((own_dissented, peer_dissenter_indices)) = dissenter_analysis {
                     if own_dissented {
-                        error!(own_id, "own value dissented, failsafe");
-                        self.mark_failsafe(FailsafeReason::StateDivergence);
-                        return StateEvent::Fault;
+                        // Own value diverges from the majority consensus.
+                        // We are the sole outlier against a healthy
+                        // majority — self-quarantine via Isolation
+                        // instead of broadcasting GoFailsafe, which
+                        // would needlessly tear down a working cluster.
+                        warn!(
+                            own_id,
+                            "own value dissented from consensus, going straight to isolation"
+                        );
+                        return StateEvent::SelfExcluded;
                     }
                     if !peer_dissenter_indices.is_empty() {
                         let dissenter_ids: Vec<u8> = peer_dissenter_indices

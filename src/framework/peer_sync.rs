@@ -70,15 +70,30 @@ struct PeerSyncState {
     pending_t1: Option<u64>,
     samples_taken: u32,
     best: Option<SyncSample>,
+    /// Nanosecond timestamp of the last activity for this peer — either
+    /// an outgoing request we sent to them (via
+    /// `record_outgoing_request`) or an incoming response we accepted
+    /// (via `on_response`). Seeded to the phase-start timestamp so
+    /// staleness has a well-defined origin for peers that never
+    /// respond.
+    last_activity_ns: u64,
+    /// Set by `mark_unreachable_if_stale` when this peer has gone
+    /// quiet for longer than the caller-supplied threshold. Once set,
+    /// `is_complete` treats this peer as if it weren't in the required
+    /// set — the framework will fall back on the normal missed-frame
+    /// path to mark it Lost in a following cycle.
+    unreachable: bool,
 }
 
 impl PeerSyncState {
-    fn new(peer_id: u8) -> Self {
+    fn new(peer_id: u8, phase_start_ns: u64) -> Self {
         Self {
             peer_id,
             pending_t1: None,
             samples_taken: 0,
             best: None,
+            last_activity_ns: phase_start_ns,
+            unreachable: false,
         }
     }
 
@@ -114,16 +129,25 @@ pub struct PeerSync {
 }
 
 impl PeerSync {
-    pub fn new(peer_ids: &[u8]) -> Self {
+    /// `phase_start_ns` seeds every peer's `last_activity_ns` so
+    /// staleness for peers that never respond has a well-defined
+    /// origin. Pass the same monotonic-clock reading that the caller
+    /// uses for the very first `record_outgoing_request`.
+    pub fn new(peer_ids: &[u8], phase_start_ns: u64) -> Self {
         Self {
-            peers: peer_ids.iter().map(|&id| PeerSyncState::new(id)).collect(),
+            peers: peer_ids
+                .iter()
+                .map(|&id| PeerSyncState::new(id, phase_start_ns))
+                .collect(),
         }
     }
 
     /// Note a request just sent so future responses can be matched.
+    /// `t1` doubles as the last-activity timestamp for the peer.
     pub fn record_outgoing_request(&mut self, peer_id: u8, t1: u64) {
         if let Some(s) = self.peers.iter_mut().find(|p| p.peer_id == peer_id) {
             s.pending_t1 = Some(t1);
+            s.last_activity_ns = t1;
         }
     }
 
@@ -143,8 +167,59 @@ impl PeerSync {
         }
     }
 
+    /// Mark any peer that has been silent for longer than `threshold_ns`
+    /// as unreachable so `is_complete` no longer waits on them. Idempotent
+    /// — safe to call every loop iteration; once a peer is flagged we
+    /// leave it flagged (a late response could still record a sample,
+    /// which is harmless).
+    ///
+    /// A peer that has already gathered `SAMPLES_PER_PEER` samples is
+    /// never flagged: it's already done, staleness after completion is
+    /// expected.
+    pub fn mark_unreachable_if_stale(&mut self, now_ns: u64, threshold_ns: u64) {
+        for peer in self.peers.iter_mut() {
+            if peer.unreachable || peer.is_complete() {
+                continue;
+            }
+            let elapsed = now_ns.saturating_sub(peer.last_activity_ns);
+            if elapsed > threshold_ns {
+                peer.unreachable = true;
+            }
+        }
+    }
+
+    /// True when every peer we still expect to hear from has enough
+    /// samples. Peers flagged `unreachable` are excluded from the
+    /// required set. If ALL peers are unreachable, returns false — the
+    /// caller's deadline path handles that as a normal timeout.
+    pub fn is_complete(&self) -> bool {
+        let mut has_responsive = false;
+        for p in self.peers.iter() {
+            if p.unreachable {
+                continue;
+            }
+            has_responsive = true;
+            if !p.is_complete() {
+                return false;
+            }
+        }
+        has_responsive
+    }
+
+    /// Peer IDs flagged unreachable during this phase. Diagnostic use —
+    /// callers may want to log which peers were excluded from the sync.
+    pub fn unreachable_peers(&self) -> Vec<u8> {
+        self.peers
+            .iter()
+            .filter(|p| p.unreachable)
+            .map(|p| p.peer_id)
+            .collect()
+    }
+
     /// Ingest a response. Rejects unknown peers, unmatched `t1`, and
-    /// samples with implausible delay.
+    /// samples with implausible delay. `t4_local` also updates the
+    /// peer's last-activity timestamp so `mark_unreachable_if_stale`
+    /// sees the peer as fresh again.
     pub fn on_response(&mut self, peer_id: u8, t1: u64, t2: u64, t3: u64, t4_local: u64) {
         let state = match self.peers.iter_mut().find(|p| p.peer_id == peer_id) {
             Some(s) => s,
@@ -154,6 +229,10 @@ impl PeerSync {
             Some(expected) if expected == t1 => {}
             _ => return,
         }
+        // Any well-formed response counts as activity, even one we
+        // ultimately reject for negative delay — the peer clearly
+        // wasn't silent.
+        state.last_activity_ns = t4_local;
         let sample = SyncSample {
             t1,
             t2,
@@ -165,11 +244,6 @@ impl PeerSync {
             return;
         }
         state.record_sample(sample);
-    }
-
-    /// True when every peer has reached the configured sample count.
-    pub fn is_complete(&self) -> bool {
-        !self.peers.is_empty() && self.peers.iter().all(|p| p.is_complete())
     }
 
     /// Extract the aggregated per-peer clocks. Meaningful only when
@@ -276,10 +350,109 @@ mod tests {
 
     #[test]
     fn on_response_rejects_unmatched_t1() {
-        let mut ps = PeerSync::new(&[1]);
+        let mut ps = PeerSync::new(&[1], 0);
         ps.record_outgoing_request(1, 12345);
         ps.on_response(1, 99999, 100, 200, 300);
         assert_eq!(ps.peers[0].samples_taken, 0);
         assert!(ps.peers[0].best.is_none());
+    }
+
+    // --- Liveness / unreachable-peer tests -------------------------
+    // These cover the T21 fix: `PeerSync` must complete with a subset
+    // of peers when one has been silent past `unreachable_threshold`,
+    // rather than blocking until the phase deadline expires.
+
+    /// Helper: push a full round-trip so a peer collects one sample
+    /// with valid delay and a fresh `last_activity_ns = t4`.
+    fn round_trip(ps: &mut PeerSync, peer_id: u8, t1: u64, one_way: u64, proc_time: u64) {
+        ps.record_outgoing_request(peer_id, t1);
+        let t2 = t1 + one_way;
+        let t3 = t2 + proc_time;
+        let t4 = t3 + one_way;
+        ps.on_response(peer_id, t1, t2, t3, t4);
+    }
+
+    #[test]
+    fn unreachable_peer_still_lets_sync_complete() {
+        // Two peers: peer 1 gets all 8 samples, peer 2 goes silent.
+        // Once we call `mark_unreachable_if_stale` past the threshold,
+        // `is_complete` must return true instead of blocking on peer 2.
+        let mut ps = PeerSync::new(&[1, 2], 0);
+        for i in 0..SAMPLES_PER_PEER {
+            let t1 = 1_000 + i as u64 * 1_000_000;
+            round_trip(&mut ps, 1, t1, 100_000, 50_000);
+        }
+        // Peer 2 got nothing — still has last_activity_ns = 0.
+        assert!(!ps.is_complete(), "before marking stale, peer 2 blocks completion");
+
+        // Advance to well past the threshold. Peer 2 flagged; peer 1
+        // is already complete so untouched.
+        ps.mark_unreachable_if_stale(10_000_000_000, 100_000_000);
+        assert!(ps.is_complete(), "peer 2 is now unreachable and skipped");
+        assert_eq!(ps.unreachable_peers(), vec![2]);
+    }
+
+    #[test]
+    fn responsive_peer_never_flagged_unreachable() {
+        // Sanity: a peer that keeps responding within the threshold
+        // must never be flagged, even after many iterations.
+        let mut ps = PeerSync::new(&[1], 0);
+        for i in 0..SAMPLES_PER_PEER {
+            let t1 = 1_000 + i as u64 * 1_000_000;
+            round_trip(&mut ps, 1, t1, 100_000, 50_000);
+            // Call staleness check with a `now` that's only a few
+            // hundred µs past the last t4 — well under the 100 ms
+            // threshold.
+            ps.mark_unreachable_if_stale(t1 + 500_000, 100_000_000);
+        }
+        assert!(ps.unreachable_peers().is_empty());
+        assert!(ps.is_complete());
+    }
+
+    #[test]
+    fn all_peers_unreachable_means_not_complete() {
+        // Defensive: if every peer is silent, is_complete must NOT
+        // return true (that would let us "sync" with nobody). The
+        // caller's deadline path then handles this as a timeout.
+        let mut ps = PeerSync::new(&[1, 2], 0);
+        ps.mark_unreachable_if_stale(10_000_000_000, 100_000_000);
+        assert_eq!(ps.unreachable_peers(), vec![1, 2]);
+        assert!(!ps.is_complete(), "no responsive peer left → not complete");
+    }
+
+    #[test]
+    fn completed_peer_immune_to_staleness() {
+        // Regression: once a peer has 8 samples we're done with them.
+        // A subsequent staleness sweep must not flip their state to
+        // "unreachable" — that would confuse downstream consumers
+        // reading `unreachable_peers()`.
+        let mut ps = PeerSync::new(&[1], 0);
+        for i in 0..SAMPLES_PER_PEER {
+            let t1 = 1_000 + i as u64 * 1_000_000;
+            round_trip(&mut ps, 1, t1, 100_000, 50_000);
+        }
+        assert!(ps.is_complete());
+        // Massive gap — peer would be stale, but is_complete already
+        // returned true.
+        ps.mark_unreachable_if_stale(u64::MAX / 2, 100_000_000);
+        assert!(ps.unreachable_peers().is_empty());
+        assert!(ps.is_complete());
+    }
+
+    #[test]
+    fn recorded_response_refreshes_activity() {
+        // A response arriving *after* a staleness window is no longer
+        // enough to un-flag the peer (unreachable is sticky) — this
+        // test just verifies the timestamp bookkeeping: once a peer
+        // responds, its last_activity_ns catches up so a *subsequent*
+        // stale check with the same `now` no longer flags it.
+        let mut ps = PeerSync::new(&[1], 0);
+        // At t=200ms, peer would look stale (last_activity=0, gap=200ms).
+        // But we send + receive at t1=150ms, t4=150.3ms → refresh.
+        round_trip(&mut ps, 1, 150_000_000, 100_000, 50_000);
+        // Now at t=200ms, gap since last_activity (~150.3ms) is ~50ms,
+        // under a 100ms threshold → not flagged.
+        ps.mark_unreachable_if_stale(200_000_000, 100_000_000);
+        assert!(ps.unreachable_peers().is_empty());
     }
 }

@@ -7,7 +7,7 @@
 use crate::framework::config::TransportConfig;
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::CyclePayload;
-use crate::framework::wire::{FrameError, Payload, UdpFrame, MAX_PAYLOAD_WIRE_SIZE};
+use crate::framework::wire::{FrameError, Payload, UdpFrame, STAGING_SIZE};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::io;
@@ -19,7 +19,12 @@ const HEADER_SIZE: usize = 23;
 const CRC_SIZE: usize = 4;
 
 /// Upper bound on receive buffer size across all payload variants.
-pub const RECV_BUFFER_SIZE: usize = HEADER_SIZE + MAX_PAYLOAD_WIRE_SIZE + CRC_SIZE;
+/// Uses `STAGING_SIZE` (max body across all variants, including the
+/// framework's `SystemStateSnapshot` with its `ApplicationData`
+/// trailer) — not `MAX_PAYLOAD_WIRE_SIZE`, which only bounds
+/// user-supplied `CyclePayload` types and would silently truncate
+/// larger framework bodies.
+pub const RECV_BUFFER_SIZE: usize = HEADER_SIZE + STAGING_SIZE + CRC_SIZE;
 
 /// Classification of an incoming frame after decode + peer-cursor checks.
 #[derive(Debug)]

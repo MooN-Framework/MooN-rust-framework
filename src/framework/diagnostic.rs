@@ -126,6 +126,16 @@ pub enum Command {
     /// a warning and falls back to the real state.
     InjectFakePhaseHeader { count: u32, wire_value: u8 },
 
+    /// One-shot: on the next `handle_read_inputs`, skip the
+    /// `record_own_input` call so the following ShareInputs sees no
+    /// own input and takes the `LocalFault` failsafe path. Self-clearing.
+    InjectInputProviderFail,
+
+    /// One-shot: on the next `handle_share_inputs`, the compute step
+    /// returns Fault without invoking `Computation::compute`, forcing
+    /// the `LocalFault` failsafe path. Self-clearing.
+    InjectComputationFail,
+
     ClearInjection,
 }
 
@@ -161,6 +171,25 @@ pub struct StatusResponse {
     pub injection: InjectionSnapshot,
     pub pending_input: bool,
     pub pending_injection_update: bool,
+
+    /// Failsafe reason latched by the first `mark_failsafe` call this
+    /// process lifetime, as the decimal `u8` discriminant of
+    /// `FailsafeReason`. `None` while the node has not yet marked
+    /// itself for failsafe.
+    pub last_failsafe_reason: Option<u8>,
+
+    /// Ring buffer (up to 32) of the most recent FSM transitions
+    /// observed by this process, oldest first. Each entry is
+    /// `(from_state, event, to_state)` formatted with `Debug`.
+    pub recent_transitions: Vec<TransitionRecord>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TransitionRecord {
+    pub from: String,
+    pub event: String,
+    pub to: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,6 +249,10 @@ pub struct PendingChanges {
     pub drop_from_peers_mask: Option<u8>,
     /// T16 staging: (count, wire_value).
     pub fake_phase_header: Option<(u32, u8)>,
+
+    /// One-shot flags picked up by the runner in apply_pending_diagnostic.
+    pub inject_input_provider_fail: bool,
+    pub inject_computation_fail: bool,
 }
 
 impl PendingChanges {
@@ -241,6 +274,8 @@ impl PendingChanges {
             || self.corrupt_result_remaining.is_some()
             || self.drop_from_peers_mask.is_some()
             || self.fake_phase_header.is_some()
+            || self.inject_input_provider_fail
+            || self.inject_computation_fail
             || self.clear_injection
     }
 }
@@ -564,6 +599,16 @@ impl Diagnostic {
             Command::InjectFakePhaseHeader { count, wire_value } => {
                 self.pending.fake_phase_header = Some((count, wire_value));
                 self.stage_ack("inject_fake_phase_header");
+                None
+            }
+            Command::InjectInputProviderFail => {
+                self.pending.inject_input_provider_fail = true;
+                self.stage_ack("inject_input_provider_fail");
+                None
+            }
+            Command::InjectComputationFail => {
+                self.pending.inject_computation_fail = true;
+                self.stage_ack("inject_computation_fail");
                 None
             }
 

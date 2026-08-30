@@ -3,12 +3,14 @@ mod observation;
 mod peers;
 mod voting;
 
-use crate::framework::config::{ParticipantConfig, MAX_PEERS, MAX_TOTAL_NODES};
+use crate::framework::config::{
+    ParticipantConfig, MAX_APPLICATION_DATA_SIZE, MAX_PEERS, MAX_TOTAL_NODES,
+};
 use crate::framework::peer_sync::PeerClock;
 use crate::framework::state_machine::{NodeState, SystemState};
-use crate::framework::traits::{CyclePayload, Voter, VotingOutcome};
+use crate::framework::traits::{ApplicationData, CyclePayload, Voter, VotingOutcome};
 use crate::framework::types::PeerMask;
-use crate::framework::wire::SnapshotEntry;
+use crate::framework::wire::{SnapshotEntry, WireReader, WireWriter};
 use crc32fast::Hasher;
 pub use cycle::{AckInfo, CycleState};
 use heapless::Vec;
@@ -46,12 +48,50 @@ fn upsert_by_id<T, const N: usize>(vec: &mut Vec<(u8, T), N>, peer_id: u8, value
     let _ = vec.push((peer_id, value));
 }
 
+/// Phantom-carrier for a compile-time assertion that a concrete
+/// `ApplicationData` fits into the wire trailer. Follows the same
+/// pattern as `UdpFrame::_ASSERT_FITS`; forcing the const at runtime
+/// via `let _: () = AssertAppDataFits::<A>::OK;` promotes the check
+/// into monomorphization so a violating impl fails to compile.
+struct AssertAppDataFits<A: ApplicationData>(core::marker::PhantomData<A>);
+
+impl<A: ApplicationData> AssertAppDataFits<A> {
+    const OK: () = assert!(
+        A::WIRE_SIZE <= MAX_APPLICATION_DATA_SIZE,
+        "ApplicationData::WIRE_SIZE exceeds MAX_APPLICATION_DATA_SIZE",
+    );
+}
+
+/// Serialize an `ApplicationData` instance into the fixed-size trailer
+/// slot used by `SystemStateSnapshot`. Returns `(len, buffer)` where
+/// `len` is the number of valid bytes at the start of the buffer.
+///
+/// The compile-time assert on `AssertAppDataFits::<A>::OK` catches any
+/// impl whose `WIRE_SIZE` exceeds `MAX_APPLICATION_DATA_SIZE`.
+pub fn serialize_app_data<A: ApplicationData>(
+    data: &A,
+) -> (u8, [u8; MAX_APPLICATION_DATA_SIZE]) {
+    let _: () = AssertAppDataFits::<A>::OK;
+
+    let mut buf = [0u8; MAX_APPLICATION_DATA_SIZE];
+    let written = {
+        let mut w = WireWriter::new(&mut buf);
+        data.to_wire(&mut w);
+        w.written()
+    };
+    // `written` is bounded by A::WIRE_SIZE which the const-assert above
+    // caps at MAX_APPLICATION_DATA_SIZE, so the cast is safe.
+    (written as u8, buf)
+}
+
 pub fn crc_from_snapshot_fields(
     nominal: u8,
     min: u8,
     probation_cycles: u32,
     current_seq: u32,
     entries: &[SnapshotEntry],
+    app_data_len: u8,
+    app_data: &[u8; MAX_APPLICATION_DATA_SIZE],
 ) -> u32 {
     let mut h = Hasher::new();
     h.update(&[nominal, min]);
@@ -66,6 +106,11 @@ pub fn crc_from_snapshot_fields(
         h.update(&[*id, *hw]);
         h.update(&cok.to_le_bytes());
     }
+    // Fold the ApplicationData bytes into the CRC. Only the valid
+    // prefix — the length itself is also hashed so `(0, [...])` and
+    // `(1, [0, ...])` can't collide.
+    h.update(&[app_data_len]);
+    h.update(&app_data[..app_data_len as usize]);
     h.finalize()
 }
 
@@ -76,6 +121,21 @@ pub struct StoredSnapshot {
     pub probation_cycles: u32,
     pub current_seq: u32,
     pub entries: [SnapshotEntry; MAX_TOTAL_NODES],
+    pub app_data_len: u8,
+    pub app_data: [u8; MAX_APPLICATION_DATA_SIZE],
+}
+
+impl StoredSnapshot {
+    /// Deserialize the trailing app-data bytes into a concrete
+    /// `ApplicationData` type. Called on the receiver side of
+    /// SystemStateSync before handing the value to
+    /// `ApplicationStateProvider::apply`.
+    pub fn decode_app_data<A: ApplicationData>(
+        &self,
+    ) -> Result<A, crate::framework::wire::PayloadError> {
+        let mut r = WireReader::new(&self.app_data[..self.app_data_len as usize]);
+        A::from_wire(&mut r)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -212,9 +272,18 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         upsert_by_id(&mut self.sync_acks, peer_id, adopted_crc);
     }
 
-    pub fn compute_system_state_crc(&self) -> u32 {
+    /// Compute the system-state CRC over roster+seq plus a serialized
+    /// `ApplicationData` snapshot. Callers pass the current
+    /// application-state bytes (already produced via
+    /// `serialize_app_data`) so this method stays a pure function of
+    /// the runstate + provided app-data buffer.
+    pub fn compute_system_state_crc(
+        &self,
+        app_data_len: u8,
+        app_data: &[u8; MAX_APPLICATION_DATA_SIZE],
+    ) -> u32 {
         let (nom, min, pc, cs, entries) = self.build_snapshot();
-        crc_from_snapshot_fields(nom, min, pc, cs, &entries)
+        crc_from_snapshot_fields(nom, min, pc, cs, &entries, app_data_len, app_data)
     }
 
     pub fn sync_snapshots(&self) -> &[(u8, StoredSnapshot)] {
@@ -369,19 +438,34 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
     /// Draws its data from `build_snapshot` so the log stays byte-for-byte
     /// aligned with what actually flows into the CRC hash. Health is
     /// reported as the wire byte (0=Alive, 1=Probation, 2=Lost) so a diff
-    /// across nodes shows exactly what the hasher saw.
-    pub fn log_system_state_crc_contents(&self) {
+    /// across nodes shows exactly what the hasher saw. The
+    /// application-data trailer is supplied by the caller (which has
+    /// already serialized the current provider snapshot).
+    pub fn log_system_state_crc_contents(
+        &self,
+        app_data_len: u8,
+        app_data: &[u8; MAX_APPLICATION_DATA_SIZE],
+    ) {
         let (nominal, min, probation_cycles, current_seq, entries) = self.build_snapshot();
         let mut nodes: Vec<(u8, u8, u32), MAX_TOTAL_NODES> = Vec::new();
         for e in entries.iter().filter(|e| e.valid) {
             let _ = nodes.push((e.id, e.health, e.probation_cycles_ok));
         }
         info!(
-            crc = crc_from_snapshot_fields(nominal, min, probation_cycles, current_seq, &entries),
+            crc = crc_from_snapshot_fields(
+                nominal,
+                min,
+                probation_cycles,
+                current_seq,
+                &entries,
+                app_data_len,
+                app_data
+            ),
             nominal,
             min,
             probation_cycles,
             current_seq,
+            app_data_len,
             nodes = ?nodes.as_slice(),
             "system state crc contents"
         );
@@ -1028,4 +1112,146 @@ pub(crate) fn strict_majority<T: Eq + Copy>(values: &[T]) -> Option<T> {
     // Kein Wert erreicht threshold.
     let _ = best;
     None
+}
+
+#[cfg(test)]
+mod app_data_tests {
+    //! Unit tests for the ApplicationData plumbing added to the
+    //! system-state CRC and SystemStateSync exchange. Covers:
+    //! - `NoApplicationData` round-trips as `(0, [0; MAX])` and its CRC
+    //!    contribution is deterministic.
+    //! - A non-trivial `ApplicationData` impl round-trips through
+    //!   `serialize_app_data` + `StoredSnapshot::decode_app_data`.
+    //! - Changing the app-data bytes changes the CRC (so a diverged
+    //!   application state actually triggers `CrcDivergent` in
+    //!   `handle_system_state_crc`).
+    //! - `SnapshotEntry` scalars and the trailer contribute
+    //!   independently to the CRC (regression guard against a bug where
+    //!   only one of the two was hashed).
+
+    use super::*;
+    use crate::framework::traits::{ApplicationData, NoApplicationData};
+    use crate::framework::wire::{PayloadError, WireReader, WireWriter};
+
+    /// Non-trivial `ApplicationData` used by these tests. Two u32
+    /// fields so the CRC is sensitive to both order and value.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TestAppData {
+        counter: u32,
+        epoch: u32,
+    }
+
+    impl ApplicationData for TestAppData {
+        const WIRE_SIZE: usize = 8;
+
+        fn to_wire(&self, w: &mut WireWriter<'_>) {
+            w.push_u32(self.counter);
+            w.push_u32(self.epoch);
+        }
+
+        fn from_wire(r: &mut WireReader<'_>) -> Result<Self, PayloadError> {
+            Ok(Self {
+                counter: r.read_u32()?,
+                epoch: r.read_u32()?,
+            })
+        }
+    }
+
+    fn dummy_entries() -> [SnapshotEntry; MAX_TOTAL_NODES] {
+        let mut e = [SnapshotEntry::default(); MAX_TOTAL_NODES];
+        e[0].valid = true;
+        e[0].id = 0;
+        e[0].health = 0; // Alive
+        e[0].probation_cycles_ok = 0;
+        e[1].valid = true;
+        e[1].id = 1;
+        e[1].health = 0;
+        e[1].probation_cycles_ok = 0;
+        e
+    }
+
+    #[test]
+    fn no_app_data_serializes_to_zero_len() {
+        let (len, buf) = serialize_app_data(&NoApplicationData);
+        assert_eq!(len, 0);
+        assert_eq!(buf, [0u8; MAX_APPLICATION_DATA_SIZE]);
+    }
+
+    #[test]
+    fn test_app_data_round_trip() {
+        let original = TestAppData { counter: 0xDEAD_BEEF, epoch: 42 };
+        let (len, buf) = serialize_app_data(&original);
+        assert_eq!(len as usize, TestAppData::WIRE_SIZE);
+
+        // Feed the trailer back through a StoredSnapshot to match the
+        // real receiver path in `handle_system_state_sync`.
+        let snap = StoredSnapshot {
+            nominal: 3,
+            min: 2,
+            probation_cycles: 10,
+            current_seq: 0,
+            entries: dummy_entries(),
+            app_data_len: len,
+            app_data: buf,
+        };
+
+        let decoded: TestAppData = snap.decode_app_data().expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn changing_app_data_changes_crc() {
+        // Same roster snapshot, different app-data bytes → CRC must
+        // differ. This is the property `CrcDivergent` relies on: if
+        // one node's app state drifts from its peers', the CRC
+        // exchange spots it.
+        let entries = dummy_entries();
+        let (len_a, buf_a) = serialize_app_data(&TestAppData { counter: 1, epoch: 0 });
+        let (len_b, buf_b) = serialize_app_data(&TestAppData { counter: 2, epoch: 0 });
+
+        let crc_a = crc_from_snapshot_fields(3, 2, 10, 0, &entries, len_a, &buf_a);
+        let crc_b = crc_from_snapshot_fields(3, 2, 10, 0, &entries, len_b, &buf_b);
+        assert_ne!(crc_a, crc_b, "CRC must be sensitive to app-data content");
+    }
+
+    #[test]
+    fn no_app_data_crc_stable() {
+        // Regression guard: `NoApplicationData` must produce the same
+        // CRC on every node — otherwise the brake use case (which
+        // ships `NoAppState`) would see spurious CRC divergence.
+        let entries = dummy_entries();
+        let (len, buf) = serialize_app_data(&NoApplicationData);
+        let crc1 = crc_from_snapshot_fields(3, 2, 10, 0, &entries, len, &buf);
+        let crc2 = crc_from_snapshot_fields(3, 2, 10, 0, &entries, len, &buf);
+        assert_eq!(crc1, crc2);
+    }
+
+    #[test]
+    fn no_app_data_differs_from_populated_app_data() {
+        // `(0, [0; N])` and `(1, [0, ...])` must not collide — the
+        // length prefix is folded into the CRC alongside the payload
+        // bytes precisely to prevent this. Without hashing the length
+        // itself, a `NoApplicationData` snapshot and a `[0x00]`
+        // one-byte app-data snapshot would have identical CRCs.
+        let entries = dummy_entries();
+        let (len_none, buf_none) = serialize_app_data(&NoApplicationData);
+        // Craft a "1 byte of zero" trailer by hand.
+        let buf_zero = [0u8; MAX_APPLICATION_DATA_SIZE];
+
+        let crc_none = crc_from_snapshot_fields(3, 2, 10, 0, &entries, len_none, &buf_none);
+        let crc_zero = crc_from_snapshot_fields(3, 2, 10, 0, &entries, 1, &buf_zero);
+        assert_ne!(crc_none, crc_zero);
+    }
+
+    #[test]
+    fn frame_scalars_still_affect_crc_with_app_data() {
+        // Guard against a refactor that accidentally routes the whole
+        // CRC through only the app-data buffer. Bumping `current_seq`
+        // must change the CRC regardless of the trailer.
+        let entries = dummy_entries();
+        let (len, buf) = serialize_app_data(&TestAppData { counter: 7, epoch: 7 });
+        let crc_seq0 = crc_from_snapshot_fields(3, 2, 10, 0, &entries, len, &buf);
+        let crc_seq1 = crc_from_snapshot_fields(3, 2, 10, 1, &entries, len, &buf);
+        assert_ne!(crc_seq0, crc_seq1);
+    }
 }

@@ -42,6 +42,7 @@ use swb_fault_tolerance::brake::voter::BrakeVoter;
 use swb_fault_tolerance::framework::config::NodeConfig;
 use swb_fault_tolerance::framework::runner::Runner;
 use swb_fault_tolerance::framework::state::RunState;
+use swb_fault_tolerance::framework::traits::{LatchedInput, NoAppState};
 use swb_fault_tolerance::framework::transport::UdpTransport;
 
 struct CliArgs {
@@ -103,11 +104,16 @@ fn main() -> ExitCode {
     let initial_input = BrakeInput::new(1.0, 0.0, 100.0);
 
     // Create the runner with the initialized components and configuration, and start the main loop of the node.
+    // `LatchedInput` gives the runner the same "hold + return" input behaviour as before —
+    // swap it for a custom `InputSource` impl to drive inputs from hardware, a shared buffer, etc.
+    // `NoAppState` is the zero-cost `ApplicationStateProvider` for use cases that have no
+    // per-node domain state to fold into the system-state CRC / state sync.
     let mut runner = Runner::new(
         state,
         transport,
         computation,
-        initial_input,
+        LatchedInput::new(initial_input),
+        NoAppState,
         sink,
         self_test,
         cfg.timing(),

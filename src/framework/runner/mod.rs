@@ -8,7 +8,9 @@ pub use collect::PhaseOutcome;
 use crate::framework::config::CycleTiming;
 use crate::framework::state::RunState;
 use crate::framework::state_machine::{NodeState, StateEvent};
-use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
+use crate::framework::traits::{
+    ApplicationStateProvider, Computation, DecisionSink, InputSource, SelfTest, Voter,
+};
 use crate::framework::transport::{TransportError, UdpTransport};
 use crate::framework::wire::{FailsafeReason, Payload};
 use serde::Deserialize;
@@ -32,17 +34,20 @@ macro_rules! diag_bool_helper {
     };
 }
 
-pub struct Runner<C, V, S, T>
+pub struct Runner<C, V, S, T, IS, A>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
     T: SelfTest,
+    IS: InputSource<Input = C::Input>,
+    A: ApplicationStateProvider,
 {
     pub(super) state: RunState<V, C::Input>,
     pub(super) transport: UdpTransport<C::Input, V::Payload>,
     pub(super) computation: C,
-    pub(super) input: C::Input,
+    pub(super) input_source: IS,
+    pub(super) app_state: A,
     pub(super) sink: S,
     pub(super) self_test: T,
     pub(super) timing: CycleTiming,
@@ -68,21 +73,46 @@ where
     pub(super) pending_cycle_delay_ms: u32,
     pub(super) peer_failsafe_seen: bool,
     pub(super) pending_failsafe_reason: Option<FailsafeReason>,
+
+    /// Ring buffer of the last N `(from, event, to)` transitions,
+    /// exposed via the diagnostic StatusResponse so external test
+    /// harnesses can assert on exact FSM paths without parsing logs.
+    /// Only compiled under `feature = "diagnostic"`.
+    #[cfg(feature = "diagnostic")]
+    pub(super) recent_transitions:
+        heapless::Deque<(NodeState, StateEvent, NodeState), 32>,
+
+    /// One-shot: when true, the next `handle_read_inputs` skips the
+    /// `record_own_input` call so the next ShareInputs sees `None`
+    /// and takes the `LocalFault` failsafe path. Set via
+    /// `InjectInputProviderFail`, cleared on effect.
+    #[cfg(feature = "diagnostic")]
+    pub(super) inject_input_provider_fail_next: bool,
+
+    /// One-shot: when true, the compute step in `handle_share_inputs`
+    /// returns `Fault` with `LocalFault` instead of calling the real
+    /// `Computation::compute`. Set via `InjectComputationFail`,
+    /// cleared on effect.
+    #[cfg(feature = "diagnostic")]
+    pub(super) inject_computation_fail_next: bool,
 }
 
-impl<C, V, S, T> Runner<C, V, S, T>
+impl<C, V, S, T, IS, A> Runner<C, V, S, T, IS, A>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
     T: SelfTest,
+    IS: InputSource<Input = C::Input>,
+    A: ApplicationStateProvider,
     C::Input: for<'de> Deserialize<'de>,
 {
     pub fn new(
         state: RunState<V, C::Input>,
         transport: UdpTransport<C::Input, V::Payload>,
         computation: C,
-        input: C::Input,
+        input_source: IS,
+        app_state: A,
         sink: S,
         self_test: T,
         timing: CycleTiming,
@@ -106,7 +136,8 @@ where
             state,
             transport,
             computation,
-            input,
+            input_source,
+            app_state,
             sink,
             self_test,
             timing,
@@ -121,6 +152,12 @@ where
             pending_cycle_delay_ms: 0,
             peer_failsafe_seen: false,
             pending_failsafe_reason: None,
+            #[cfg(feature = "diagnostic")]
+            recent_transitions: heapless::Deque::new(),
+            #[cfg(feature = "diagnostic")]
+            inject_input_provider_fail_next: false,
+            #[cfg(feature = "diagnostic")]
+            inject_computation_fail_next: false,
         }
     }
 
@@ -233,7 +270,7 @@ where
     }
 
     pub fn set_input(&mut self, input: C::Input) {
-        self.input = input;
+        self.input_source.set(input);
     }
 
     /// Cycle-global deadline anchor.
@@ -304,6 +341,13 @@ where
 
             let next = current.next(event);
             info!(from = ?current, event = ?event, to = ?next, "transition");
+            #[cfg(feature = "diagnostic")]
+            {
+                if self.recent_transitions.is_full() {
+                    let _ = self.recent_transitions.pop_front();
+                }
+                let _ = self.recent_transitions.push_back((current, event, next));
+            }
             self.state.set_node_state(next);
         }
     }

@@ -1,18 +1,22 @@
 use crate::framework::state::{AckInfo, PeerHealth};
 use crate::framework::state_machine::NodeState;
-use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
+use crate::framework::traits::{
+    ApplicationStateProvider, Computation, DecisionSink, InputSource, SelfTest, Voter,
+};
 use crate::framework::transport::now_monotonic_ns;
 use crate::framework::types::PeerMask;
 use crate::framework::wire::{Payload, UdpFrame};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-impl<C, V, S, T> super::Runner<C, V, S, T>
+impl<C, V, S, T, IS, A> super::Runner<C, V, S, T, IS, A>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
     T: SelfTest,
+    IS: InputSource<Input = C::Input>,
+    A: ApplicationStateProvider,
     C::Input: for<'de> Deserialize<'de>,
 {
     /// Route a validated frame into `RunState`. Drops frames from unknown

@@ -1,16 +1,21 @@
 use crate::framework::diagnostic::{
     Command, Diagnostic, InjectionSnapshot, OutgoingTelegram, PeerStatus, StatusResponse,
+    TransitionRecord,
 };
-use crate::framework::traits::{Computation, DecisionSink, SelfTest, Voter};
+use crate::framework::traits::{
+    ApplicationStateProvider, Computation, DecisionSink, InputSource, SelfTest, Voter,
+};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
-impl<C, V, S, T> super::Runner<C, V, S, T>
+impl<C, V, S, T, IS, A> super::Runner<C, V, S, T, IS, A>
 where
     C: Computation,
     V: Voter<Payload = C::Payload>,
     S: DecisionSink<Decision = V::Decision>,
     T: SelfTest,
+    IS: InputSource<Input = C::Input>,
+    A: ApplicationStateProvider,
     C::Input: for<'de> Deserialize<'de>,
 {
     /// Drain diagnostic telegrams. GetStatus is answered directly; other
@@ -54,6 +59,17 @@ where
 
         diag.apply_pending_injection();
 
+        // One-shot flags picked up from the staging area; the diag
+        // struct only carries the *request* — the actual behaviour
+        // sits on the runner because the injection points are inside
+        // handle_read_inputs and handle_share_inputs.
+        if core::mem::take(&mut diag.pending.inject_input_provider_fail) {
+            self.inject_input_provider_fail_next = true;
+        }
+        if core::mem::take(&mut diag.pending.inject_computation_fail) {
+            self.inject_computation_fail_next = true;
+        }
+
         let (mute_active, delay_ms) = diag.tick_cycle_effects();
         self.mute_active = mute_active;
         self.pending_cycle_delay_ms = delay_ms;
@@ -68,7 +84,7 @@ where
             match serde_json::from_value::<C::Input>(json) {
                 Ok(new_input) => {
                     info!("staged input applied");
-                    self.input = new_input;
+                    self.input_source.set(new_input);
                 }
                 Err(e) => {
                     warn!(error = ?e, "staged input deserialise failed, keeping previous");
@@ -117,6 +133,16 @@ where
             },
             pending_input: diag.pending.has_input(),
             pending_injection_update: diag.pending.has_injection_update(),
+            last_failsafe_reason: self.pending_failsafe_reason.map(|r| r as u8),
+            recent_transitions: self
+                .recent_transitions
+                .iter()
+                .map(|(from, event, to)| TransitionRecord {
+                    from: format!("{:?}", from),
+                    event: format!("{:?}", event),
+                    to: format!("{:?}", to),
+                })
+                .collect(),
         }
     }
 }

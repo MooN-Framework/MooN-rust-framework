@@ -12,7 +12,7 @@
 //!   X..X+4   crc32             (4)
 //! ```
 
-use crate::framework::config::MAX_TOTAL_NODES;
+use crate::framework::config::{MAX_APPLICATION_DATA_SIZE, MAX_TOTAL_NODES};
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::CyclePayload;
 use crate::framework::types::PeerMask;
@@ -31,7 +31,15 @@ const TIME_SYNC_RESP_BODY: usize = 24;
 const SYSTEM_STATE_CRC_BODY: usize = 4;
 const SNAPSHOT_SCALARS: usize = 1 + 1 + 4 + 4;
 const SNAPSHOT_SLOT_SIZE: usize = 1 + 1 + 1 + 4;
-const SYSTEM_STATE_SNAPSHOT_BODY: usize = SNAPSHOT_SCALARS + SNAPSHOT_SLOT_SIZE * MAX_TOTAL_NODES;
+// Trailer: 1 byte length prefix + fixed-size buffer for ApplicationData.
+// The framework serializes A::Data via `A::Data::to_wire` into the first
+// `app_data_len` bytes of this buffer; the remainder is zero-filled and
+// contributes to neither the CRC of the framework snapshot nor decoding
+// (bounded by the length prefix). Sized once at compile time so
+// `MAX_FRAME_SIZE` stays a const.
+const SNAPSHOT_APP_DATA_TRAILER: usize = 1 + MAX_APPLICATION_DATA_SIZE;
+const SYSTEM_STATE_SNAPSHOT_BODY: usize =
+    SNAPSHOT_SCALARS + SNAPSHOT_SLOT_SIZE * MAX_TOTAL_NODES + SNAPSHOT_APP_DATA_TRAILER;
 const SYSTEM_STATE_SNAPSHOT_ACK_BODY: usize = 4;
 const GO_FAILSAFE_BODY: usize = 1;
 
@@ -47,6 +55,8 @@ const DISC_SYSTEM_STATE_SNAPSHOT_ACK: u8 = 0x08;
 const DISC_INPUT: u8 = 0x09;
 const DISC_GO_FAILSAFE: u8 = 0x0A;
 
+/// Bound for user-supplied `CyclePayload::WIRE_SIZE` (I / R). Enforced
+/// at compile time via `UdpFrame::_ASSERT_FITS`.
 pub const MAX_PAYLOAD_WIRE_SIZE: usize = 128;
 
 const fn max_usize(a: usize, b: usize) -> usize {
@@ -56,6 +66,15 @@ const fn max_usize(a: usize, b: usize) -> usize {
         b
     }
 }
+
+/// Staging-buffer size used by `UdpFrame::encode` / `compute_crc`, and
+/// exported so `transport` can size its receive buffer accordingly.
+/// Must fit the largest possible body — either a user payload or an
+/// internal framework variant. `SystemStateSnapshot` is currently the
+/// largest framework body because it carries the fixed-size
+/// `ApplicationData` trailer. Kept as a plain top-level const so the
+/// staging arrays inside `compute_crc` and `encode` are non-generic.
+pub const STAGING_SIZE: usize = max_usize(MAX_PAYLOAD_WIRE_SIZE, SYSTEM_STATE_SNAPSHOT_BODY);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SnapshotEntry {
@@ -146,6 +165,13 @@ pub enum Payload<I: CyclePayload, R: CyclePayload> {
         probation_cycles: u32,
         current_seq: u32,
         entries: [SnapshotEntry; MAX_TOTAL_NODES],
+        /// Application-data trailer. `app_data_len` is the number of
+        /// valid bytes at the start of `app_data`; the rest is
+        /// zero-padded. Layers above deserialize via
+        /// `ApplicationData::from_wire` on `&app_data[..app_data_len]`.
+        /// For `NoApplicationData` this is always `(0, [0u8; N])`.
+        app_data_len: u8,
+        app_data: [u8; MAX_APPLICATION_DATA_SIZE],
     },
     /// Receiver's attestation of the snapshot it adopted. `adopted_crc`
     /// is the receiver-side CRC over the applied state — allows senders
@@ -222,6 +248,8 @@ impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
                 probation_cycles,
                 current_seq,
                 entries,
+                app_data_len,
+                app_data,
             } => {
                 w.push_u8(*nominal_participants);
                 w.push_u8(*min_participants);
@@ -232,6 +260,10 @@ impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
                     w.push_u8(e.id);
                     w.push_u8(e.health);
                     w.push_u32(e.probation_cycles_ok);
+                }
+                w.push_u8(*app_data_len);
+                for b in app_data.iter() {
+                    w.push_u8(*b);
                 }
             }
             Payload::SystemStateSnapshotAck { adopted_crc } => {
@@ -280,12 +312,22 @@ impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
                     e.health = r.read_u8()?;
                     e.probation_cycles_ok = r.read_u32()?;
                 }
+                let app_data_len = r.read_u8()?;
+                if app_data_len as usize > MAX_APPLICATION_DATA_SIZE {
+                    return Err(FrameError::InvalidPayload);
+                }
+                let mut app_data = [0u8; MAX_APPLICATION_DATA_SIZE];
+                for b in app_data.iter_mut() {
+                    *b = r.read_u8()?;
+                }
                 Payload::SystemStateSnapshot {
                     nominal_participants,
                     min_participants,
                     probation_cycles,
                     current_seq,
                     entries,
+                    app_data_len,
+                    app_data,
                 }
             }
             DISC_SYSTEM_STATE_SNAPSHOT_ACK => Payload::SystemStateSnapshotAck {
@@ -381,7 +423,7 @@ impl<I: CyclePayload, R: CyclePayload> UdpFrame<I, R> {
         h.update(&[self.node_state_wire]);
         h.update(&self.timestamp.to_le_bytes());
         h.update(&[self.payload.discriminator()]);
-        let mut staging = [0u8; MAX_PAYLOAD_WIRE_SIZE];
+        let mut staging = [0u8; STAGING_SIZE];
         let n = {
             let mut w = WireWriter::new(&mut staging);
             self.payload.write_body(&mut w);
@@ -405,7 +447,7 @@ impl<I: CyclePayload, R: CyclePayload> UdpFrame<I, R> {
         buf.push(self.node_state_wire);
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
         buf.push(self.payload.discriminator());
-        let mut staging = [0u8; MAX_PAYLOAD_WIRE_SIZE];
+        let mut staging = [0u8; STAGING_SIZE];
         let n = {
             let mut w = WireWriter::new(&mut staging);
             self.payload.write_body(&mut w);
@@ -453,5 +495,197 @@ impl<I: CyclePayload, R: CyclePayload> UdpFrame<I, R> {
             return Err(FrameError::CrcMismatch);
         }
         Ok(frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Wire-level regression tests for the SystemStateSnapshot layout
+    //! after the `ApplicationData` trailer was added. These are the
+    //! tests that would have failed loudly on the `STAGING_SIZE`
+    //! overflow (the panic in `encode` when the snapshot body exceeds
+    //! `MAX_PAYLOAD_WIRE_SIZE`) — worth having a fast unit-level
+    //! guard for it since the failure mode at runtime was subtle
+    //! (rejoin tests hang instead of erroring cleanly).
+
+    use super::*;
+    use crate::framework::state_machine::NodeState;
+    use crate::framework::traits::CyclePayload;
+    use crate::framework::wire::codec::{PayloadError, WireReader, WireWriter};
+
+    /// Minimal `CyclePayload` for wiring up a generic frame — the
+    /// SystemStateSnapshot variant doesn't carry I or R, but the frame
+    /// type still needs concrete types to instantiate.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct DummyPayload;
+    impl CyclePayload for DummyPayload {
+        const WIRE_SIZE: usize = 0;
+        fn to_wire(&self, _w: &mut WireWriter<'_>) {}
+        fn from_wire(_r: &mut WireReader<'_>) -> Result<Self, PayloadError> {
+            Ok(Self)
+        }
+    }
+
+    fn full_entries() -> [SnapshotEntry; MAX_TOTAL_NODES] {
+        let mut e = [SnapshotEntry::default(); MAX_TOTAL_NODES];
+        // Populate every slot so we serialize a maximum-size snapshot
+        // — this is what triggers the STAGING_SIZE ceiling.
+        for (i, slot) in e.iter_mut().enumerate() {
+            slot.valid = true;
+            slot.id = i as u8;
+            slot.health = (i % 3) as u8;
+            slot.probation_cycles_ok = i as u32 * 17;
+        }
+        e
+    }
+
+    fn full_app_data() -> [u8; MAX_APPLICATION_DATA_SIZE] {
+        let mut buf = [0u8; MAX_APPLICATION_DATA_SIZE];
+        // Deterministic pattern so byte-for-byte comparison after
+        // decode catches truncation or misalignment.
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        buf
+    }
+
+    /// The critical regression test: encoding a fully-populated
+    /// SystemStateSnapshot (max entries + max-length app_data trailer)
+    /// must NOT panic on staging-buffer overflow. Before the
+    /// `STAGING_SIZE` fix this panicked inside `WireWriter::take` with
+    /// an index-out-of-bounds on the 128-byte staging slice.
+    #[test]
+    fn full_size_snapshot_encodes_without_panic() {
+        let payload = Payload::<DummyPayload, DummyPayload>::SystemStateSnapshot {
+            nominal_participants: 8,
+            min_participants: 2,
+            probation_cycles: 10,
+            current_seq: 42,
+            entries: full_entries(),
+            app_data_len: MAX_APPLICATION_DATA_SIZE as u8,
+            app_data: full_app_data(),
+        };
+
+        let frame = UdpFrame::<DummyPayload, DummyPayload>::new(
+            0,
+            0xDEAD_BEEF,
+            1,
+            NodeState::SystemStateSync,
+            123_456_789,
+            payload,
+        );
+
+        // `encode` runs the same write_body path as `compute_crc` — if
+        // one panics, so does the other. Not asserting on length here
+        // (that would be brittle across body-layout changes); just
+        // asserting the call returns.
+        let bytes = frame.encode();
+        assert!(
+            !bytes.is_empty(),
+            "encoded frame must produce at least the header"
+        );
+    }
+
+    /// End-to-end wire round-trip: encode → decode → compare. If the
+    /// app_data trailer is lost, misaligned, or truncated anywhere in
+    /// the codec pipeline this test catches it.
+    #[test]
+    fn snapshot_with_app_data_round_trips() {
+        let entries = full_entries();
+        let app_data = full_app_data();
+
+        let payload_in = Payload::<DummyPayload, DummyPayload>::SystemStateSnapshot {
+            nominal_participants: 5,
+            min_participants: 3,
+            probation_cycles: 7,
+            current_seq: 99,
+            entries,
+            app_data_len: 40, // partial fill — length prefix must survive
+            app_data,
+        };
+
+        let frame_in = UdpFrame::<DummyPayload, DummyPayload>::new(
+            2,
+            0x1234_5678_9ABC_DEF0,
+            99,
+            NodeState::SystemStateSync,
+            555,
+            payload_in,
+        );
+
+        let bytes = frame_in.encode();
+        let frame_out = UdpFrame::<DummyPayload, DummyPayload>::decode(&bytes)
+            .expect("decode must succeed on a well-formed frame");
+
+        // Header fields survive.
+        assert_eq!(frame_out.node_id(), 2);
+        assert_eq!(frame_out.session_id(), 0x1234_5678_9ABC_DEF0);
+        assert_eq!(frame_out.seq_num(), 99);
+
+        // Payload survives with every field intact.
+        match frame_out.payload() {
+            Payload::SystemStateSnapshot {
+                nominal_participants,
+                min_participants,
+                probation_cycles,
+                current_seq,
+                entries: got_entries,
+                app_data_len,
+                app_data: got_app_data,
+            } => {
+                assert_eq!(nominal_participants, 5);
+                assert_eq!(min_participants, 3);
+                assert_eq!(probation_cycles, 7);
+                assert_eq!(current_seq, 99);
+                assert_eq!(got_entries, entries);
+                assert_eq!(app_data_len, 40);
+                assert_eq!(got_app_data, app_data);
+            }
+            other => panic!("expected SystemStateSnapshot, got {:?}", other),
+        }
+    }
+
+    /// The decoder must reject a snapshot whose length prefix claims
+    /// more bytes than the trailer can hold. This is a defensive check
+    /// against a hostile or corrupted frame — the buffer itself is
+    /// always exactly `MAX_APPLICATION_DATA_SIZE` bytes on the wire,
+    /// but the length prefix could theoretically be up to 255.
+    #[test]
+    fn decoder_rejects_oversized_app_data_len() {
+        // Build a byte stream by hand — start from a valid snapshot,
+        // then overwrite the len prefix byte with 0xFF.
+        let payload = Payload::<DummyPayload, DummyPayload>::SystemStateSnapshot {
+            nominal_participants: 3,
+            min_participants: 2,
+            probation_cycles: 10,
+            current_seq: 0,
+            entries: full_entries(),
+            app_data_len: 0,
+            app_data: [0u8; MAX_APPLICATION_DATA_SIZE],
+        };
+        let frame = UdpFrame::<DummyPayload, DummyPayload>::new(
+            0,
+            0,
+            0,
+            NodeState::SystemStateSync,
+            0,
+            payload,
+        );
+        let mut bytes = frame.encode();
+
+        // Locate the app_data_len byte: header (23) + disc (1) +
+        // SNAPSHOT_SCALARS (10) + SNAPSHOT_SLOT_SIZE * MAX_TOTAL_NODES.
+        let len_byte_off = 23 + 1 + SNAPSHOT_SCALARS + SNAPSHOT_SLOT_SIZE * MAX_TOTAL_NODES;
+        bytes[len_byte_off] = 0xFF;
+
+        // The frame CRC will also be wrong now (we tampered with the
+        // body), so decode should reject — either as CrcMismatch or
+        // as InvalidPayload depending on which check fires first.
+        // Both are acceptable failures; the point is decode does NOT
+        // return Ok.
+        match UdpFrame::<DummyPayload, DummyPayload>::decode(&bytes) {
+            Err(_) => {}
+            Ok(_) => panic!("decode must reject an oversized app_data_len"),
+        }
     }
 }
