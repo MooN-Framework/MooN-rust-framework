@@ -1,12 +1,28 @@
 [package]
 name = "swb_fault_tolerance"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-if-addrs = "0.7"
-crc32fast = "1.5.0"
-simple_logger = "5.1.0"
-log = "0.4.29"
+if-addrs = "0.13"
+crc32fast = "1.5"
+socket2 = { version = "0.5", features = ["all"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0"
+sha2 = "0.10"
+heapless = "0.8"
+toml = "0.8"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "node"
+path = "src/bin/node.rs"
+
+[features]
+default = []
+diagnostic = []

@@ -1,0 +1,85 @@
+|========================|
+|  TO-DO Diagnosetool    |
+|========================|
+
+
+- Logs einsehen von tests etc. machbar machen.
+- Config-Generator mit Signatur prüfung [x]
+- Testframework mergen mit diag tool [x]
+- Im inject tab sind targets und command nebeneinander aber nicht even geleveled. [x]
+- Test output sollte farben enthalten green für passed z.B. [x]
+- Im status tab können die sequenz nummern noch nicht stimmen, außerdem ein node nach 10 sekunden ohne signal ist lost [x]
+- Farb fehler beim letzten knoten der joint, entweder rot oder grau [x]
+- Bei registry leerung verlieren knoten ihre farbe.. [x]
+
+|==========================|
+|  TO-DO test framework    |
+|==========================|
+- ausfall von probation node im resynchrosnierenten betrieb => isolation => 2 nodes laufen weiter []
+=========
+- ausfall von nicht probation node während node probaten hat => failsafe [x]
+- Langzeit test [x]
+- Sequentieller ausfall 2oo4 [x]
+- Doppelter ausfall 2oo4 [x]
+- Testen ob bei 2 vs 2 verschiedene Ergebnisse in 2oo4 zu failsafe führen.[x]
+- Sink testen ob bei eingabe zwangsbremse gezogen wird. [x]
+
+|================|
+|  TO-DO RUST    |
+|================|
+- Signaturen für konfigfiles einführen.
+- Ausfall von probation node sorgt für total ausfall sollte nicht sein.
+- Dokumentation + Refactoring => Document rest of framework.
+- Clippy warnings nochmal fixen.
+
+
+|================|
+|Voter Impl  	 |
+|================|
+- Anzahl übereinstimmender Ergebnisse darf niemals gleichstand haben! (z.B. bei 2-oo-4 darf niemals 2 vs 2 gleiche haben) => zählen der vorkommen verschiedener Ergebnisse und wenn keine mehrheit => Failsafe!
+
+|================|
+|SW-Ausfälle	 |
+|================|
+- Node sendet Nachricht ohne zu empfangen (Geht in Failsafe, weil anderen Nodes nicht antworten => Sicherer Systemzustand)
+- Node empfängt Nachrichten ohne zu senden (Wird ausgeschlossen, von den anderen Nodes durch seperate Message?)
+- Node rechnet falsche Ergebnis / Verfälschtes Ergebnis durch bitflip (Voting setzt Suspect erst auf Suspect und dann Isolation)
+- Node wählt falschen Voter (Voting setzt Suspect erst auf Suspect und dann Isolation)
+
+- 1 Node fällt silent  => System rekonfiguriert und läuft weiter
+- Mehrheit fällt silent => Failsafe durch letzten alive Node
+- Node in probation fällt aus => System läuft weiter
+- Healthy node fällt in probation vom anderen node aus => System unterschreitet gesunde Größe => Failsafe
+
+|================|
+|Done	 		 |
+|================|
+- Konfigurationsmanagement + Refactoring [X]
+- Fehlermanagement (Suspect) Synchronisierung von Fehlerzustandswechsel [X]
+- Resynchronisierung von Knoten [X]
+- Probation von Resynchroniserten Knoten für konfigurierbare zyklen zeit [X]
+- CRC-Systemstate Vergleich der Knoten [X]
+- SendSystemstate nach Reynchonisierung von LostNode [x]
+- SelfTest umfunktionieren zu trait [X]
+- InputDaten sharen und vergleichen [X]
+- Off-By-One-State-Problem bei Ausfall Lösen? (Phase-Drift) => rendevouz in error management [x]
+- diagnose schnittstelle erweitern [x]
+- ResyncLostPeer timeouts in Config einarbeiten [x]
+- Docs for brake implementation and main [x]
+- Unterscheidung zwischen Isolation und Failsafe nachlegen [x]
+- Tatsächliche Notbremse im Fall vom Reißen des Bremsweges => publish anpassen. [x]
+- Failsafe Signal um die anderen Knoten zum failsafe zu bringen [x]
+- automatische Testfälle [x]
+- Compile feature guards für diagnose schnittstelle [x]
+
+|================|
+|Fehlermanagement|
+|================|
+- Jeder darf Suspect/Isolation proposen
+- Es erfordert explizite Zustimmung
+- Weiterlaufen vs Failsafe (Noch zu bestimmen) bei uneinigkeit
+- Wird immer im ErrorManagement umgesetzt
+- Maybe send to Isolation mit ACK, das die nodes bestätigen können der Node ist weg sonst failsafe.
+
+[Wenn Zeit]
+- Sync crossvalidation der offsets
