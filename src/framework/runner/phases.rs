@@ -1,6 +1,6 @@
 use super::PhaseOutcome;
 use crate::framework::config::{MAX_PEERS, MAX_TOTAL_NODES};
-use crate::framework::peer_sync::{extract_sync_fields, PeerSync, SyncFields, SAMPLES_PER_PEER};
+use crate::framework::clock_sync::{extract_sync_fields, ClockSync, SyncFields, SAMPLES_PER_PEER};
 use crate::framework::state::{
     crc_from_snapshot_fields, serialize_app_data, PeerHealth, StoredSnapshot,
 };
@@ -260,9 +260,9 @@ where
         }
     }
 
-    /// PeerSync: run Cristian rounds with each non-Lost peer until every
+    /// ClockSync: run Cristian rounds with each non-Lost peer until every
     /// peer has enough samples or the window elapses.
-    pub(super) fn handle_peer_sync(&mut self) -> StateEvent {
+    pub(super) fn handle_clock_sync(&mut self) -> StateEvent {
         if self.state.sync_valid() {
             self.state.invalidate_sync();
         }
@@ -275,7 +275,7 @@ where
             .map(|p| p.id)
             .collect();
         if peer_ids.is_empty() {
-            error!("peer sync entered without active peers");
+            error!("clock sync entered without active peers");
             return StateEvent::Fault;
         }
 
@@ -287,38 +287,57 @@ where
         // packet loss on multicast. Clamped to a floor of 50 ms so
         // very tight configs don't false-positive.
         let unreachable_threshold =
-            self.timing.peer_sync_timeout / 10;
+            self.timing.clock_sync_timeout / 10;
         let unreachable_threshold = unreachable_threshold.max(Duration::from_millis(50));
         let unreachable_threshold_ns = unreachable_threshold.as_nanos() as u64;
 
         let phase_start_ns = crate::framework::transport::now_monotonic_ns();
-        let mut peer_sync = PeerSync::new(&peer_ids, phase_start_ns);
+        let mut clock_sync = ClockSync::new(&peer_ids, phase_start_ns);
         let node_state = self.state.node_state();
-        let deadline = Instant::now() + self.timing.peer_sync_timeout;
+        let deadline = Instant::now() + self.timing.clock_sync_timeout;
         let mut next_request = Instant::now();
 
         loop {
             // Cheap to call every iteration — it's a linear scan of
             // at most MAX_PEERS entries with a saturating subtract.
-            peer_sync.mark_unreachable_if_stale(
+            clock_sync.mark_unreachable_if_stale(
                 crate::framework::transport::now_monotonic_ns(),
                 unreachable_threshold_ns,
             );
 
-            if peer_sync.is_complete() {
-                let clocks = peer_sync.finalize();
-                let epsilon = peer_sync.max_error_bound().unwrap_or(0);
-                let unreachable = peer_sync.unreachable_peers();
+            if clock_sync.is_complete() {
+                let clocks = clock_sync.finalize();
+                let epsilon = clock_sync.max_error_bound().unwrap_or(0);
+                let unreachable = clock_sync.unreachable_peers();
                 if !unreachable.is_empty() {
                     warn!(
                         unreachable = ?unreachable.as_slice(),
-                        "peer sync complete with unreachable peers — they'll be dropped by the normal missed-frame path next cycle"
+                        "clock sync complete with unreachable peers — they'll be dropped by the normal missed-frame path next cycle"
                     );
                 }
                 info!(
                     epsilon_ns = epsilon,
                     count = clocks.len(),
-                    "peer sync complete"
+                    "clock sync complete"
+                );
+                // Diagnostic view of the actual clock offsets. Split out
+                // from the completion `info!` because these are the
+                // numbers you look at when investigating drift: the
+                // group median (what we'd correct our local clock by
+                // to follow the fabric) plus each peer's individual
+                // offset relative to us. Logged at warn so it stands
+                // out in a log dominated by info-level cycle chatter,
+                // even though a healthy sync is not itself a problem.
+                let median_offset_ns = clock_sync.convergence_correction().unwrap_or(0);
+                let per_peer_offsets_ns: Vec<(u8, i64)> = clocks
+                    .iter()
+                    .map(|c| (c.peer_id, c.offset_ns))
+                    .collect();
+                warn!(
+                    median_offset_ns,
+                    epsilon_ns = epsilon,
+                    per_peer_offsets_ns = ?per_peer_offsets_ns.as_slice(),
+                    "clock divergence snapshot"
                 );
                 self.state.set_peer_clocks(&clocks);
                 self.state.set_sync_epsilon(epsilon);
@@ -327,28 +346,28 @@ where
                 self.next_cycle_deadline = None;
                 self.last_cycle_start = None;
                 self.state.start_new_cycle(self.next_cycle_tick());
-                return StateEvent::PeerSyncOk;
+                return StateEvent::ClockSyncOk;
             }
 
             if Instant::now() > deadline {
                 warn!(
-                    found = peer_sync.finalize().len(),
+                    found = clock_sync.finalize().len(),
                     total = peer_ids.len(),
                     target = SAMPLES_PER_PEER,
-                    unreachable = ?peer_sync.unreachable_peers().as_slice(),
-                    "peer sync deadline exceeded"
+                    unreachable = ?clock_sync.unreachable_peers().as_slice(),
+                    "clock sync deadline exceeded"
                 );
-                return StateEvent::PeerSyncTimeout;
+                return StateEvent::ClockSyncTimeout;
             }
 
             if Instant::now() >= next_request {
-                let any_needs_sync = peer_ids.iter().any(|&id| !peer_sync.has_pending(id));
+                let any_needs_sync = peer_ids.iter().any(|&id| !clock_sync.has_pending(id));
                 if any_needs_sync {
                     match self.transport.send_time_sync_req(node_state) {
                         Ok((_seq, t1)) => {
                             for &peer_id in &peer_ids {
-                                if !peer_sync.has_pending(peer_id) {
-                                    peer_sync.record_outgoing_request(peer_id, t1);
+                                if !clock_sync.has_pending(peer_id) {
+                                    clock_sync.record_outgoing_request(peer_id, t1);
                                 }
                             }
                             next_request = Instant::now() + self.timing.send_interval;
@@ -381,7 +400,7 @@ where
                         t3,
                         t4_local,
                     }) => {
-                        peer_sync.on_response(peer_id, t1, t2, t3, t4_local);
+                        clock_sync.on_response(peer_id, t1, t2, t3, t4_local);
                     }
                     None => {}
                 }
@@ -688,9 +707,22 @@ where
             }
         }
 
-        let input = self.input_source.read();
-        self.state.record_own_input(input);
-        StateEvent::InputsRead
+        match self.input_source.read() {
+            Ok(input) => {
+                self.state.record_own_input(input);
+                StateEvent::InputsRead
+            }
+            Err(e) => {
+                // Domain-level sensor failure. The trait contract routes
+                // this to Failsafe by design — the sink's `on_failsafe`
+                // hook will drive the actuator into its safe state.
+                // Impls that want softer semantics (last-known-good on
+                // transient miss) have to return `Ok(...)` themselves;
+                // we never guess.
+                error!(error = ?e, "input source read failed, going to Failsafe");
+                StateEvent::InputSourceFailed
+            }
+        }
     }
 
     /// ShareInputs: broadcast our sensor input until every non-Lost peer's

@@ -84,7 +84,7 @@ pub struct CycleTiming {
 
     // Non-cycle phase timeouts (relative to phase entry).
     pub init_sync_timeout: Duration,
-    pub peer_sync_timeout: Duration,
+    pub clock_sync_timeout: Duration,
     pub cycle_sync_timeout: Duration,
     pub error_mgmt_timeout: Duration,
     pub state_sync_timeout: Duration,
@@ -125,7 +125,7 @@ impl CycleTiming {
         let all_timeouts = [
             self.cycle_sync_timeout,
             self.error_mgmt_timeout,
-            self.peer_sync_timeout,
+            self.clock_sync_timeout,
             self.state_sync_timeout,
             self.init_sync_timeout,
             self.resync_returning_timeout,
@@ -197,7 +197,7 @@ pub struct TimingSection {
     pub crc_offset_ms: u64,
 
     pub init_sync_timeout_ms: u64,
-    pub peer_sync_timeout_ms: u64,
+    pub clock_sync_timeout_ms: u64,
     pub cycle_sync_timeout_ms: u64,
     pub error_mgmt_timeout_ms: u64,
     pub state_sync_timeout_ms: u64,
@@ -290,7 +290,7 @@ impl NodeConfig {
             crc_offset: ms(t.crc_offset_ms),
 
             init_sync_timeout: ms(t.init_sync_timeout_ms),
-            peer_sync_timeout: ms(t.peer_sync_timeout_ms),
+            clock_sync_timeout: ms(t.clock_sync_timeout_ms),
             cycle_sync_timeout: ms(t.cycle_sync_timeout_ms),
             error_mgmt_timeout: ms(t.error_mgmt_timeout_ms),
             state_sync_timeout: ms(t.state_sync_timeout_ms),

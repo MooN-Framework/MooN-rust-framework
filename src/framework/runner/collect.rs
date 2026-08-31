@@ -1,4 +1,4 @@
-use crate::framework::peer_sync::{extract_sync_fields, SyncFields};
+use crate::framework::clock_sync::{extract_sync_fields, SyncFields};
 use crate::framework::state::PeerHealth;
 use crate::framework::traits::{
     ApplicationStateProvider, Computation, DecisionSink, InputSource, SelfTest, Voter,

@@ -22,7 +22,7 @@ pub enum NodeState {
     PublishResult = 0x07,
     ErrorManagement = 0x08,
     Isolation = 0x09,
-    PeerSync = 0x0A,
+    ClockSync = 0x0A,
     ResyncLostPeer = 0x0B,
     SystemStateCrcExchange = 0x0C,
     SystemStateSync = 0x0D,
@@ -36,8 +36,8 @@ pub enum StateEvent {
     SelfTestErr,
     InitialSyncOk,
     InitialSyncTimeout,
-    PeerSyncOk,
-    PeerSyncTimeout,
+    ClockSyncOk,
+    ClockSyncTimeout,
     CycleSyncOk,
     CycleSyncTimeout,
     InputsRead,
@@ -75,6 +75,11 @@ pub enum StateEvent {
     TooFewNodes,
     Fault,
     SelfExcluded,
+    /// `InputSource::read` returned `Err`. The runner routes this to
+    /// Failsafe so the sink drives the actuator into its safe state —
+    /// domains that want softer semantics for transient sensor faults
+    /// must return `Ok(last_known)` from their `read` impl instead.
+    InputSourceFailed,
     /// A healthy peer's frame carried a `node_state` of `ErrorManagement`
     /// while we were still in an earlier in-cycle phase. Rendezvous rule:
     /// follow the peer forward so both healthy nodes reach the exclusion
@@ -94,17 +99,18 @@ impl NodeState {
             (Startup, SelfTestOk) => InitSync,
             (Startup, SelfTestErr) => Failsafe,
 
-            (InitSync, InitialSyncOk) => PeerSync,
+            (InitSync, InitialSyncOk) => ClockSync,
             (InitSync, GoResyncLostPeer) => ResyncLostPeer,
             (InitSync, InitialSyncTimeout) => Failsafe,
 
-            (PeerSync, PeerSyncOk) => ReadInputs,
-            (PeerSync, PeerSyncTimeout) => Failsafe,
+            (ClockSync, ClockSyncOk) => ReadInputs,
+            (ClockSync, ClockSyncTimeout) => Failsafe,
 
             (CycleSync, CycleSyncOk) => ReadInputs,
             (CycleSync, CycleSyncTimeout) => ErrorManagement,
 
             (ReadInputs, InputsRead) => ShareInputs,
+            (ReadInputs, InputSourceFailed) => Failsafe,
 
             (ShareInputs, InputsShared) => ShareResult,
             (ShareInputs, ShareInputsTimeout) => ErrorManagement,
@@ -126,7 +132,7 @@ impl NodeState {
             (SystemStateCrcExchange,  SelfExcluded) => Isolation,
 
             (PublishResult, ResultPublished) => CycleSync,
-            (PublishResult, ResyncDue) => PeerSync,
+            (PublishResult, ResyncDue) => ClockSync,
             (PublishResult, GoResyncLostPeer) => ResyncLostPeer,
             (PublishResult, DissenterDetected) => ErrorManagement,
             (PublishResult, StateDiverged) => Failsafe,
@@ -135,9 +141,17 @@ impl NodeState {
             (ResyncLostPeer, ResyncLostPeerTimeout) => ErrorManagement,
             (ResyncLostPeer, ResyncLostPeerOk) => SystemStateSync,
 
-            (SystemStateSync, SystemStateSyncOk) => PeerSync,
-            (SystemStateSync, SystemStateSyncTimeout) => Isolation,
-            (SystemStateSync, SystemStateSyncMinority) => Isolation,
+            (SystemStateSync, SystemStateSyncOk) => ClockSync,
+            // SystemStateSync failures go to Failsafe rather than
+            // Isolation: Isolation is a silent state that stops
+            // broadcast but never triggers the sink's emergency-brake
+            // hook, which is dangerous in a safety context. If a
+            // rejoin fails — whether because peers are unreachable
+            // (Timeout) or because our own snapshot disagreed with
+            // the majority (Minority) — we can't safely keep running,
+            // so we go hard-stop instead of quietly parking.
+            (SystemStateSync, SystemStateSyncTimeout) => Failsafe,
+            (SystemStateSync, SystemStateSyncMinority) => Failsafe,
 
             (ErrorManagement, StateOk) => CycleSync,
             (ErrorManagement, StateDiverged) => Failsafe,
@@ -171,7 +185,7 @@ impl NodeState {
             0x07 => PublishResult,
             0x08 => ErrorManagement,
             0x09 => Isolation,
-            0x0A => PeerSync,
+            0x0A => ClockSync,
             0x0B => ResyncLostPeer,
             0x0C => SystemStateCrcExchange,
             0x0D => SystemStateSync,

@@ -137,14 +137,27 @@ pub trait SelfTest {
 /// value — the runner treats the returned value as the cycle's input
 /// and forwards it to `Computation::compute` after `inputs_agree`.
 ///
+/// `read` is fallible so a broken sensor path never gets silently
+/// papered over. Any `Err` routes the cycle through the state
+/// machine's `InputSourceFailed` transition, which lands in Failsafe
+/// — the sink's `on_failsafe` fires so the actuator gets driven into
+/// its safe state. Domains that want softer semantics (e.g. re-use the
+/// last-known-good value on a transient miss) must express that
+/// explicitly inside their `read` impl by returning `Ok(last_known)`.
+/// The framework never guesses.
+///
 /// `set` is a hook for external overrides (diagnostic input injection,
-/// externally-driven simulations). Impls without an external-push story
-/// can leave the default no-op.
+/// externally-driven simulations). Infallible on purpose — a diagnostic
+/// push either lands or it doesn't, there's no domain-level failure
+/// mode to propagate. Default is a no-op; impls that only pull from
+/// hardware can ignore it.
 pub trait InputSource {
     type Input: CyclePayload;
+    type Error: fmt::Debug;
 
-    /// Fetch the current sensor value for this cycle.
-    fn read(&mut self) -> Self::Input;
+    /// Fetch the current sensor value for this cycle. `Err` triggers
+    /// Failsafe on this node.
+    fn read(&mut self) -> Result<Self::Input, Self::Error>;
 
     /// Override the current input from outside (diagnostic staged
     /// input, external push). Default is a no-op — impls that only
@@ -154,7 +167,9 @@ pub trait InputSource {
 
 /// Trivial `InputSource` that just latches a value and returns it every
 /// cycle. Matches the original runner behaviour where a single
-/// `C::Input` field was polled each cycle.
+/// `C::Input` field was polled each cycle. Infallible: a purely
+/// in-memory latch has no way to fail, so `Error = Infallible` and
+/// `read` always returns `Ok`.
 #[derive(Debug, Clone, Copy)]
 pub struct LatchedInput<T: CyclePayload> {
     current: T,
@@ -172,9 +187,10 @@ impl<T: CyclePayload> LatchedInput<T> {
 
 impl<T: CyclePayload> InputSource for LatchedInput<T> {
     type Input = T;
+    type Error = core::convert::Infallible;
 
-    fn read(&mut self) -> T {
-        self.current
+    fn read(&mut self) -> Result<T, Self::Error> {
+        Ok(self.current)
     }
 
     fn set(&mut self, input: T) {
@@ -246,4 +262,93 @@ impl ApplicationStateProvider for NoAppState {
     }
 
     fn apply(&mut self, _data: &NoApplicationData) {}
+}
+
+#[cfg(test)]
+mod input_source_tests {
+    //! Tests for the fallible `InputSource` contract. Covers:
+    //! - `LatchedInput` (infallible impl) never returns Err.
+    //! - A failing `InputSource` produces `Err` on read that the
+    //!   caller (runner) can match on.
+    //! - The state machine has the `(ReadInputs, InputSourceFailed)
+    //!   => Failsafe` transition wired up.
+    use super::*;
+    use crate::framework::state_machine::{NodeState, StateEvent};
+    use crate::framework::wire::{PayloadError, WireReader, WireWriter};
+
+    /// Minimal CyclePayload for isolating InputSource behaviour from
+    /// the domain types. One u32 field so the wire round-trip is
+    /// non-trivial but doesn't pull in the whole brake module.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct DummyInput(u32);
+
+    impl CyclePayload for DummyInput {
+        const WIRE_SIZE: usize = 4;
+
+        fn to_wire(&self, w: &mut WireWriter<'_>) {
+            w.push_u32(self.0);
+        }
+
+        fn from_wire(r: &mut WireReader<'_>) -> Result<Self, PayloadError> {
+            Ok(Self(r.read_u32()?))
+        }
+    }
+
+    /// Impl that always fails — models a permanently dead sensor.
+    struct AlwaysFailInput;
+
+    #[derive(Debug)]
+    struct SensorGone;
+
+    impl InputSource for AlwaysFailInput {
+        type Input = DummyInput;
+        type Error = SensorGone;
+
+        fn read(&mut self) -> Result<DummyInput, SensorGone> {
+            Err(SensorGone)
+        }
+    }
+
+    #[test]
+    fn latched_input_never_errs() {
+        let mut src = LatchedInput::new(DummyInput(42));
+        // Ok is guaranteed at the type level via Infallible, but a
+        // runtime check reads well and documents the contract.
+        assert_eq!(src.read().expect("infallible"), DummyInput(42));
+        // set() overrides — the next read returns the new value.
+        src.set(DummyInput(99));
+        assert_eq!(src.read().expect("infallible"), DummyInput(99));
+    }
+
+    #[test]
+    fn always_fail_input_returns_err() {
+        // The runner match arm in handle_read_inputs pattern-matches
+        // this Err and produces StateEvent::InputSourceFailed. Here
+        // we just verify the trait side: the Err surfaces.
+        let mut src = AlwaysFailInput;
+        assert!(src.read().is_err());
+    }
+
+    #[test]
+    fn read_inputs_transitions_to_failsafe_on_source_error() {
+        // The critical safety guarantee: the state machine must route
+        // InputSourceFailed to Failsafe. Verified against the actual
+        // transition table so a future refactor can't quietly redirect
+        // this event somewhere softer (e.g. Isolation).
+        assert_eq!(
+            NodeState::ReadInputs.next(StateEvent::InputSourceFailed),
+            NodeState::Failsafe,
+        );
+    }
+
+    #[test]
+    fn read_inputs_transitions_to_share_inputs_on_ok() {
+        // Companion regression guard for the happy path — ensures
+        // we didn't accidentally break the normal flow while wiring
+        // up the error path.
+        assert_eq!(
+            NodeState::ReadInputs.next(StateEvent::InputsRead),
+            NodeState::ShareInputs,
+        );
+    }
 }

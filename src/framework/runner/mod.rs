@@ -309,7 +309,7 @@ where
             let mut event = match current {
                 NodeState::Startup => self.handle_startup(),
                 NodeState::InitSync => self.handle_init_sync(),
-                NodeState::PeerSync => self.handle_peer_sync(),
+                NodeState::ClockSync => self.handle_clock_sync(),
                 NodeState::CycleSync => self.handle_cycle_sync(),
                 NodeState::ReadInputs => self.handle_read_inputs(),
                 NodeState::ShareInputs => self.handle_share_inputs(),

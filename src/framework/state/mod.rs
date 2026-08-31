@@ -6,7 +6,7 @@ mod voting;
 use crate::framework::config::{
     ParticipantConfig, MAX_APPLICATION_DATA_SIZE, MAX_PEERS, MAX_TOTAL_NODES,
 };
-use crate::framework::peer_sync::PeerClock;
+use crate::framework::clock_sync::PeerClock;
 use crate::framework::state_machine::{NodeState, SystemState};
 use crate::framework::traits::{ApplicationData, CyclePayload, Voter, VotingOutcome};
 use crate::framework::types::PeerMask;

@@ -110,7 +110,7 @@ where
                 debug!(peer_id, "state frame outside CycleSync, dropped");
             }
             Payload::TimeSyncReq { .. } | Payload::TimeSyncResp { .. } => {
-                debug!(peer_id, "sync frame outside PeerSync, dropped");
+                debug!(peer_id, "sync frame outside ClockSync, dropped");
             }
             Payload::SystemStateCrc { .. } => {
                 debug!(
