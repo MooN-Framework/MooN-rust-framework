@@ -103,7 +103,7 @@ impl NodeState {
             (InitSync, GoResyncLostPeer) => ResyncLostPeer,
             (InitSync, InitialSyncTimeout) => Failsafe,
 
-            (ClockSync, ClockSyncOk) => ReadInputs,
+            (ClockSync, ClockSyncOk) => CycleSync,
             (ClockSync, ClockSyncTimeout) => Failsafe,
 
             (CycleSync, CycleSyncOk) => ReadInputs,
