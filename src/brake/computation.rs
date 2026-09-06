@@ -5,7 +5,31 @@
 //! while also providing a mechanism to check if two inputs agree within specified tolerances.
 
 use crate::brake::braking_curve::{compute_braking_curve, BrakeError, BrakeInput, BrakeResult};
+use crate::framework::config::MAX_TOTAL_NODES;
 use crate::framework::traits::Computation;
+use heapless::Vec;
+
+/// Median of `values`, with the arithmetic mean of the two middle
+/// elements on an even count. Sorting uses `f64::total_cmp` so the
+/// order is total and the call cannot panic on a NaN. A NaN sorts to
+/// the end and can only reach the median if it is one of the middle
+/// elements, in which case the result stays NaN and
+/// `compute_braking_curve` rejects it with `BrakeError::NotFinite`,
+/// i.e. the cycle fails safe instead of producing a curve from a
+/// poisoned value.
+///
+/// Deterministic across nodes: the result depends only on the multiset
+/// of values, not on the order they were collected in, and `(a + b) /
+/// 2.0` is exactly reproducible in IEEE 754.
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_unstable_by(|a, b| a.total_cmp(b));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        (values[mid - 1] + values[mid]) / 2.0
+    }
+}
 
 /// Per-field tolerance on the ShareInputs divergence gate. Two peers'
 /// inputs are considered to represent the same physical measurement iff
@@ -58,5 +82,102 @@ impl Computation for BrakeComputation {
 
     fn inputs_agree(&self, own: &BrakeInput, peer: &BrakeInput) -> bool {
         self.tolerance.matches(own, peer)
+    }
+
+    /// Median over `current_speed` of the own input and every peer
+    /// input that passed the tolerance gate.
+    ///
+    /// Only `current_speed` is a sensor reading. `target_speed` and
+    /// `available_distance` come from the movement authority and are
+    /// identical on every node by construction, so they are taken from
+    /// the own input unchanged. If that assumption ever stops holding
+    /// (different nodes deriving them independently), they have to be
+    /// consolidated the same way, otherwise every node computes on its
+    /// own variant and the divergence only shows up one phase later in
+    /// ShareResult.
+    fn consolidate(&self, own: &BrakeInput, peers: &[BrakeInput]) -> BrakeInput {
+        let mut speeds: Vec<f64, MAX_TOTAL_NODES> = Vec::new();
+        let _ = speeds.push(own.current_speed);
+        for peer in peers {
+            let _ = speeds.push(peer.current_speed);
+        }
+
+        BrakeInput {
+            current_speed: median(&mut speeds),
+            target_speed: own.target_speed,
+            available_distance: own.available_distance,
+        }
+    }
+}
+
+#[cfg(test)]
+mod consolidation_tests {
+    use super::*;
+
+    fn comp() -> BrakeComputation {
+        BrakeComputation::new(BrakeInputTolerance::new(2.0, 10.0))
+    }
+
+    fn input(speed: f64) -> BrakeInput {
+        BrakeInput::new(speed, 5.0, 800.0)
+    }
+
+    #[test]
+    fn median_of_three_picks_middle_value() {
+        // 2oo3 happy path: the outlier inside the tolerance band gets
+        // discarded, the middle sensor wins.
+        let out = comp().consolidate(&input(30.0), &[input(31.5), input(30.5)]);
+        assert_eq!(out.current_speed, 30.5);
+    }
+
+    #[test]
+    fn median_of_two_averages() {
+        // One peer excluded, two nodes left: mean of the two remaining
+        // readings, which stay inside the tolerance band by definition
+        // of the gate that ran before consolidate.
+        let out = comp().consolidate(&input(30.0), &[input(31.0)]);
+        assert_eq!(out.current_speed, 30.5);
+    }
+
+    #[test]
+    fn single_input_is_passed_through() {
+        let out = comp().consolidate(&input(42.0), &[]);
+        assert_eq!(out.current_speed, 42.0);
+    }
+
+    #[test]
+    fn non_sensor_fields_come_from_own_input() {
+        let own = BrakeInput::new(30.0, 5.0, 800.0);
+        let out = comp().consolidate(&own, &[input(31.0), input(29.0)]);
+        assert_eq!(out.target_speed, own.target_speed);
+        assert_eq!(out.available_distance, own.available_distance);
+    }
+
+    #[test]
+    fn result_is_independent_of_peer_order() {
+        // Cross-node determinism: node A and node B collect the same
+        // inputs in whatever order the frames arrived. Both must end up
+        // with the exact same bits, otherwise ShareResult diverges.
+        let a = comp().consolidate(&input(30.0), &[input(31.7), input(29.3)]);
+        let b = comp().consolidate(&input(30.0), &[input(29.3), input(31.7)]);
+        assert_eq!(a.current_speed.to_bits(), b.current_speed.to_bits());
+    }
+
+    #[test]
+    fn even_count_mean_is_bit_identical_regardless_of_order() {
+        let a = comp().consolidate(&input(30.1), &[input(31.3)]);
+        let b = comp().consolidate(&input(31.3), &[input(30.1)]);
+        assert_eq!(a.current_speed.to_bits(), b.current_speed.to_bits());
+    }
+
+    #[test]
+    fn nan_in_the_middle_fails_safe_in_compute() {
+        // A NaN cannot pass inputs_agree, so it never reaches consolidate
+        // in the real flow. Guard the behaviour anyway: the poisoned
+        // median must be rejected by compute rather than yield a curve.
+        let mut c = comp();
+        let out = c.consolidate(&input(f64::NAN), &[input(30.0)]);
+        assert!(out.current_speed.is_nan());
+        assert_eq!(c.compute(out), Err(BrakeError::NotFinite));
     }
 }

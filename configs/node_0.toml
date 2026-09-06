@@ -13,8 +13,8 @@ share_result_offset_ms  = 10
 send_ack_offset_ms      = 14
 crc_offset_ms           = 17
 
-init_sync_timeout_ms        = 2000
-peer_sync_timeout_ms        = 500
+init_sync_timeout_ms        = 15000
+clock_sync_timeout_ms        = 500
 cycle_sync_timeout_ms       = 10
 error_mgmt_timeout_ms       = 20
 state_sync_timeout_ms       = 500
@@ -40,4 +40,4 @@ port            = 6666
 # python -m harness.config_gen if you change anything above.
 [integrity]
 algo     = "sha256"
-checksum = "0af3699dd75a58d61107c68f76f6590fcb4cc87a15961e29d2d0e0d6053e72fb"
+checksum = "aa3b7224842e2e95fed843726589a0f5a0982dda17ce3cf256533e29020c198a"

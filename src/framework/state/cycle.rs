@@ -19,6 +19,11 @@ pub struct AckInfo {
 /// the computation result payload (shared during ShareResult).
 pub struct CycleState<P: CyclePayload, I: CyclePayload> {
     pub own_input: Option<I>,
+    /// Result of `Computation::consolidate` over own + validated peer
+    /// inputs. This is the value `compute` actually ran on, kept for
+    /// logging and post-mortem traceability. `own_input` stays the raw
+    /// local sensor value, since that is what went on the wire.
+    pub consolidated_input: Option<I>,
     pub peer_inputs: Vec<Option<I>, MAX_PEERS>,
     pub own_result: Option<P>,
     pub peer_results: Vec<Option<P>, MAX_PEERS>,
@@ -30,6 +35,7 @@ impl<P: CyclePayload, I: CyclePayload> CycleState<P, I> {
     pub const fn empty() -> Self {
         Self {
             own_input: None,
+            consolidated_input: None,
             peer_inputs: Vec::new(),
             own_result: None,
             peer_results: Vec::new(),
@@ -50,6 +56,7 @@ impl<P: CyclePayload, I: CyclePayload> CycleState<P, I> {
     /// Clear all per-peer slots for a new cycle.
     pub fn reset(&mut self, deadline: u64) {
         self.own_input = None;
+        self.consolidated_input = None;
         self.own_result = None;
         for slot in self.peer_inputs.iter_mut() {
             *slot = None;

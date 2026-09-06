@@ -794,10 +794,20 @@ where
 
         let mut agree_count: usize = 1; // own zaehlt sich mit
         let mut divergent_peers: heapless::Vec<u8, MAX_PEERS> = heapless::Vec::new();
+        // Peer inputs that passed the tolerance gate, fed into
+        // `Computation::consolidate` below. Lost peers are filtered out
+        // (their slots are never written by `record_peer_input`, the
+        // check is belt and braces); Probation peers count, unlike in
+        // `run_vote`, because their sensor reading is still a valid
+        // measurement of the same physical quantity.
+        let mut valid_inputs: heapless::Vec<C::Input, MAX_PEERS> = heapless::Vec::new();
         for (idx, slot) in self.state.peer_inputs().iter().enumerate() {
             if let Some(peer_input) = slot {
                 if self.computation.inputs_agree(&own, peer_input) {
                     agree_count += 1;
+                    if self.state.peers()[idx].health != PeerHealth::Lost {
+                        let _ = valid_inputs.push(*peer_input);
+                    }
                 } else {
                     let _ = divergent_peers.push(self.state.peers()[idx].id);
                 }
@@ -854,7 +864,20 @@ where
             }
         }
 
-        match self.computation.compute(own) {
+        // Consolidation: every non-Lost peer has delivered and every
+        // delivered input passed the tolerance gate, so all nodes hold
+        // the same input set here. The computation runs on the reduced
+        // value (for the brake domain: the median speed) instead of the
+        // local sensor value alone, which keeps a single drifting sensor
+        // inside its tolerance band from biasing the curve.
+        let consolidated = self.computation.consolidate(&own, &valid_inputs);
+        self.state.record_consolidated_input(consolidated);
+        debug!(
+            n_inputs = valid_inputs.len() + 1,
+            "computing on consolidated input"
+        );
+
+        match self.computation.compute(consolidated) {
             Ok(payload) => {
                 self.state.record_own_result(payload);
                 StateEvent::InputsShared

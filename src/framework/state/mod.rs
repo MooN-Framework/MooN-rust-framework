@@ -592,6 +592,14 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         self.cycle.own_input
     }
 
+    pub fn record_consolidated_input(&mut self, input: I) {
+        self.cycle.consolidated_input = Some(input);
+    }
+
+    pub fn consolidated_input(&self) -> Option<I> {
+        self.cycle.consolidated_input
+    }
+
     pub fn peer_inputs(&self) -> &[Option<I>] {
         &self.cycle.peer_inputs
     }

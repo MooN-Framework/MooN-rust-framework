@@ -70,6 +70,24 @@ pub trait Computation {
     /// `false` for any non-Lost peer routes the cycle through
     /// ErrorManagement so the divergent sensor gets excluded.
     fn inputs_agree(&self, own: &Self::Input, peer: &Self::Input) -> bool;
+
+    /// Reduce the cycle's validated sensor inputs to the single input
+    /// `compute` runs on.
+    ///
+    /// Called during ShareInputs after the `inputs_agree` gate passed
+    /// for every non-Lost peer, with `own` plus every peer input that
+    /// passed the gate. At that point all nodes hold the same input
+    /// multiset, so an order-independent reduction (median, mid-value
+    /// select) is bit-identical on every node. An order-dependent one
+    /// is not and will surface as a divergence in ShareResult, so
+    /// implementations must not depend on the slice order.
+    ///
+    /// The default keeps the pre-consolidation behaviour: the node
+    /// computes on its own sensor value only.
+    fn consolidate(&self, own: &Self::Input, peers: &[Self::Input]) -> Self::Input {
+        let _ = peers;
+        *own
+    }
 }
 
 // ... alles davor unverändert ...
