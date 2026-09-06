@@ -54,6 +54,23 @@ where
     pub(super) last_cycle_start: Option<Instant>,
     pub(super) last_cycle_us: Option<u128>,
     pub(super) next_cycle_deadline: Option<Instant>,
+    /// Timing marks between the cycle anchor and the first send of the
+    /// cycle. Reported as fields on the ShareInputs entry-offset line so
+    /// a lost budget can be attributed to a specific step instead of
+    /// guessed at. Deliberately no log lines of their own: on a node
+    /// where the synchronous stdout writer is the suspect, extra lines
+    /// would distort the very measurement they serve.
+    pub(super) mark_after_cycle_log: Option<Instant>,
+    pub(super) mark_after_input: Option<Instant>,
+    pub(super) mark_after_poll: Option<Instant>,
+    /// Frames discarded during the current collect phase, by reason.
+    /// Reset on entry to every phase and reported when its deadline is
+    /// missed: without them, "the peer sent nothing" and "the peer sent
+    /// something and we threw it away" produce an identical log, and
+    /// both discard paths below are `debug!`, so at INFO they are
+    /// invisible.
+    pub(super) drops_stale: u32,
+    pub(super) drops_lost_peer: u32,
     pub(super) cycles_since_last_sync: u32,
     #[cfg(feature = "diagnostic")]
     pub(super) diagnostic: Option<Diagnostic>,
@@ -144,6 +161,11 @@ where
             last_cycle_start: None,
             last_cycle_us: None,
             next_cycle_deadline: None,
+            mark_after_cycle_log: None,
+            mark_after_input: None,
+            mark_after_poll: None,
+            drops_stale: 0,
+            drops_lost_peer: 0,
             cycles_since_last_sync: 0,
             #[cfg(feature = "diagnostic")]
             diagnostic,
@@ -285,6 +307,19 @@ where
         core::mem::replace(&mut self.peer_in_error_seen, false)
     }
 
+    /// Read the rendezvous flag without consuming it.
+    ///
+    /// The four in-cycle phases use this in their completion predicate
+    /// so the collect loop stops as soon as a peer signals
+    /// ErrorManagement, rather than waiting out a deadline for answers
+    /// from nodes that have demonstrably moved on. The flag itself is
+    /// still consumed once, by `take_peer_in_error` after the loop,
+    /// which is what turns the outcome into `PeerInError`.
+    #[inline]
+    pub(super) fn peer_in_error(&self) -> bool {
+        self.peer_in_error_seen
+    }
+
     /// Consult mute state. If true, send paths return without transmitting.
     #[inline]
     pub(super) fn is_muted(&self) -> bool {
@@ -332,6 +367,10 @@ where
 
             #[cfg(feature = "diagnostic")]
             self.poll_diagnostic();
+            // Outside the feature gate: without the diagnostic this just
+            // marks the point right before the transition log, which is
+            // what the ShareInputs breakdown needs either way.
+            self.mark_after_poll = Some(Instant::now());
 
             if self.peer_failsafe_seen {
                 warn!("peer_failsafe_seen set, forcing Fault");

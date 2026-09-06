@@ -30,11 +30,22 @@ pub enum VotingOutcome<D> {
 }
 
 /// Voting rule: reduce own + peer values to a decision.
+///
+/// Note the two methods are called with different peer slices, and an
+/// implementation must not carry indices from one into the other:
+///
+/// - `decide` receives only the values of `Alive` peers, compacted, so
+///   its indices do not correspond to roster slots.
+/// - `find_dissenters` receives the full per-slot buffer, so the
+///   indices it returns are roster slots and are mapped back to peer
+///   ids by the runner.
 pub trait Voter {
     type Payload: CyclePayload;
     type Decision: Copy;
 
-    /// `peers[i] == None` means peer i sent nothing in time.
+    /// Values of the `Alive` peers only, compacted — `None` means that
+    /// peer sent nothing in time. The positions are NOT roster slots,
+    /// so do not derive peer identity from them here.
     fn decide(
         &self,
         own: &Self::Payload,
@@ -45,9 +56,11 @@ pub trait Voter {
     /// `InsufficientQuorum`.
     fn required_participants(&self) -> u8;
 
-    /// Called after `decide` returned `Consensus`. Returns:
+    /// Called after `decide` returned `Consensus`. Unlike `decide`,
+    /// this is handed the full per-slot buffer, so the indices it
+    /// returns are roster slots. Returns:
     /// - `own_dissented`: our value disagreed with the consensus.
-    /// - dissenting peer indices into the original `peers` slice.
+    /// - dissenting peer indices into the `peers` slice passed here.
     fn find_dissenters(
         &self,
         own: &Self::Payload,

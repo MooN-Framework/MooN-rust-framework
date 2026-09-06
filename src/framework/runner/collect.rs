@@ -46,6 +46,8 @@ where
         Done: FnMut(&Self) -> bool,
         Ing: FnMut(&mut Self, UdpFrame<C::Input, V::Payload>),
     {
+        self.drops_stale = 0;
+        self.drops_lost_peer = 0;
         let mut next_send = Instant::now();
         loop {
             if Instant::now() >= next_send {
@@ -62,8 +64,22 @@ where
                 return PhaseOutcome::Complete;
             }
 
-            if Instant::now() > deadline {
-                warn!(phase, "phase deadline exceeded");
+            let now = Instant::now();
+            if now > deadline {
+                // `overshoot_us` is how late the deadline was noticed.
+                // The check runs once per loop iteration, so a large
+                // value means this loop did not get scheduled, not that
+                // the phase legitimately used up its budget. Read it
+                // together with the entry offset logged by the phase
+                // handlers: entry offset small plus overshoot large
+                // points at CPU starvation rather than a silent peer.
+                warn!(
+                    phase,
+                    overshoot_us = now.saturating_duration_since(deadline).as_micros(),
+                    drops_stale = self.drops_stale,
+                    drops_lost_peer = self.drops_lost_peer,
+                    "phase deadline exceeded"
+                );
                 return PhaseOutcome::Timeout;
             }
 

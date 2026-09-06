@@ -160,13 +160,6 @@ impl ClockSync {
             .is_some()
     }
 
-    /// Clear the outstanding request for this peer (e.g. on response timeout).
-    pub fn mark_timeout(&mut self, peer_id: u8) {
-        if let Some(s) = self.peers.iter_mut().find(|p| p.peer_id == peer_id) {
-            s.pending_t1 = None;
-        }
-    }
-
     /// Mark any peer that has been silent for longer than `threshold_ns`
     /// as unreachable so `is_complete` no longer waits on them. Idempotent
     /// — safe to call every loop iteration; once a peer is flagged we

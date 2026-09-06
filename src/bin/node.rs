@@ -24,6 +24,10 @@
 //!
 //! Without `--log-dir` the file sink is off (stdout only). The operator is
 //! responsible for only setting the flag on real hardware.
+//!
+//! Both sinks are written by worker threads, so a slow reader on the
+//! other end of the node's stdout cannot stall a cycle. Neither worker
+//! drops lines; see `init_logging`.
 
 use std::env;
 use std::fs;
@@ -31,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use swb_fault_tolerance::brake::braking_curve::BrakeInput;
@@ -74,9 +78,11 @@ fn main() -> ExitCode {
     let own_id = cfg.own_id;
     let participants = cfg.participants();
 
-    // Initialize the tracing subscriber. `_log_guard` MUST stay alive for the
-    // whole program lifetime — dropping it flushes and closes the file sink.
-    let _log_guard = match init_logging(args.log_dir.as_deref(), own_id, session_id) {
+    // Initialize the tracing subscriber. `_log_guards` MUST stay alive for
+    // the whole program lifetime — dropping them flushes and closes the
+    // sinks. Never call `std::process::exit` past this point, that skips
+    // the drop and loses whatever is still buffered.
+    let _log_guards = match init_logging(args.log_dir.as_deref(), own_id, session_id) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("logging init failed: {e}");
@@ -126,28 +132,63 @@ fn main() -> ExitCode {
     ExitCode::from(1)
 }
 
+/// How many lines the stdout worker may buffer before a write blocks.
+/// At the ten or so lines a cycle this node emits, that is roughly a
+/// minute of output at a 20 ms cycle, and about five megabytes worst
+/// case. Anything beyond that is not a stalled reader any more.
+const STDOUT_BUFFERED_LINES: usize = 32_768;
+
 /// Set up the tracing subscriber.
 ///
 /// stdout is always active. A file sink is added iff `log_dir` is `Some`.
 /// When the file sink is active, log lines go to
 /// `<log_dir>/node_<own_id>_session_<session_id>.log` and the symlink
 /// `<log_dir>/node_<own_id>_current.log` is repointed at that file.
+///
+/// Both sinks are written by worker threads. stdout used to be written
+/// synchronously from the node thread, which is fine against a file or a
+/// terminal but not against a pipe: a harness or GUI that reads the
+/// node's output stalls for a moment, the 64 KB pipe buffer fills, and
+/// the next `write` blocks inside whatever phase happened to be logging.
+/// That surfaced as a phase deadline missed for no visible reason, with
+/// the milliseconds unaccounted for between the cycle anchor and the
+/// first send.
+///
+/// The stdout worker is explicitly NOT lossy. `tracing_appender`
+/// defaults to dropping lines once its buffer is full, which would make
+/// `wait_for_log` in the scenario harness miss lines at random. Blocking
+/// after `STDOUT_BUFFERED_LINES` is the better failure mode here: the
+/// node keeps every line, and a reader that far behind is a problem in
+/// its own right.
 fn init_logging(
     log_dir: Option<&Path>,
     own_id: u8,
     session_id: u64,
-) -> Result<Option<WorkerGuard>, Box<dyn std::error::Error>> {
+) -> Result<Vec<WorkerGuard>, Box<dyn std::error::Error>> {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let stdout_layer = fmt::layer().with_writer(std::io::stdout);
+    let mut guards: Vec<WorkerGuard> = Vec::new();
+
+    let (stdout_writer, stdout_guard) = NonBlockingBuilder::default()
+        .lossy(false)
+        .buffered_lines_limit(STDOUT_BUFFERED_LINES)
+        .thread_name("log-stdout")
+        .finish(std::io::stdout());
+    guards.push(stdout_guard);
+    let stdout_layer = fmt::layer().with_writer(stdout_writer);
 
     if let Some(dir) = log_dir {
         fs::create_dir_all(dir)?;
 
         let filename = format!("node_{own_id}_session_{session_id}.log");
         let appender = tracing_appender::rolling::never(dir, &filename);
-        let (nb_writer, guard) = tracing_appender::non_blocking(appender);
+        let (nb_writer, file_guard) = NonBlockingBuilder::default()
+            .lossy(false)
+            .buffered_lines_limit(STDOUT_BUFFERED_LINES)
+            .thread_name("log-file")
+            .finish(appender);
+        guards.push(file_guard);
 
         let file_layer = fmt::layer()
             .with_writer(nb_writer)
@@ -170,13 +211,13 @@ fn init_logging(
             log_file = %dir.join(&filename).display(),
             "file logging enabled"
         );
-        Ok(Some(guard))
+        Ok(guards)
     } else {
         tracing_subscriber::registry()
             .with(env_filter)
             .with(stdout_layer)
             .init();
-        Ok(None)
+        Ok(guards)
     }
 }
 

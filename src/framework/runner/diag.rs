@@ -21,6 +21,14 @@ where
     /// Drain diagnostic telegrams. GetStatus is answered directly; other
     /// commands are staged inside `Diagnostic`.
     pub(super) fn poll_diagnostic(&mut self) {
+        // The diagnostic poll sits in the run loop after every phase
+        // handler, so when it lands between ReadInputs and ShareInputs
+        // its cost comes straight out of that phase's budget. Report it
+        // when it gets expensive enough to matter, so a phase timeout
+        // with a large `entry_offset_us` can be attributed instead of
+        // guessed at. The threshold is a quarter of a send interval.
+        let poll_started = std::time::Instant::now();
+        let poll_budget = self.timing.send_interval / 4;
         let Some(mut diag) = self.diagnostic.take() else {
             return;
         };
@@ -35,6 +43,15 @@ where
             }
         }
         self.diagnostic = Some(diag);
+
+        let poll_elapsed = poll_started.elapsed();
+        if poll_elapsed > poll_budget {
+            warn!(
+                poll_us = poll_elapsed.as_micros(),
+                budget_us = poll_budget.as_micros(),
+                "diagnostic poll consumed a noticeable share of the cycle"
+            );
+        }
     }
 
     /// Apply staged diagnostic input and injection updates at cycle start.

@@ -57,11 +57,13 @@ where
         }
         if let Some(idx) = self.state.peer_index(peer_id) {
             if self.state.peers()[idx].health == PeerHealth::Lost {
+                self.drops_lost_peer = self.drops_lost_peer.saturating_add(1);
                 debug!(peer_id, "frame from lost peer dropped");
                 return;
             }
         }
         if let Some(age) = self.frame_age_if_stale(&frame) {
+            self.drops_stale = self.drops_stale.saturating_add(1);
             debug!(peer_id, age_ns = age, "stale frame dropped");
             return;
         }

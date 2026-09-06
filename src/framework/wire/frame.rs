@@ -1,28 +1,38 @@
 //! Framed UDP payload for peer-to-peer traffic.
 //!
-//! Wire layout (little-endian):
+//! All multi-byte fields are little-endian. `offset` is the byte
+//! position from the start of the frame and `size` the field's length,
+//! so a field occupies the bytes `offset` through `offset + size - 1`.
+//!
 //! ```text
-//!   0        node_id           (1)
-//!   1..9     session_id        (8)
-//!   9..13    seq_num           (4)
-//!   13       node_state_wire   (1)
-//!   14..22   timestamp         (8)   sender local monotonic ns
-//!   22       payload_disc      (1)
-//!   23..X    payload_body      variant-dependent
-//!   X..X+4   crc32             (4)
+//!   offset  size  field
+//!   ------  ----  -----------------------------------------------
+//!        0     1  node_id
+//!        1     8  session_id
+//!        9     4  seq_num
+//!       13     1  node_state_wire
+//!       14     8  timestamp         sender local monotonic ns
+//!       22     1  payload_disc
+//!       23     B  payload_body      variant-dependent, B bytes
+//!   23 + B     4  crc32             over bytes 0 to 22 + B
 //! ```
+//!
+//! The header is 23 bytes (`HEADER_SIZE`) and the CRC trailer 4 bytes
+//! (`CRC_SIZE`), so a frame is `23 + B + 4` bytes long. The CRC covers
+//! the header and the payload body, not itself.
 
 use crate::framework::config::{MAX_APPLICATION_DATA_SIZE, MAX_TOTAL_NODES};
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::CyclePayload;
-use crate::framework::types::PeerMask;
+use crate::framework::types::{NodeIdMask, PeerMask};
 use crate::framework::wire::codec::{PayloadError, WireReader, WireWriter};
 use crc32fast::Hasher;
 
 const HEADER_SIZE: usize = 23;
 const CRC_SIZE: usize = 4;
 
-const STATE_BODY: usize = 2;
+// seen_mask(1) + active_count(1) + cycle_seq(4) = 6
+const STATE_BODY: usize = 6;
 // received_from(1) + publisher_candidate(1) + rejoin_vote(1) = 3
 const ACK_BODY: usize = 3;
 const EXCLUSION_PROPOSAL_BODY: usize = 1;
@@ -130,6 +140,17 @@ pub enum Payload<I: CyclePayload, R: CyclePayload> {
     State {
         seen_mask: PeerMask,
         active_count: u8,
+        /// The sender's `current_seq` at the time the beacon was sent,
+        /// i.e. which cycle this beacon belongs to.
+        ///
+        /// Beacons carry no other identity, and a node emits one on
+        /// entering the CycleSync barrier and one more on leaving it.
+        /// The trailing one routinely arrives at a peer that has already
+        /// left, which makes it indistinguishable from a beacon for the
+        /// next barrier unless the cycle is named explicitly. Since
+        /// `current_seq` is part of the system-state CRC, every node in
+        /// step carries the same value here.
+        cycle_seq: u32,
     },
     /// Sensor input attested this cycle. Shared during ShareInputs so
     /// every node can gate for input divergence.
@@ -138,12 +159,15 @@ pub enum Payload<I: CyclePayload, R: CyclePayload> {
     /// Ack beacon. `received_from` attests which peer results this node
     /// ingested this cycle. `publisher_candidate` is the sender's pick.
     /// `rejoin_vote` carries the sender's vote to admit lost peers back:
-    /// bit `k` set = sender confirms rejoin for the peer with id `k`.
-    /// Empty mask means no rejoin endorsed this cycle.
+    /// bit `k` set = sender confirms rejoin for the node with id `k`.
+    /// Empty mask means no rejoin endorsed this cycle. Note the
+    /// different index space from `received_from`: the rejoin vote is
+    /// id-indexed (`NodeIdMask`) because every node ANDs it with its
+    /// peers' votes directly, without position translation.
     Ack {
         received_from: PeerMask,
         publisher_candidate: u8,
-        rejoin_vote: PeerMask,
+        rejoin_vote: NodeIdMask,
     },
     ExclusionProposal {
         propose_exclude: PeerMask,
@@ -209,9 +233,11 @@ impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
             Payload::State {
                 seen_mask,
                 active_count,
+                cycle_seq,
             } => {
                 w.push_u8(seen_mask.as_u8());
                 w.push_u8(*active_count);
+                w.push_u32(*cycle_seq);
             }
             Payload::Input(i) => {
                 i.to_wire(w);
@@ -282,13 +308,14 @@ impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
             DISC_STATE => Payload::State {
                 seen_mask: PeerMask::from_u8(r.read_u8()?),
                 active_count: r.read_u8()?,
+                cycle_seq: r.read_u32()?,
             },
             DISC_INPUT => Payload::Input(I::from_wire(r)?),
             DISC_RESULT => Payload::Result(R::from_wire(r)?),
             DISC_ACK => Payload::Ack {
                 received_from: PeerMask::from_u8(r.read_u8()?),
                 publisher_candidate: r.read_u8()?,
-                rejoin_vote: PeerMask::from_u8(r.read_u8()?),
+                rejoin_vote: NodeIdMask::from_u8(r.read_u8()?),
             },
             DISC_EXCLUSION_PROPOSAL => Payload::ExclusionProposal {
                 propose_exclude: PeerMask::from_u8(r.read_u8()?),

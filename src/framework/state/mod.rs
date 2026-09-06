@@ -9,7 +9,7 @@ use crate::framework::config::{
 use crate::framework::clock_sync::PeerClock;
 use crate::framework::state_machine::{NodeState, SystemState};
 use crate::framework::traits::{ApplicationData, CyclePayload, Voter, VotingOutcome};
-use crate::framework::types::PeerMask;
+use crate::framework::types::{NodeIdMask, PeerMask};
 use crate::framework::wire::{SnapshotEntry, WireReader, WireWriter};
 use crc32fast::Hasher;
 pub use cycle::{AckInfo, CycleState};
@@ -171,10 +171,13 @@ pub struct RunState<V: Voter, I: CyclePayload> {
     sync_valid: bool,
 
     was_lost: bool,
-    rejoin_seen: PeerMask,
-    peer_rejoin_votes: Vec<Option<PeerMask>, MAX_PEERS>,
-    pending_rejoin: PeerMask,
-    self_probation_remaining: u32,
+    rejoin_seen: NodeIdMask,
+    peer_rejoin_votes: Vec<Option<NodeIdMask>, MAX_PEERS>,
+    pending_rejoin: NodeIdMask,
+    /// Cycle counter value at which this node entered probation, or
+    /// `None` when it is not on probation. Mirrors
+    /// `PeerInfo::probation_start_seq` on the peer side.
+    self_probation_start_seq: Option<u32>,
 
     peer_crcs: Vec<Option<u32>, MAX_PEERS>,
 
@@ -208,10 +211,10 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
             sync_epsilon_ns: 0,
             sync_valid: false,
             was_lost: false,
-            rejoin_seen: PeerMask::EMPTY,
+            rejoin_seen: NodeIdMask::EMPTY,
             peer_rejoin_votes: Vec::new(),
-            pending_rejoin: PeerMask::EMPTY,
-            self_probation_remaining: 0,
+            pending_rejoin: NodeIdMask::EMPTY,
+            self_probation_start_seq: None,
             needs_state_sync: false,
             sync_snapshots: Vec::new(),
             sync_acks: Vec::new(),
@@ -293,26 +296,34 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         &self.sync_acks
     }
 
-    /// Pick the majority snapshot from what we've collected.
-    /// Returns (chosen_snapshot, minority_sender_ids) or None if empty.
+    /// Pick the snapshot backed by a strict majority of the senders we
+    /// heard from. Returns `(winner, minority_sender_ids)`.
+    ///
+    /// Without a strict majority this returns `None` instead of the
+    /// most frequent candidate. With two senders disagreeing, "most
+    /// frequent" degenerates into "whichever frame arrived first", and
+    /// two receivers can then adopt different states from the same
+    /// exchange. The caller leaves the phase on its deadline instead,
+    /// which routes to Failsafe.
     pub fn majority_snapshot(&self) -> Option<(StoredSnapshot, Vec<u8, MAX_TOTAL_NODES>)> {
-        if self.sync_snapshots.is_empty() {
+        let total = self.sync_snapshots.len();
+        if total == 0 {
             return None;
         }
-        let mut best_count = 0u8;
-        let mut best_snap: Option<StoredSnapshot> = None;
+        let threshold = total / 2 + 1;
+        let mut winner: Option<StoredSnapshot> = None;
         for (_, snap) in self.sync_snapshots.iter() {
             let count = self
                 .sync_snapshots
                 .iter()
                 .filter(|(_, s)| s == snap)
-                .count() as u8;
-            if count > best_count {
-                best_count = count;
-                best_snap = Some(*snap);
+                .count();
+            if count >= threshold {
+                winner = Some(*snap);
+                break;
             }
         }
-        let winner = best_snap?;
+        let winner = winner?;
         let mut minority: Vec<u8, MAX_TOTAL_NODES> = Vec::new();
         for (sender_id, snap) in self.sync_snapshots.iter() {
             if *snap != winner {
@@ -322,6 +333,13 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         Some((winner, minority))
     }
 
+    /// Adopt a peer's system-state snapshot.
+    ///
+    /// Validates every entry before mutating anything. A snapshot that
+    /// turns out to be inconsistent halfway through must leave the node
+    /// exactly as it was, otherwise a rejected snapshot still moves
+    /// `current_seq` and part of the roster, and the node then diverges
+    /// on the next CRC exchange with no visible cause.
     pub fn apply_snapshot(
         &mut self,
         nominal: u8,
@@ -336,45 +354,54 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         {
             return Err(SnapshotApplyError::ConfigMismatch);
         }
-        self.current_seq = current_seq;
+
+        // Validation pass. Nothing below this point may fail.
+        let mut own: Option<(PeerHealth, u32)> = None;
+        let mut peer_updates: Vec<(u8, PeerHealth, u32), MAX_TOTAL_NODES> = Vec::new();
         for entry in entries.iter().filter(|e| e.valid) {
             let health = health_from_wire(entry.health)?;
             if entry.id == self.own_id {
-                match health {
-                    PeerHealth::Probation => {
-                        self.self_probation_remaining =
-                            probation_cycles.saturating_sub(entry.probation_cycles_ok);
-                    }
-                    PeerHealth::Alive => {
-                        self.self_probation_remaining = 0;
-                    }
-                    PeerHealth::Lost => return Err(SnapshotApplyError::SelfMarkedLost),
+                if health == PeerHealth::Lost {
+                    return Err(SnapshotApplyError::SelfMarkedLost);
                 }
+                own = Some((health, entry.probation_cycles_ok));
             } else {
-                if !self
-                    .roster
-                    .set_peer_from_snapshot(entry.id, health, entry.probation_cycles_ok)
-                {
+                if self.peer_index(entry.id).is_none() {
                     return Err(SnapshotApplyError::UnknownPeerInSnapshot);
                 }
+                let _ = peer_updates.push((entry.id, health, entry.probation_cycles_ok));
             }
+        }
+
+        // Commit pass.
+        self.current_seq = current_seq;
+        match own {
+            Some((PeerHealth::Probation, cycles_ok)) => {
+                self.self_probation_start_seq = Some(current_seq.wrapping_sub(cycles_ok));
+            }
+            Some((PeerHealth::Alive, _)) => {
+                self.self_probation_start_seq = None;
+            }
+            // Own id absent from the snapshot, or Lost (rejected
+            // above): leave local probation state untouched.
+            _ => {}
+        }
+        for (id, health, cycles_ok) in peer_updates.iter() {
+            self.roster
+                .set_peer_from_snapshot(*id, *health, *cycles_ok, current_seq);
         }
         Ok(())
     }
 
     pub fn build_snapshot(&self) -> (u8, u8, u32, u32, [SnapshotEntry; MAX_TOTAL_NODES]) {
         let mut entries = [SnapshotEntry::default(); MAX_TOTAL_NODES];
-        let own_health = if self.self_probation_remaining > 0 {
-            PeerHealth::Probation
-        } else {
-            PeerHealth::Alive
+        let own_health = match self.self_probation_start_seq {
+            Some(_) => PeerHealth::Probation,
+            None => PeerHealth::Alive,
         };
-        let own_cycles_ok = if self.self_probation_remaining > 0 {
-            self.participants
-                .probation_cycles
-                .saturating_sub(self.self_probation_remaining)
-        } else {
-            0
+        let own_cycles_ok = match self.self_probation_start_seq {
+            Some(start) => self.current_seq.wrapping_sub(start),
+            None => 0,
         };
 
         let mut collected: Vec<(u8, PeerHealth, u32), MAX_TOTAL_NODES> = Vec::new();
@@ -685,12 +712,13 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
 
     /// Reset all per-cycle buffers to start a fresh cycle. Also clears the
     /// pending exclusion proposal.
-    pub fn start_new_cycle(&mut self, deadline: u64) {
+    pub fn start_new_cycle(&mut self) {
         self.current_seq = self.current_seq.wrapping_add(1);
-        self.cycle.reset(deadline);
+        self.refresh_probation();
+        self.cycle.reset();
         self.pending_exclusion_proposal = PeerMask::EMPTY;
         self.last_decision = None;
-        self.rejoin_seen = PeerMask::EMPTY;
+        self.rejoin_seen = NodeIdMask::EMPTY;
         for slot in self.peer_rejoin_votes.iter_mut() {
             *slot = None;
         }
@@ -813,33 +841,37 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
     /// Note that we've observed a ResyncLostPeer frame from `peer_id` —
     /// this contributes a bit to our own rejoin vote for this cycle.
     pub fn set_rejoin_seen(&mut self, peer_id: u8) {
-        if (peer_id as usize) < 8 {
-            self.rejoin_seen.set(peer_id as usize);
+        if !self.rejoin_seen.set(peer_id) {
+            warn!(
+                peer_id,
+                max_id = MAX_TOTAL_NODES - 1,
+                "node id not representable in the rejoin mask, vote dropped"
+            );
         }
     }
 
     /// The rejoin mask we'll attest to peers in send_ack.
-    pub fn own_rejoin_vote(&self) -> PeerMask {
+    pub fn own_rejoin_vote(&self) -> NodeIdMask {
         self.rejoin_seen
     }
 
-    pub fn set_pending_rejoin(&mut self, mask: PeerMask) {
+    pub fn set_pending_rejoin(&mut self, mask: NodeIdMask) {
         self.pending_rejoin = mask;
     }
 
-    pub fn pending_rejoin(&self) -> PeerMask {
+    pub fn pending_rejoin(&self) -> NodeIdMask {
         self.pending_rejoin
     }
 
     pub fn clear_pending_rejoin(&mut self) {
-        self.pending_rejoin = PeerMask::EMPTY;
+        self.pending_rejoin = NodeIdMask::EMPTY;
     }
 
     /// Record a peer's rejoin-vote mask received in an ack frame.
     pub fn record_peer_rejoin_vote(
         &mut self,
         peer_id: u8,
-        vote: PeerMask,
+        vote: NodeIdMask,
     ) -> Result<(), DiscoveryError> {
         if let Some(idx) = self.resolve_peer_slot(peer_id)? {
             self.peer_rejoin_votes[idx] = Some(vote);
@@ -851,7 +883,7 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
     /// peer that didn't attest → return EMPTY (no rejoin this cycle).
     /// Called after send_ack completes; a missing attestation means the
     /// unanimity requirement isn't met.
-    pub fn aggregate_rejoin_votes(&self) -> PeerMask {
+    pub fn aggregate_rejoin_votes(&self) -> NodeIdMask {
         let mut agg = self.rejoin_seen.as_u8();
         for (idx, peer) in self.roster.peers().iter().enumerate() {
             if peer.health == PeerHealth::Lost {
@@ -859,10 +891,10 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
             }
             match self.peer_rejoin_votes[idx] {
                 Some(m) => agg &= m.as_u8(),
-                None => return PeerMask::EMPTY,
+                None => return NodeIdMask::EMPTY,
             }
         }
-        PeerMask::from_u8(agg)
+        NodeIdMask::from_u8(agg)
     }
 
     /// Peers whose vote is expected this round but has not arrived. A peer
@@ -990,30 +1022,33 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
 
     /// Readmit a peer that came back via resync. Returns true on transition.
     pub fn readmit_peer(&mut self, peer_id: u8) -> bool {
-        self.roster.readmit(peer_id)
+        self.roster.readmit(peer_id, self.current_seq)
     }
 
     pub fn active_count_including_self(&self) -> u8 {
         (1 + self.active_peer_count()) as u8
     }
 
-    pub fn tick_probation(&mut self) -> usize {
-        if self.self_probation_remaining > 0 {
-            self.self_probation_remaining -= 1;
-            if self.self_probation_remaining == 0 {
+    /// Re-evaluate probation for self and every peer against the
+    /// current cycle counter. Called from `start_new_cycle`, so it runs
+    /// on every path that advances the cycle rather than only on the
+    /// PublishResult success path.
+    fn refresh_probation(&mut self) {
+        let threshold = self.participants.probation_cycles;
+        if let Some(start) = self.self_probation_start_seq {
+            if self.current_seq.wrapping_sub(start) >= threshold {
+                self.self_probation_start_seq = None;
                 info!("self promoted from Probation to Alive");
             }
         }
-        self.roster
-            .tick_probation(self.participants.probation_cycles)
-    }
-
-    pub fn enter_self_probation(&mut self) {
-        self.self_probation_remaining = self.participants.probation_cycles;
+        let promoted = self.roster.refresh_probation(self.current_seq, threshold);
+        if promoted > 0 {
+            info!(promoted, "peers promoted from Probation to Alive");
+        }
     }
 
     pub fn self_in_probation(&self) -> bool {
-        self.self_probation_remaining > 0
+        self.self_probation_start_seq.is_some()
     }
 
     pub fn lowest_alive_peer_id(&self) -> Option<u8> {
@@ -1106,19 +1141,12 @@ pub(crate) fn strict_majority<T: Eq + Copy>(values: &[T]) -> Option<T> {
         return None;
     }
     let threshold = n / 2 + 1;
-    let mut best: Option<(T, usize)> = None;
     for &v in values.iter() {
         let count = values.iter().filter(|&&x| x == v).count();
         if count >= threshold {
             return Some(v);
         }
-        match best {
-            Some((_, c)) if count <= c => {}
-            _ => best = Some((v, count)),
-        }
     }
-    // Kein Wert erreicht threshold.
-    let _ = best;
     None
 }
 

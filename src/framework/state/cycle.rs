@@ -28,7 +28,6 @@ pub struct CycleState<P: CyclePayload, I: CyclePayload> {
     pub own_result: Option<P>,
     pub peer_results: Vec<Option<P>, MAX_PEERS>,
     pub peer_acks: Vec<Option<AckInfo>, MAX_PEERS>,
-    pub phase_deadline: u64,
 }
 
 impl<P: CyclePayload, I: CyclePayload> CycleState<P, I> {
@@ -40,7 +39,6 @@ impl<P: CyclePayload, I: CyclePayload> CycleState<P, I> {
             own_result: None,
             peer_results: Vec::new(),
             peer_acks: Vec::new(),
-            phase_deadline: 0,
         }
     }
 
@@ -54,7 +52,7 @@ impl<P: CyclePayload, I: CyclePayload> CycleState<P, I> {
     }
 
     /// Clear all per-peer slots for a new cycle.
-    pub fn reset(&mut self, deadline: u64) {
+    pub fn reset(&mut self) {
         self.own_input = None;
         self.consolidated_input = None;
         self.own_result = None;
@@ -67,6 +65,5 @@ impl<P: CyclePayload, I: CyclePayload> CycleState<P, I> {
         for slot in self.peer_acks.iter_mut() {
             *slot = None;
         }
-        self.phase_deadline = deadline;
     }
 }

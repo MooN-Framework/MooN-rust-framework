@@ -125,6 +125,7 @@ where
                     Payload::State {
                         seen_mask: mask,
                         active_count: ac,
+                        cycle_seq: this.state.current_seq(),
                     },
                 ) {
                     error!(error = ?e, "send_state failed in resync");
@@ -176,11 +177,13 @@ where
                         return StateEvent::SelfTestErr;
                     }
                     self.state.set_was_lost(false);
-                    self.state.set_needs_state_sync(true); // NEU: markiere für nächste Phase
-                                                           // enter_self_probation() ENTFÄLLT — Snapshot setzt self_probation_remaining
+                    // The snapshot adopted in SystemStateSync carries our
+                    // own probation entry, so no local probation seeding
+                    // is needed here.
+                    self.state.set_needs_state_sync(true);
                 }
                 self.state.clear_pending_rejoin();
-                self.state.start_new_cycle(self.next_cycle_tick());
+                self.state.start_new_cycle();
                 StateEvent::ResyncLostPeerOk // statt InitialSyncOk
             }
             PhaseOutcome::Timeout => {
@@ -213,6 +216,7 @@ where
                     Payload::State {
                         seen_mask: PeerMask::EMPTY,
                         active_count: 0,
+                        cycle_seq: this.state.current_seq(),
                     },
                 ) {
                     error!(error = ?e, "send_state failed in init sync");
@@ -244,7 +248,7 @@ where
                     return StateEvent::SelfTestErr;
                 }
 
-                self.state.start_new_cycle(self.next_cycle_tick());
+                self.state.start_new_cycle();
                 self.state.set_system_state(SystemState::Operational);
                 StateEvent::InitialSyncOk
             }
@@ -345,7 +349,7 @@ where
                 self.cycles_since_last_sync = 0;
                 self.next_cycle_deadline = None;
                 self.last_cycle_start = None;
-                self.state.start_new_cycle(self.next_cycle_tick());
+                self.state.start_new_cycle();
                 return StateEvent::ClockSyncOk;
             }
 
@@ -380,13 +384,12 @@ where
                 }
             }
 
-            if let RecvOutcome::TimeSync {
-                frame,
-                local_recv_ns,
-                ..
-            } = self.transport.try_recv()
-            {
-                match extract_sync_fields(&frame, local_recv_ns) {
+            match self.transport.try_recv() {
+                RecvOutcome::TimeSync {
+                    frame,
+                    local_recv_ns,
+                    ..
+                } => match extract_sync_fields(&frame, local_recv_ns) {
                     Some(SyncFields::Request { t1, t2_local, .. }) => {
                         if let Err(e) = self.transport.send_time_sync_resp(node_state, t1, t2_local)
                         {
@@ -403,7 +406,26 @@ where
                         clock_sync.on_response(peer_id, t1, t2, t3, t4_local);
                     }
                     None => {}
+                },
+                // A peer can decide to fail-stop while we are still
+                // syncing clocks. This phase does not go through
+                // `collect_phase`, so without this arm the broadcast is
+                // dropped and we keep running until our own deadline
+                // fires — the fabric-wide stop would be delayed by a
+                // full phase for no reason.
+                RecvOutcome::Valid(frame)
+                | RecvOutcome::SeqGap { frame, .. }
+                | RecvOutcome::NewSession { frame, .. } => {
+                    if let Payload::GoFailsafe { reason } = frame.payload() {
+                        warn!(
+                            peer_id = frame.node_id(),
+                            reason, "Peer broadcast GoFailsafe during clock sync"
+                        );
+                        self.peer_failsafe_seen = true;
+                        return StateEvent::Fault;
+                    }
                 }
+                _ => {}
             }
         }
     }
@@ -429,20 +451,18 @@ where
         // snapshot has been picked.
         let (own_app_len, own_app_buf) = serialize_app_data(&self.app_state.snapshot());
 
-        // Für den Sender: Empfänger-Liste = alle non-Lost Peers (der Receiver
-        // ist einer davon; die anderen Sender ackn nicht, aber schicken auch
-        // keinen Snapshot der ein Ack erwartet, weil sie nicht Empfänger sind).
-        // Vereinfachung: wir warten auf Acks von allen non-Lost, aber
-        // ignorieren fehlende Acks von Sendern (die brauchen wir nicht).
-        // Sauberer: der Sender weiß nicht wer Empfänger ist. Er sendet einfach
-        // und wartet auf mindestens einen Ack. Bei mehreren Empfängern:
-        // Ack von jedem der needs_state_sync=true hat. Aber das weiß der
-        // Sender lokal nicht. Pragmatisch:
-        //   Sender-Abschluss = mindestens ein Ack mit passendem CRC empfangen
-        //                    UND alle non-Lost haben entweder Snapshot ODER Ack gesendet
-        //   Receiver-Abschluss = Snapshot angewandt + Ack gesendet
-        // Für den Rückkehrer-Fall (1 Empfänger, N-1 Sender) reicht: mindestens
-        // 1 Ack mit unserem CRC → wir sind Mehrheit, weiter.
+        // Role split for this phase:
+        //   Sender   completes on at least one ack carrying our own CRC.
+        //            A sender does not know locally which nodes are
+        //            receivers, so it cannot wait for a specific set.
+        //   Receiver completes once it has adopted the majority
+        //            snapshot (see the latch below).
+        // Receiver-side latch: set once the majority snapshot has been
+        // adopted. Also the receiver's completion condition — the phase
+        // must not end just because all snapshots arrived, since without
+        // a strict majority none of them is adopted and leaving with
+        // `needs_state_sync = false` would silently skip the sync.
+        let applied: Cell<bool> = Cell::new(false);
 
         let outcome = self.collect_phase(
             "system_state_sync",
@@ -450,9 +470,13 @@ where
             self.timing.send_interval,
             |this| {
                 if is_receiver {
-                    // Receiver: sobald wir Snapshots haben, wenden wir Mehrheit an
-                    // und senden Ack. Vorher nichts.
-                    if !this.state.sync_snapshots().is_empty() {
+                    // Adopt only once every non-Lost peer's snapshot is
+                    // in and one of them holds a strict majority.
+                    // Applying on the first arrival would let a single
+                    // sender drive our roster and application state, and
+                    // re-applying every send interval would let it flip
+                    // us back and forth.
+                    if !applied.get() && this.state.peers_missing_snapshot().is_empty() {
                         if let Some((winner, _minority)) = this.state.majority_snapshot() {
                             if let Err(e) = this.state.apply_snapshot(
                                 winner.nominal,
@@ -490,13 +514,30 @@ where
                             let adopted_crc = this
                                 .state
                                 .compute_system_state_crc(adopted_app_len, &adopted_app_buf);
-                            if let Err(e) = this
-                                .transport
-                                .send(node_state, Payload::SystemStateSnapshotAck { adopted_crc })
-                            {
-                                error!(error = ?e, "send_snapshot_ack failed");
-                                return Err(());
-                            }
+                            info!(adopted_crc, "majority snapshot adopted");
+                            applied.set(true);
+                        } else {
+                            warn!(
+                                senders = this.state.sync_snapshots().len(),
+                                "no strict majority among collected snapshots, not adopting"
+                            );
+                        }
+                    }
+
+                    // Keep re-attesting the adopted state until a sender
+                    // has seen our ack or the deadline runs out.
+                    if applied.get() {
+                        let (adopted_app_len, adopted_app_buf) =
+                            serialize_app_data(&this.app_state.snapshot());
+                        let adopted_crc = this
+                            .state
+                            .compute_system_state_crc(adopted_app_len, &adopted_app_buf);
+                        if let Err(e) = this
+                            .transport
+                            .send(node_state, Payload::SystemStateSnapshotAck { adopted_crc })
+                        {
+                            error!(error = ?e, "send_snapshot_ack failed");
+                            return Err(());
                         }
                     }
                 } else {
@@ -522,12 +563,11 @@ where
             },
             |this| {
                 if is_receiver {
-                    // Fertig wenn wir Snapshots von allen non-Lost haben und
-                    // (den Snapshot bereits angewandt haben, angezeigt durch
-                    // needs_state_sync=false in apply-Erfolg — aber das setzen
-                    // wir erst nach Handler-Abschluss). Alternative:
-                    // Snapshot-Set komplett + kein Ausstand.
-                    this.state.peers_missing_snapshot().is_empty()
+                    // Complete only once the majority snapshot was
+                    // actually adopted, not merely once all snapshots
+                    // arrived.
+                    let _ = this;
+                    applied.get()
                 } else {
                     // Sender: Ack von mindestens einem Peer der needs_state_sync
                     // hatte, und CRC stimmt mit unserem überein.
@@ -635,6 +675,7 @@ where
                     Payload::State {
                         seen_mask: mask,
                         active_count: this.state.active_count_including_self(),
+                        cycle_seq: this.state.current_seq(),
                     },
                 ) {
                     error!(error = ?e, "send_state failed in cycle sync");
@@ -660,7 +701,7 @@ where
 
         match outcome {
             super::PhaseOutcome::Complete => {
-                self.state.start_new_cycle(self.next_cycle_tick());
+                self.state.start_new_cycle();
                 StateEvent::CycleSyncOk
             }
             super::PhaseOutcome::Timeout => StateEvent::CycleSyncTimeout,
@@ -697,6 +738,9 @@ where
             info!(cycle_us = elapsed.as_micros(), "cycle duration");
         }
         self.last_cycle_start = Some(now);
+        // After the cycle-duration line has been written. The gap to
+        // `now` is the cost of that single synchronous log write.
+        self.mark_after_cycle_log = Some(std::time::Instant::now());
 
         #[cfg(feature = "diagnostic")]
         {
@@ -710,6 +754,7 @@ where
         match self.input_source.read() {
             Ok(input) => {
                 self.state.record_own_input(input);
+                self.mark_after_input = Some(std::time::Instant::now());
                 StateEvent::InputsRead
             }
             Err(e) => {
@@ -746,6 +791,58 @@ where
         let deadline = self.cycle_anchor() + self.timing.share_inputs_offset;
         let node_state = self.state.node_state();
 
+        // Instrumentation for the in-cycle budget. The deadline is an
+        // offset from the cycle anchor set in ReadInputs, so everything
+        // consumed between the anchor and this point is already gone
+        // from this phase's budget before a single frame was sent. If
+        // the remaining budget is regularly below one send interval,
+        // the phase times out for local scheduling reasons rather than
+        // because a peer was silent, and the resulting exclusion says
+        // nothing about the peers.
+        let entry = Instant::now();
+        let entry_offset = entry.saturating_duration_since(self.cycle_anchor());
+        let remaining = self.timing.share_inputs_offset.saturating_sub(entry_offset);
+
+        // Breakdown of the entry offset, in order of occurrence:
+        //   log_us       writing the cycle-duration line
+        //   input_us     InputSource::read plus record_own_input
+        //   poll_us      the diagnostic poll in the run loop
+        //   dispatch_us  transition logging and the hop into this phase
+        // They sum to entry_offset_us. Whichever dominates is the thing
+        // to fix; two of the four are synchronous log writes.
+        let anchor = self.cycle_anchor();
+        let m_log = self.mark_after_cycle_log.unwrap_or(anchor);
+        let m_input = self.mark_after_input.unwrap_or(m_log);
+        let m_poll = self.mark_after_poll.unwrap_or(m_input);
+        let log_us = m_log.saturating_duration_since(anchor).as_micros();
+        let input_us = m_input.saturating_duration_since(m_log).as_micros();
+        let poll_us = m_poll.saturating_duration_since(m_input).as_micros();
+        let dispatch_us = entry.saturating_duration_since(m_poll).as_micros();
+
+        if remaining < self.timing.send_interval {
+            warn!(
+                entry_offset_us = entry_offset.as_micros(),
+                remaining_us = remaining.as_micros(),
+                budget_us = self.timing.share_inputs_offset.as_micros(),
+                send_interval_us = self.timing.send_interval.as_micros(),
+                log_us,
+                input_us,
+                poll_us,
+                dispatch_us,
+                "share_inputs entered with less than one send interval of budget left"
+            );
+        } else {
+            info!(
+                entry_offset_us = entry_offset.as_micros(),
+                remaining_us = remaining.as_micros(),
+                log_us,
+                input_us,
+                poll_us,
+                dispatch_us,
+                "share_inputs entry offset"
+            );
+        }
+
         // Injection decisions latched per-phase (not per-send-attempt) so
         // that a `count=1` drops the entire cycle's transmit, not just the
         // first retransmit.
@@ -767,7 +864,12 @@ where
                 }
                 Ok(())
             },
-            |this| this.all_peer_inputs_in(),
+            // Stop early on rendezvous: a peer already in
+            // ErrorManagement will not answer this phase, and waiting
+            // out the deadline costs the whole budget. By the time we
+            // reach EM the peers may have finished their round, and an
+            // EM phase that collects no votes ends in Failsafe.
+            |this| this.all_peer_inputs_in() || this.peer_in_error(),
             |this, frame| {
                 if frame.node_state_wire() == NodeState::ResyncLostPeer.to_wire() {
                     this.state.set_rejoin_seen(frame.node_id());
@@ -785,6 +887,14 @@ where
 
         match outcome {
             super::PhaseOutcome::Timeout => {
+                // Name the peers whose input never landed. Together with
+                // the drop counters on the deadline warning this says
+                // whether they were silent or whether we discarded what
+                // they sent.
+                warn!(
+                    missing = ?self.state.peers_missing_input(),
+                    "share_inputs timed out, peers without input"
+                );
                 self.state.attribute_input_missing();
                 return StateEvent::ShareInputsTimeout;
             }
@@ -933,7 +1043,7 @@ where
                 }
                 Ok(())
             },
-            |this| this.all_peer_results_in(),
+            |this| this.all_peer_results_in() || this.peer_in_error(),
             |this, frame| {
                 if frame.node_state_wire() == NodeState::ResyncLostPeer.to_wire() {
                     this.state.set_rejoin_seen(frame.node_id());
@@ -1006,7 +1116,7 @@ where
                 }
                 Ok(())
             },
-            |this| this.all_peer_acks_in(),
+            |this| this.all_peer_acks_in() || this.peer_in_error(),
             |this, frame| {
                 if let Payload::Ack { rejoin_vote, .. } = frame.payload() {
                     let _ = this
@@ -1080,7 +1190,7 @@ where
                 }
                 Ok(())
             },
-            |this| this.state.healthy_peers_missing_crc().is_empty(),
+            |this| this.state.healthy_peers_missing_crc().is_empty() || this.peer_in_error(),
             |this, frame| {
                 if let Payload::SystemStateCrc { crc } = frame.payload() {
                     let _ = this.state.record_peer_crc(frame.node_id(), crc);
@@ -1296,11 +1406,10 @@ where
                     debug!(publisher, own_id, "consensus reached, peer publishes");
                 }
 
-                let promoted = self.state.tick_probation();
-                if promoted > 0 {
-                    info!(promoted, "peers promoted from Probation to Alive");
-                }
-
+                // Probation promotion is not ticked here any more: it is
+                // derived from `current_seq` in `start_new_cycle`, so a
+                // cycle that ends in ErrorManagement instead of here can
+                // no longer desynchronise the counters across nodes.
                 let confirmed_rejoin = self.state.aggregate_rejoin_votes();
                 if confirmed_rejoin.as_u8() != 0 {
                     warn!(
@@ -1412,7 +1521,7 @@ where
                     );
                 }
 
-                self.state.start_new_cycle(self.next_cycle_tick());
+                self.state.start_new_cycle();
                 if !self.state.quorum_available() {
                     self.mark_failsafe(FailsafeReason::QuorumLost);
                     return StateEvent::TooFewNodes;
@@ -1479,8 +1588,8 @@ where
         found == self.state.participants().nominal_participants
     }
 
-    /// Sleep until the next cycle tick. Logs an overrun and skips sleeping
-    /// on lateness.
+    /// Sleep until the next cycle tick. On lateness the schedule skips
+    /// forward by whole periods instead of sleeping.
     fn wait_for_next_cycle_tick(&mut self) {
         let now = Instant::now();
         match self.next_cycle_deadline {
@@ -1493,7 +1602,8 @@ where
                 } else {
                     warn!(overrun_us = (now - deadline).as_micros(), "cycle overrun");
                 }
-                self.next_cycle_deadline = Some(deadline + self.timing.cycle_duration);
+                self.next_cycle_deadline =
+                    Some(next_raster_point(deadline, now, self.timing.cycle_duration));
             }
         }
     }
@@ -1512,9 +1622,74 @@ where
         }
     }
 
-    /// Placeholder for the next-cycle epoch; the barrier is at the
-    /// application layer for now.
-    fn next_cycle_tick(&self) -> u64 {
-        0
+}
+/// First raster point strictly after `now`, keeping the phase of the
+/// original schedule.
+///
+/// The distinction matters after an overrun. Re-anchoring on `now`
+/// would shift this node's raster against its peers permanently: their
+/// in-cycle deadlines are offsets from their own anchors, so a node
+/// whose anchor sits a few milliseconds off sends inside a window the
+/// others have already closed, gets attributed as missing, and is voted
+/// out of a fabric it is perfectly able to serve. Advancing by a single
+/// period is no good either, because after a long stall the result can
+/// still be in the past and the node then races through the backlog
+/// without ever sleeping. Skipping whole periods keeps the phase and
+/// lands in the future in one step.
+fn next_raster_point(deadline: Instant, now: Instant, period: Duration) -> Instant {
+    if now < deadline {
+        return deadline + period;
+    }
+    let period_ns = period.as_nanos().max(1);
+    let missed = ((now - deadline).as_nanos() / period_ns) + 1;
+    let missed = u32::try_from(missed).unwrap_or(u32::MAX);
+    deadline + period.saturating_mul(missed)
+}
+
+#[cfg(test)]
+mod raster_tests {
+    //! The cycle raster has to keep its phase across an overrun. A node
+    //! whose anchor drifts against its peers falls outside their
+    //! in-cycle windows and gets excluded even though it is healthy.
+    use super::next_raster_point;
+    use std::time::{Duration, Instant};
+
+    const PERIOD: Duration = Duration::from_millis(20);
+
+    #[test]
+    fn on_time_advances_by_one_period() {
+        let deadline = Instant::now();
+        let now = deadline - Duration::from_millis(5);
+        assert_eq!(next_raster_point(deadline, now, PERIOD), deadline + PERIOD);
+    }
+
+    #[test]
+    fn small_overrun_keeps_the_original_phase() {
+        // The exact case from the field log: a 6.2 ms overrun must not
+        // move the raster by 6.2 ms.
+        let deadline = Instant::now();
+        let now = deadline + Duration::from_micros(6235);
+        assert_eq!(next_raster_point(deadline, now, PERIOD), deadline + PERIOD);
+    }
+
+    #[test]
+    fn long_stall_skips_whole_periods_and_lands_in_the_future() {
+        let deadline = Instant::now();
+        let now = deadline + Duration::from_millis(95); // 4.75 periods late
+        let next = next_raster_point(deadline, now, PERIOD);
+        assert_eq!(next, deadline + PERIOD * 5);
+        assert!(next > now);
+    }
+
+    #[test]
+    fn result_is_always_a_whole_number_of_periods_from_the_anchor() {
+        let deadline = Instant::now();
+        for late_us in [0u64, 1, 19_999, 20_000, 20_001, 250_000] {
+            let now = deadline + Duration::from_micros(late_us);
+            let next = next_raster_point(deadline, now, PERIOD);
+            let offset = next.duration_since(deadline).as_nanos();
+            assert_eq!(offset % PERIOD.as_nanos(), 0, "late_us={late_us}");
+            assert!(next > now, "late_us={late_us}");
+        }
     }
 }

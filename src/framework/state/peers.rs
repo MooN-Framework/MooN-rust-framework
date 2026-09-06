@@ -17,7 +17,13 @@ pub enum PeerHealth {
 pub struct PeerInfo {
     pub id: u8,
     pub health: PeerHealth,
+    /// Cycles completed under probation. Derived from `current_seq`
+    /// in `refresh_probation`, never counted up locally.
     pub probation_cycles_ok: u32,
+    /// Cycle counter value at which this peer entered probation.
+    /// Local bookkeeping only, never on the wire: the wire carries
+    /// `probation_cycles_ok`, from which a receiver reconstructs this.
+    pub probation_start_seq: u32,
 }
 
 /// Discovery and management errors.
@@ -56,11 +62,13 @@ impl PeerRoster {
         id: u8,
         health: PeerHealth,
         probation_cycles_ok: u32,
+        current_seq: u32,
     ) -> bool {
         for peer in self.peers.iter_mut() {
             if peer.id == id {
                 peer.health = health;
                 peer.probation_cycles_ok = probation_cycles_ok;
+                peer.probation_start_seq = current_seq.wrapping_sub(probation_cycles_ok);
                 return true;
             }
         }
@@ -103,6 +111,7 @@ impl PeerRoster {
                 id,
                 health: PeerHealth::Alive,
                 probation_cycles_ok: 0,
+                probation_start_seq: 0,
             })
             .expect("push failed despite capacity check");
         Ok(())
@@ -138,11 +147,12 @@ impl PeerRoster {
         transitions
     }
 
-    pub fn readmit(&mut self, peer_id: u8) -> bool {
+    pub fn readmit(&mut self, peer_id: u8, current_seq: u32) -> bool {
         for peer in self.peers.iter_mut() {
             if peer.id == peer_id && peer.health == PeerHealth::Lost {
                 peer.health = PeerHealth::Probation;
                 peer.probation_cycles_ok = 0;
+                peer.probation_start_seq = current_seq;
                 return true;
             }
         }
@@ -156,16 +166,30 @@ impl PeerRoster {
             .count()
     }
 
-    pub fn tick_probation(&mut self, threshold: u32) -> usize {
+    /// Re-derive probation progress from the fabric-agreed cycle
+    /// counter and promote every peer that has served its term.
+    ///
+    /// The progress is a difference against `probation_start_seq`, not
+    /// a locally incremented counter. `current_seq` is part of the
+    /// system-state CRC and therefore identical on all nodes, so every
+    /// node promotes in the same cycle even if one of them took a
+    /// detour through ErrorManagement in between. A local counter would
+    /// drift apart on exactly those paths and surface one phase later
+    /// as an unexplained CRC divergence.
+    pub fn refresh_probation(&mut self, current_seq: u32, threshold: u32) -> usize {
         let mut promoted = 0;
         for peer in self.peers.iter_mut() {
-            if peer.health == PeerHealth::Probation {
-                peer.probation_cycles_ok = peer.probation_cycles_ok.saturating_add(1);
-                if peer.probation_cycles_ok >= threshold {
-                    peer.health = PeerHealth::Alive;
-                    peer.probation_cycles_ok = 0;
-                    promoted += 1;
-                }
+            if peer.health != PeerHealth::Probation {
+                continue;
+            }
+            let elapsed = current_seq.wrapping_sub(peer.probation_start_seq);
+            if elapsed >= threshold {
+                peer.health = PeerHealth::Alive;
+                peer.probation_cycles_ok = 0;
+                peer.probation_start_seq = 0;
+                promoted += 1;
+            } else {
+                peer.probation_cycles_ok = elapsed;
             }
         }
         promoted
@@ -188,5 +212,79 @@ impl PeerRoster {
             }
         }
         min_id
+    }
+}
+
+#[cfg(test)]
+mod probation_tests {
+    //! Probation progress is derived from the fabric-agreed cycle
+    //! counter, not counted locally. These tests pin the property that
+    //! two nodes which evaluate at the same `current_seq` reach the same
+    //! verdict even if they called `refresh_probation` a different
+    //! number of times in between.
+    use super::*;
+
+    const THRESHOLD: u32 = 10;
+
+    fn roster_with_lost_peer() -> PeerRoster {
+        let mut r = PeerRoster::new();
+        r.discover(1, 0, 2).expect("discover");
+        r.discover(2, 0, 2).expect("discover");
+        r.finalize(0, 3).expect("finalize");
+        let mut mask = PeerMask::EMPTY;
+        mask.set(0); // peer id 1 sits in slot 0 after sorting
+        assert_eq!(r.exclude(mask), 1);
+        r
+    }
+
+    #[test]
+    fn readmitted_peer_is_promoted_after_threshold_cycles() {
+        let mut r = roster_with_lost_peer();
+        assert!(r.readmit(1, 100));
+        assert_eq!(r.peers()[0].health, PeerHealth::Probation);
+
+        assert_eq!(r.refresh_probation(105, THRESHOLD), 0);
+        assert_eq!(r.peers()[0].probation_cycles_ok, 5);
+
+        assert_eq!(r.refresh_probation(110, THRESHOLD), 1);
+        assert_eq!(r.peers()[0].health, PeerHealth::Alive);
+    }
+
+    #[test]
+    fn skipped_refresh_calls_do_not_delay_promotion() {
+        // The node that missed intermediate cycles (e.g. because it went
+        // through ErrorManagement) must promote at the same seq as one
+        // that refreshed every cycle. A local counter would lag here.
+        let mut sparse = roster_with_lost_peer();
+        let mut dense = roster_with_lost_peer();
+        assert!(sparse.readmit(1, 100));
+        assert!(dense.readmit(1, 100));
+
+        for seq in 101..=110 {
+            dense.refresh_probation(seq, THRESHOLD);
+        }
+        sparse.refresh_probation(110, THRESHOLD);
+
+        assert_eq!(sparse.peers()[0].health, PeerHealth::Alive);
+        assert_eq!(dense.peers()[0].health, PeerHealth::Alive);
+    }
+
+    #[test]
+    fn snapshot_reconstructs_the_start_seq() {
+        // A rejoining node learns only `probation_cycles_ok` from the
+        // wire and has to derive the anchor from it, otherwise its
+        // promotion cycle drifts against the senders'.
+        let mut r = roster_with_lost_peer();
+        assert!(r.set_peer_from_snapshot(1, PeerHealth::Probation, 4, 100));
+        assert_eq!(r.peers()[0].probation_start_seq, 96);
+        assert_eq!(r.refresh_probation(105, THRESHOLD), 0);
+        assert_eq!(r.refresh_probation(106, THRESHOLD), 1);
+    }
+
+    #[test]
+    fn alive_peers_are_untouched() {
+        let mut r = roster_with_lost_peer();
+        assert_eq!(r.refresh_probation(9_999, THRESHOLD), 0);
+        assert_eq!(r.peers()[1].health, PeerHealth::Alive);
     }
 }
