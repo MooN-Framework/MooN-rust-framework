@@ -1,3 +1,11 @@
+//! One handler per node state.
+//!
+//! Each handler runs its phase to completion and returns the
+//! [`StateEvent`] that describes how it ended. Handlers never decide
+//! the next state themselves, that is `NodeState::next`, and they never
+//! sleep on a fixed duration, they wait until a cycle-anchored
+//! deadline.
+
 use super::PhaseOutcome;
 use crate::framework::config::{MAX_PEERS, MAX_TOTAL_NODES};
 use crate::framework::clock_sync::{extract_sync_fields, ClockSync, SyncFields, SAMPLES_PER_PEER};

@@ -17,8 +17,11 @@ pub const BRAKE_BUILDUP_TIME_S: f64 = 2.5;
 /// One speed band of the deceleration table.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecelerationStage {
+    /// Lower speed bound of the band, inclusive, in m/s.
     pub v_min: f64,
+    /// Upper speed bound of the band, exclusive, in m/s.
     pub v_max: f64,
+    /// Deceleration applied inside the band, in m/s^2.
     pub a: f64,
 }
 
@@ -59,12 +62,18 @@ pub const DECELERATION_STAGES: &[DecelerationStage] = &[
 /// Inputs for one brake curve computation.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct BrakeInput {
+    /// Current speed, in m/s. Must be finite and non-negative.
     pub current_speed: f64,
+    /// Speed to brake down to, in m/s. Must not exceed `current_speed`.
     pub target_speed: f64,
+    /// Distance available before the target point, in metres.
     pub available_distance: f64,
 }
 
 impl BrakeInput {
+    /// Build an input. Validation happens in
+    /// [`compute_braking_curve`], not here, so a deserialized frame and
+    /// a locally built value take the same path.
     pub fn new(current_speed: f64, target_speed: f64, available_distance: f64) -> Self {
         Self {
             current_speed,
@@ -108,8 +117,15 @@ impl CyclePayload for BrakeInput {
 /// and whether the input was valid.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrakeResult {
+    /// Distance needed to reach the target speed, reaction distance
+    /// included, in metres.
     pub total_distance: f64,
+    /// True when `total_distance` meets or exceeds the available
+    /// distance, so the service brake is not sufficient.
     pub emergency_brake: bool,
+    /// False when the inputs were out of spec and no curve was
+    /// computed. The sink treats this as a fault, not as a normal
+    /// decision.
     pub valid_entry: bool,
 }
 
@@ -128,9 +144,14 @@ impl BrakeResult {
 /// or a target speed that exceeds the current speed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BrakeError {
+    /// At least one input was NaN or infinite.
     NotFinite,
+    /// A speed was negative.
     NegativeSpeed,
+    /// The available distance was negative.
     NegativeDistance,
+    /// The target speed was above the current speed, which is an
+    /// acceleration request, not a braking request.
     TargetAboveCurrent,
 }
 
@@ -208,4 +229,145 @@ fn compute_braking_distance(v_start: f64, v_target: f64) -> f64 {
         }
     }
     distance
+}
+
+#[cfg(test)]
+mod braking_curve_tests {
+    //! The braking curve is the safety function of the demo domain.
+    //! Its validation gate and its stage boundaries are pinned here,
+    //! including the exact comparison that decides between service
+    //! brake and emergency brake.
+    use super::*;
+
+    fn curve(current: f64, target: f64, available: f64) -> Result<BrakeResult, BrakeError> {
+        compute_braking_curve(BrakeInput::new(current, target, available))
+    }
+
+    #[test]
+    fn reaction_distance_is_always_added() {
+        // Standing still still costs the buildup time times zero speed,
+        // so the distance is zero, but the call must succeed.
+        let r = curve(0.0, 0.0, 100.0).expect("valid");
+        assert_eq!(r.total_distance, 0.0);
+        assert!(r.valid_entry);
+        assert!(!r.emergency_brake);
+    }
+
+    #[test]
+    fn braking_inside_one_stage_matches_the_closed_form() {
+        // 5 m/s lies entirely in the 0..10 stage with a = 1.0.
+        let r = curve(5.0, 0.0, 1000.0).expect("valid");
+        let expected = 5.0 * BRAKE_BUILDUP_TIME_S + (5.0 * 5.0) / (2.0 * 1.0);
+        assert!((r.total_distance - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_speed_reduction_means_reaction_distance_only() {
+        let r = curve(3.0, 3.0, 100.0).expect("valid");
+        assert!((r.total_distance - 3.0 * BRAKE_BUILDUP_TIME_S).abs() < 1e-9);
+    }
+
+    #[test]
+    fn braking_across_stages_sums_each_band_with_its_own_rate() {
+        // 15 m/s spans the 10..20 band (a = 0.9) down to 10, then the
+        // 0..10 band (a = 1.0) down to standstill.
+        let r = curve(15.0, 0.0, 10_000.0).expect("valid");
+        let upper = (15.0f64 * 15.0 - 10.0 * 10.0) / (2.0 * 0.9);
+        let lower = (10.0f64 * 10.0) / (2.0 * 1.0);
+        let expected = 15.0 * BRAKE_BUILDUP_TIME_S + upper + lower;
+        assert!((r.total_distance - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_speed_exactly_on_a_stage_boundary_uses_the_lower_band() {
+        // v_max is exclusive: at exactly 10 m/s the 10..20 band
+        // contributes nothing, otherwise the distance would be counted
+        // twice at every boundary.
+        let r = curve(10.0, 0.0, 10_000.0).expect("valid");
+        let expected = 10.0 * BRAKE_BUILDUP_TIME_S + (10.0f64 * 10.0) / (2.0 * 1.0);
+        assert!((r.total_distance - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn partial_deceleration_stops_at_the_target_speed() {
+        let r = curve(15.0, 12.0, 10_000.0).expect("valid");
+        let expected = 15.0 * BRAKE_BUILDUP_TIME_S + (15.0f64 * 15.0 - 12.0 * 12.0) / (2.0 * 0.9);
+        assert!((r.total_distance - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_open_ended_top_stage_is_reachable() {
+        // The last band runs to infinity, so a high speed must not fall
+        // off the end of the table and silently return a short distance.
+        let r = curve(80.0, 0.0, 100_000.0).expect("valid");
+        assert!(r.total_distance > 80.0 * BRAKE_BUILDUP_TIME_S);
+        assert!(r.total_distance.is_finite());
+    }
+
+    #[test]
+    fn emergency_triggers_when_the_distance_is_exactly_used_up() {
+        // The comparison is `>=`: needing exactly the available
+        // distance leaves no margin and must already be an emergency.
+        let needed = curve(5.0, 0.0, 1e9).expect("valid").total_distance;
+        assert!(curve(5.0, 0.0, needed).expect("valid").emergency_brake);
+        assert!(
+            !curve(5.0, 0.0, needed + 1e-6)
+                .expect("valid")
+                .emergency_brake
+        );
+    }
+
+    #[test]
+    fn invalid_inputs_are_rejected_by_category() {
+        assert_eq!(curve(f64::NAN, 0.0, 10.0), Err(BrakeError::NotFinite));
+        assert_eq!(curve(1.0, f64::NAN, 10.0), Err(BrakeError::NotFinite));
+        assert_eq!(curve(1.0, 0.0, f64::NAN), Err(BrakeError::NotFinite));
+        assert_eq!(curve(f64::INFINITY, 0.0, 10.0), Err(BrakeError::NotFinite));
+        assert_eq!(curve(-1.0, 0.0, 10.0), Err(BrakeError::NegativeSpeed));
+        assert_eq!(curve(1.0, -1.0, 10.0), Err(BrakeError::NegativeSpeed));
+        assert_eq!(curve(1.0, 0.0, -1.0), Err(BrakeError::NegativeDistance));
+        assert_eq!(curve(1.0, 2.0, 10.0), Err(BrakeError::TargetAboveCurrent));
+    }
+
+    #[test]
+    fn validation_order_reports_the_coarsest_fault_first() {
+        // A NaN speed combined with a negative distance is reported as
+        // NotFinite, because a non-finite value makes every later
+        // comparison meaningless.
+        assert_eq!(curve(f64::NAN, 0.0, -1.0), Err(BrakeError::NotFinite));
+    }
+
+    #[test]
+    fn the_stage_table_is_contiguous_and_ordered() {
+        // A gap or an overlap in the table would silently drop or
+        // double-count a speed band at runtime.
+        let mut previous_max = 0.0;
+        for stage in DECELERATION_STAGES {
+            assert_eq!(stage.v_min, previous_max, "gap or overlap at {stage:?}");
+            assert!(stage.v_max > stage.v_min);
+            assert!(stage.a > 0.0, "a deceleration rate of zero divides by zero");
+            previous_max = stage.v_max;
+        }
+        assert_eq!(previous_max, f64::INFINITY, "table must be open ended");
+    }
+
+    #[test]
+    fn brake_input_round_trips_on_the_wire() {
+        let input = BrakeInput::new(12.5, 3.25, 800.0);
+        let mut buf = [0u8; BrakeInput::WIRE_SIZE];
+        let mut w = WireWriter::new(&mut buf);
+        input.to_wire(&mut w);
+        assert_eq!(w.written(), BrakeInput::WIRE_SIZE);
+
+        let mut r = WireReader::new(&buf);
+        assert_eq!(BrakeInput::from_wire(&mut r), Ok(input));
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn a_truncated_brake_input_is_rejected() {
+        let buf = [0u8; BrakeInput::WIRE_SIZE - 1];
+        let mut r = WireReader::new(&buf);
+        assert_eq!(BrakeInput::from_wire(&mut r), Err(PayloadError::TooShort));
+    }
 }

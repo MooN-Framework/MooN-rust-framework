@@ -1,3 +1,14 @@
+//! The generic phase loop.
+//!
+//! Every waiting phase is the same shape: broadcast periodically, watch
+//! for a completion condition, give up at a deadline. `collect_phase`
+//! implements that once and takes the three differing parts as
+//! closures.
+//!
+//! The loop also answers incoming time-sync requests transparently, so
+//! a peer that is still synchronising does not stall while everyone
+//! else is busy in a cycle phase.
+
 use crate::framework::clock_sync::{extract_sync_fields, SyncFields};
 use crate::framework::state::PeerHealth;
 use crate::framework::traits::{

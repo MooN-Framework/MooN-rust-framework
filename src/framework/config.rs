@@ -1,10 +1,29 @@
+//! Configuration: the file on disk and the typed values derived from it.
+//!
+//! A node is configured entirely by one TOML file. [`NodeConfig`] is the
+//! literal file layout, and the `participants`, `timing`, `transport`
+//! and `diagnostic` accessors project it onto the value types the
+//! framework works with, validating as they go.
+//!
+//! The file carries its own SHA-256 in an `[integrity]` section, and
+//! [`NodeConfig::verify_and_parse`] refuses to load a file whose digest
+//! does not match. The digest is computed over a canonical form, so
+//! comments, whitespace and key order do not affect it, while every
+//! value does. Regenerate it with `python -m harness.config_gen` after
+//! any edit.
+
 use serde::Deserialize;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use sha2::{Digest, Sha256};
 
+/// Hard upper bound on nodes in one fabric. Sets the width of every
+/// peer mask, so it cannot exceed 8 without changing the wire format.
 pub const MAX_TOTAL_NODES: usize = 8;
+/// Hard upper bound on peers, own node excluded. Sizes every per-peer
+/// buffer.
 pub const MAX_PEERS: usize = MAX_TOTAL_NODES - 1;
+/// Capacity of the dissenter list a voter may report in one cycle.
 pub const MAX_DISSENTERS: usize = 16;
 
 /// Upper bound on the wire size of a single `ApplicationData` snapshot.
@@ -18,14 +37,26 @@ pub const MAX_DISSENTERS: usize = 16;
 /// compile time inside `UdpFrame`.
 pub const MAX_APPLICATION_DATA_SIZE: usize = 64;
 
+/// Node counts and the probation term.
 #[derive(Debug, Clone, Copy)]
 pub struct ParticipantConfig {
+    /// Nodes expected at startup. Discovery does not close below this.
     pub nominal_participants: u8,
+    /// Safety floor on active nodes. Dropping below it is failsafe.
     pub min_participants: u8,
+    /// Cycles a readmitted node serves before it votes again.
     pub probation_cycles: u32,
 }
 
 impl ParticipantConfig {
+    /// Build a participant configuration.
+    ///
+    /// # Panics
+    ///
+    /// If `minimum` is zero, exceeds `nominal`, or `nominal` exceeds
+    /// [`MAX_TOTAL_NODES`]. This runs at startup, before the node joins
+    /// the fabric, so a misconfiguration stops the process rather than
+    /// producing a silently degraded system.
     pub fn new(minimum: u8, nominal: u8, probation_cycles: u32) -> Self {
         assert!(minimum >= 1, "min_participants must be >= 1");
         assert!(
@@ -43,10 +74,13 @@ impl ParticipantConfig {
         }
     }
 
+    /// Node failures the configuration can absorb before the fabric
+    /// falls below its floor.
     pub fn tolerable_failures(&self) -> u8 {
         self.nominal_participants - self.min_participants
     }
 
+    /// Peers this node expects, own node excluded.
     pub fn max_peers(&self) -> usize {
         (self.nominal_participants - 1) as usize
     }
@@ -73,34 +107,57 @@ impl ParticipantConfig {
 /// It must be smaller than every timeout. 1 ms is a safe default.
 #[derive(Debug, Clone, Copy)]
 pub struct CycleTiming {
-    // Cycle scheduling.
+    /// Wall-clock length of one cycle.
     pub cycle_duration: Duration,
 
-    // In-cycle phase deadlines (offsets from cycle anchor).
+    /// Deadline for ShareInputs, as an offset from the cycle anchor.
     pub share_inputs_offset: Duration,
+    /// Deadline for ShareResult, as an offset from the cycle anchor.
     pub share_result_offset: Duration,
+    /// Deadline for SendAck, as an offset from the cycle anchor.
     pub send_ack_offset: Duration,
+    /// Deadline for the CRC exchange, as an offset from the cycle
+    /// anchor. Must still fit inside `cycle_duration`.
     pub crc_offset: Duration,
 
-    // Non-cycle phase timeouts (relative to phase entry).
+    /// How long discovery may take before the node gives up.
     pub init_sync_timeout: Duration,
+    /// How long one clock-sync round may take.
     pub clock_sync_timeout: Duration,
+    /// How long the cycle barrier waits for the last beacon.
     pub cycle_sync_timeout: Duration,
+    /// How long the exclusion vote waits for the last proposal.
     pub error_mgmt_timeout: Duration,
+    /// How long the snapshot exchange may take.
     pub state_sync_timeout: Duration,
+    /// Patience of the node that is coming back. Needs the most
+    /// headroom, since cold-start latency dominates here.
     pub resync_returning_timeout: Duration,
+    /// Patience of an established node waiting on the returning peer.
     pub resync_healthy_timeout: Duration,
 
-    // Universal retransmit interval for collect_phase loops.
+    /// Retransmit interval used by every waiting phase. Must be
+    /// strictly smaller than the shortest timeout above.
     pub send_interval: Duration,
 
-    // Misc.
+    /// Age past which a received frame is discarded as stale, measured
+    /// against the sender's clock after offset translation.
     pub stale_frame_threshold: Duration,
+    /// Cycles between two clock-sync rounds.
     pub resync_interval_cycles: u32,
 }
 
 impl CycleTiming {
     /// Validate timing at startup. Panics on inconsistency.
+    /// Check the ordering invariants.
+    ///
+    /// # Panics
+    ///
+    /// If the in-cycle offsets are not strictly increasing, if the last
+    /// offset does not fit inside the cycle, or if `send_interval` is
+    /// not below every timeout. A phase whose retransmit interval
+    /// reaches its timeout would expire before it ever retransmitted,
+    /// which is indistinguishable from a silent peer in the logs.
     pub fn validate(&self) {
         // In-cycle offsets strictly monotonic and fit into the cycle.
         assert!(
@@ -142,21 +199,35 @@ impl CycleTiming {
     }
 }
 
+/// Everything the operational multicast socket needs.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
+    /// Interface to bind and join the multicast group on.
     pub interface_name: String,
+    /// Operational multicast group.
     pub multicast_group: Ipv4Addr,
+    /// Operational UDP port.
     pub port: u16,
+    /// This node's id, written into every frame header.
     pub self_node_id: u8,
+    /// Session id for this process run. Lets peers tell a restart apart
+    /// from a sequence gap.
     pub self_session_id: u64,
+    /// Sequence number the first outgoing frame carries.
     pub initial_seq_num: u32,
 }
 
+/// Everything the diagnostic socket needs. Only read in builds with the
+/// `diagnostic` feature.
 #[derive(Debug, Clone)]
 pub struct DiagnosticConfig {
+    /// Whether to open the diagnostic socket at all.
     pub enabled: bool,
+    /// Interface to bind the diagnostic socket on.
     pub interface_name: String,
+    /// Diagnostic multicast group, separate from the operational one.
     pub multicast_group: Ipv4Addr,
+    /// Diagnostic UDP port.
     pub port: u16,
 }
 
@@ -171,61 +242,103 @@ impl Default for DiagnosticConfig {
     }
 }
 
+/// The configuration file as it appears on disk.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeConfig {
+    /// This node's id. Must be unique in the fabric.
     pub own_id: u8,
+    /// `[participants]` section.
     pub participants: ParticipantSection,
+    /// `[timing]` section.
     pub timing: TimingSection,
+    /// `[transport]` section.
     pub transport: TransportSection,
+    /// `[diagnostic]` section.
     pub diagnostic: DiagnosticSection,
 }
 
+/// `[participants]`: node counts and probation term.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParticipantSection {
+    /// Nodes expected at startup.
     pub nominal: u8,
+    /// Safety floor on active nodes.
     pub minimum: u8,
+    /// Cycles a readmitted node serves before it votes again.
     pub probation_cycles: u32,
 }
 
+/// `[timing]`: all durations in milliseconds. See [`CycleTiming`] for
+/// what each one governs and how they have to be ordered.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TimingSection {
+    /// Cycle length.
     pub cycle_duration_ms: u64,
 
+    /// ShareInputs deadline, offset from the cycle anchor.
     pub share_inputs_offset_ms: u64,
+    /// ShareResult deadline, offset from the cycle anchor.
     pub share_result_offset_ms: u64,
+    /// SendAck deadline, offset from the cycle anchor.
     pub send_ack_offset_ms: u64,
+    /// CRC exchange deadline, offset from the cycle anchor.
     pub crc_offset_ms: u64,
 
+    /// Discovery timeout.
     pub init_sync_timeout_ms: u64,
+    /// Clock-sync round timeout.
     pub clock_sync_timeout_ms: u64,
+    /// Cycle barrier timeout.
     pub cycle_sync_timeout_ms: u64,
+    /// Exclusion vote timeout.
     pub error_mgmt_timeout_ms: u64,
+    /// Snapshot exchange timeout.
     pub state_sync_timeout_ms: u64,
+    /// Rejoin timeout on the returning node.
     pub resync_returning_timeout_ms: u64,
+    /// Rejoin timeout on an established node.
     pub resync_healthy_timeout_ms: u64,
 
+    /// Retransmit interval for every waiting phase.
     pub send_interval_ms: u64,
 
+    /// Age past which a received frame counts as stale.
     pub stale_frame_threshold_ms: u64,
+    /// Cycles between two clock-sync rounds.
     pub resync_interval_cycles: u32,
 }
 
+/// `[transport]`: the operational multicast channel.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TransportSection {
+    /// Interface name, e.g. `eth0`. Needs an IPv4 address.
     pub interface: String,
+    /// Multicast group, e.g. `239.10.0.1`.
     pub multicast_group: Ipv4Addr,
+    /// UDP port.
     pub port: u16,
 }
 
+/// `[diagnostic]`: the diagnostic channel, ignored in production
+/// builds.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiagnosticSection {
+    /// Whether to open the diagnostic socket.
     pub enabled: bool,
+    /// Interface name for the diagnostic socket.
     pub interface: String,
+    /// Diagnostic multicast group, separate from the operational one.
     pub multicast_group: Ipv4Addr,
+    /// Diagnostic UDP port.
     pub port: u16,
 }
 
 impl NodeConfig {
+    /// Participant counts as a validated [`ParticipantConfig`].
+    ///
+    /// # Panics
+    ///
+    /// Via [`ParticipantConfig::new`] if the counts are inconsistent.
     pub fn participants(&self) -> ParticipantConfig {
         ParticipantConfig::new(
             self.participants.minimum,
@@ -234,6 +347,12 @@ impl NodeConfig {
         )
     }
 
+        /// Verify the `[integrity]` digest, then parse.
+        ///
+        /// The digest is computed over a canonical form of the document
+        /// with the `[integrity]` section removed, so formatting is
+        /// irrelevant and every value counts. A file that does not
+        /// verify is rejected rather than loaded with a warning.
         pub fn verify_and_parse(text: &str) -> Result<Self, ConfigError> {
         // 1. Parse into a generic toml::Value so we can walk the tree
         //    for the canonical form BEFORE deserializing.
@@ -278,6 +397,11 @@ impl NodeConfig {
             .map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
+    /// Timing as a validated [`CycleTiming`].
+    ///
+    /// # Panics
+    ///
+    /// Via [`CycleTiming::validate`] if the deadlines are inconsistent.
     pub fn timing(&self) -> CycleTiming {
         let t = &self.timing;
         let ms = Duration::from_millis;
@@ -306,6 +430,8 @@ impl NodeConfig {
         ct
     }
 
+    /// Transport settings for this run. `self_session_id` is generated
+    /// per process start and is what lets peers detect a restart.
     pub fn transport(&self, self_session_id: u64) -> TransportConfig {
         TransportConfig {
             interface_name: self.transport.interface.clone(),
@@ -317,6 +443,7 @@ impl NodeConfig {
         }
     }
 
+    /// Diagnostic socket settings.
     pub fn diagnostic(&self) -> DiagnosticConfig {
         DiagnosticConfig {
             enabled: self.diagnostic.enabled,
@@ -327,9 +454,12 @@ impl NodeConfig {
     }
 }
 
+/// `[integrity]`: the self-check on the configuration file.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IntegritySection {
+    /// Digest algorithm. Only `sha256` is accepted.
     pub algo: String,
+    /// Lower-case hex digest over the canonical form of the file.
     pub checksum: String,
 }
 
@@ -420,13 +550,27 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
+/// Why a configuration file was rejected.
 #[derive(Debug)]
 pub enum ConfigError {
+    /// The file is not valid TOML, or does not match the expected
+    /// schema.
     Parse(String),
+    /// No `[integrity]` section. Unsigned configurations are not
+    /// accepted.
     MissingIntegrity,
+    /// The named `[integrity]` field is missing or has the wrong type.
     MissingIntegrityField(&'static str),
+    /// The file asks for a digest algorithm this build does not
+    /// implement.
     UnsupportedAlgo(String),
-    ChecksumMismatch { expected: String, actual: String },
+    /// The digest does not match the file contents.
+    ChecksumMismatch {
+        /// Digest recorded in the file.
+        expected: String,
+        /// Digest computed from the file contents.
+        actual: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -447,3 +591,300 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+#[cfg(test)]
+mod config_integrity_tests {
+    //! `verify_and_parse` is the config-side integrity check. Two
+    //! properties carry it: the digest must react to every value in the
+    //! file, and it must not react to anything that is pure formatting,
+    //! otherwise reformatting a config silently bricks a node.
+    use super::*;
+
+    /// A complete config without the `[integrity]` section.
+    const BODY: &str = r#"
+own_id = 0
+
+[participants]
+nominal          = 3
+minimum          = 2
+probation_cycles = 10
+
+[timing]
+cycle_duration_ms = 20
+
+share_inputs_offset_ms = 5
+share_result_offset_ms = 10
+send_ack_offset_ms     = 14
+crc_offset_ms          = 17
+
+init_sync_timeout_ms        = 15000
+clock_sync_timeout_ms       = 500
+cycle_sync_timeout_ms       = 10
+error_mgmt_timeout_ms       = 20
+state_sync_timeout_ms       = 500
+resync_returning_timeout_ms = 5000
+resync_healthy_timeout_ms   = 500
+
+send_interval_ms         = 1
+stale_frame_threshold_ms = 100
+resync_interval_cycles   = 500
+
+[transport]
+interface       = "lo"
+multicast_group = "239.10.0.1"
+port            = 5555
+
+[diagnostic]
+enabled         = true
+interface       = "lo"
+multicast_group = "239.10.0.2"
+port            = 6666
+"#;
+
+    /// Digest over the canonical form of `body`, as the generator
+    /// computes it.
+    fn digest_of(body: &str) -> String {
+        let value: toml::Value = toml::from_str(body).expect("body parses");
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_bytes(&value));
+        hex_lower(&hasher.finalize())
+    }
+
+    /// `body` plus a matching `[integrity]` section.
+    fn signed(body: &str) -> String {
+        format!(
+            "{body}\n[integrity]\nalgo = \"sha256\"\nchecksum = \"{}\"\n",
+            digest_of(body)
+        )
+    }
+
+    #[test]
+    fn a_correctly_signed_config_parses() {
+        let cfg = NodeConfig::verify_and_parse(&signed(BODY)).expect("verifies");
+        assert_eq!(cfg.own_id, 0);
+        assert_eq!(cfg.participants.nominal, 3);
+        assert_eq!(cfg.transport.port, 5555);
+    }
+
+    #[test]
+    fn a_tampered_value_is_rejected() {
+        let tampered = signed(BODY).replace("minimum          = 2", "minimum          = 1");
+        match NodeConfig::verify_and_parse(&tampered) {
+            Err(ConfigError::ChecksumMismatch { .. }) => {}
+            other => panic!("tampering went undetected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_section_contributes_to_the_digest() {
+        // Walked explicitly so a future refactor of `canonical_bytes`
+        // cannot quietly drop a subtree from the hash.
+        let mutations = [
+            ("own_id = 0", "own_id = 1"),
+            ("nominal          = 3", "nominal          = 4"),
+            ("cycle_duration_ms = 20", "cycle_duration_ms = 21"),
+            ("port            = 5555", "port            = 5556"),
+            ("enabled         = true", "enabled         = false"),
+        ];
+        let baseline = digest_of(BODY);
+        for (from, to) in mutations {
+            let mutated = BODY.replace(from, to);
+            assert_ne!(mutated, BODY, "mutation {from:?} did not apply");
+            assert_ne!(digest_of(&mutated), baseline, "{from:?} left the digest untouched");
+        }
+    }
+
+    #[test]
+    fn formatting_does_not_change_the_digest() {
+        // Comments, whitespace and key order are not part of the
+        // canonical form. If they were, every hand-reformatted config
+        // would fail the check at boot for no substantive reason.
+        let commented = format!("# generated, do not edit\n{BODY}\n# trailing note\n");
+        assert_eq!(digest_of(&commented), digest_of(BODY));
+
+        let respaced = BODY.replace("          = ", " = ").replace("       = ", " = ");
+        assert_eq!(digest_of(&respaced), digest_of(BODY));
+
+        let reordered = BODY.replace(
+            "nominal          = 3\nminimum          = 2",
+            "minimum          = 2\nnominal          = 3",
+        );
+        assert_eq!(digest_of(&reordered), digest_of(BODY));
+    }
+
+    #[test]
+    fn the_integrity_section_itself_is_excluded_from_the_digest() {
+        // Otherwise the checksum would have to hash itself.
+        let with_extra = format!(
+            "{BODY}\n[integrity]\nalgo = \"sha256\"\nchecksum = \"{}\"\nnote = \"ignored\"\n",
+            digest_of(BODY)
+        );
+        assert!(NodeConfig::verify_and_parse(&with_extra).is_ok());
+    }
+
+    #[test]
+    fn a_missing_integrity_section_is_rejected() {
+        match NodeConfig::verify_and_parse(BODY) {
+            Err(ConfigError::MissingIntegrity) => {}
+            other => panic!("unsigned config accepted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_integrity_fields_are_named() {
+        let no_checksum = format!("{BODY}\n[integrity]\nalgo = \"sha256\"\n");
+        match NodeConfig::verify_and_parse(&no_checksum) {
+            Err(ConfigError::MissingIntegrityField("checksum")) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let no_algo = format!("{BODY}\n[integrity]\nchecksum = \"00\"\n");
+        match NodeConfig::verify_and_parse(&no_algo) {
+            Err(ConfigError::MissingIntegrityField("algo")) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unsupported_algorithm_is_refused_not_skipped() {
+        let md5 = format!(
+            "{BODY}\n[integrity]\nalgo = \"md5\"\nchecksum = \"{}\"\n",
+            digest_of(BODY)
+        );
+        match NodeConfig::verify_and_parse(&md5) {
+            Err(ConfigError::UnsupportedAlgo(a)) => assert_eq!(a, "md5"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_toml_is_reported_as_a_parse_error() {
+        match NodeConfig::verify_and_parse("own_id = ") {
+            Err(ConfigError::Parse(_)) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_shipped_node_configs_verify() {
+        // Guards against a config being edited without regenerating the
+        // checksum, which a node would only report at boot time.
+        for (name, text) in [
+            ("node_0.toml", include_str!("../../configs/node_0.toml")),
+            ("node_1.toml", include_str!("../../configs/node_1.toml")),
+            ("node_2.toml", include_str!("../../configs/node_2.toml")),
+        ] {
+            NodeConfig::verify_and_parse(text)
+                .unwrap_or_else(|e| panic!("{name} failed verification: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_shipped_timing_passes_validation() {
+        let cfg = NodeConfig::verify_and_parse(&signed(BODY)).expect("verifies");
+        cfg.timing().validate();
+    }
+}
+
+#[cfg(test)]
+mod timing_validation_tests {
+    //! `CycleTiming::validate` is the startup gate that keeps the
+    //! in-cycle deadlines ordered. Each assertion is probed separately,
+    //! because a panic message only tells you which one fired if there
+    //! is a test that made it fire on purpose.
+    use super::*;
+
+    fn ms(v: u64) -> Duration {
+        Duration::from_millis(v)
+    }
+
+    fn sane() -> CycleTiming {
+        CycleTiming {
+            cycle_duration: ms(20),
+            share_inputs_offset: ms(5),
+            share_result_offset: ms(10),
+            send_ack_offset: ms(14),
+            crc_offset: ms(17),
+            init_sync_timeout: ms(15_000),
+            clock_sync_timeout: ms(500),
+            cycle_sync_timeout: ms(10),
+            error_mgmt_timeout: ms(20),
+            state_sync_timeout: ms(500),
+            resync_returning_timeout: ms(5_000),
+            resync_healthy_timeout: ms(500),
+            send_interval: ms(1),
+            stale_frame_threshold: ms(100),
+            resync_interval_cycles: 500,
+        }
+    }
+
+    #[test]
+    fn a_sane_configuration_validates() {
+        sane().validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "share_inputs_offset must precede share_result_offset")]
+    fn input_and_result_offsets_must_be_ordered() {
+        let mut t = sane();
+        t.share_inputs_offset = t.share_result_offset;
+        t.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "share_result_offset must precede send_ack_offset")]
+    fn result_and_ack_offsets_must_be_ordered() {
+        let mut t = sane();
+        t.share_result_offset = ms(15);
+        t.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "send_ack_offset must precede crc_offset")]
+    fn ack_and_crc_offsets_must_be_ordered() {
+        let mut t = sane();
+        t.send_ack_offset = ms(18);
+        t.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "crc_offset must fit into cycle_duration")]
+    fn the_last_offset_must_fit_into_the_cycle() {
+        let mut t = sane();
+        t.crc_offset = t.cycle_duration;
+        t.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "send_interval")]
+    fn send_interval_must_be_below_every_timeout() {
+        // If the retransmit interval reaches the shortest timeout, the
+        // phase times out before it ever retransmits, which looks like
+        // a silent peer in the logs.
+        let mut t = sane();
+        t.send_interval = t.cycle_sync_timeout;
+        t.validate();
+    }
+
+    #[test]
+    fn participant_config_derives_its_margins() {
+        let p = ParticipantConfig::new(2, 3, 10);
+        assert_eq!(p.tolerable_failures(), 1);
+        assert_eq!(p.max_peers(), 2);
+
+        let p = ParticipantConfig::new(2, 4, 10);
+        assert_eq!(p.tolerable_failures(), 2);
+        assert_eq!(p.max_peers(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not exceed nominal")]
+    fn minimum_above_nominal_is_rejected() {
+        ParticipantConfig::new(4, 3, 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds MAX_TOTAL_NODES")]
+    fn more_nodes_than_the_buffers_hold_is_rejected() {
+        ParticipantConfig::new(2, MAX_TOTAL_NODES as u8 + 1, 10);
+    }
+}

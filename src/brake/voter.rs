@@ -39,7 +39,11 @@ impl CyclePayload for BrakeResult {
 /// exactly and total distances are within `distance_tolerance`.
 #[derive(Debug, Clone, Copy)]
 pub struct BrakeVoter {
+    /// Safety floor on agreeing values, independent of how many nodes
+    /// are still active.
     pub min_participants: u8,
+    /// Maximum accepted difference between two braking distances, in
+    /// metres, for them to count as the same value.
     pub distance_tolerance: f64,
 }
 
@@ -178,5 +182,198 @@ impl crate::framework::traits::Corruptible for BrakeResult {
         // flippen, damit auch bei tolerance=inf der Boolean-Gate greift.
         self.total_distance += 10_000.0;
         self.emergency_brake = !self.emergency_brake;
+    }
+}
+#[cfg(test)]
+mod brake_voter_tests {
+    //! The voter turns N candidate results into one decision, so its
+    //! failure modes are the interesting part: an even split must never
+    //! resolve to one of the halves, a missing majority must surface as
+    //! Disagreement rather than as a decision, and NaN must never
+    //! compare equal to anything.
+    use super::*;
+    use crate::framework::traits::{Voter, VotingOutcome};
+
+    const TOLERANCE: f64 = 0.5;
+
+    fn voter() -> BrakeVoter {
+        BrakeVoter::new(2, TOLERANCE)
+    }
+
+    fn result(distance: f64) -> BrakeResult {
+        BrakeResult {
+            total_distance: distance,
+            emergency_brake: false,
+            valid_entry: true,
+        }
+    }
+
+    fn consensus(outcome: VotingOutcome<BrakeResult>) -> BrakeResult {
+        match outcome {
+            VotingOutcome::Consensus(d) => d,
+            other => panic!("expected consensus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn three_agreeing_nodes_reach_consensus() {
+        let out = voter().decide(&result(100.0), &[Some(result(100.1)), Some(result(99.9))]);
+        assert!((consensus(out).total_distance - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_representative_is_the_median_not_the_first_value() {
+        // Picking the first element would let the node that happens to
+        // be lowest-numbered steer the published value.
+        let out = voter().decide(&result(10.0), &[Some(result(10.4)), Some(result(9.7))]);
+        assert!((consensus(out).total_distance - 10.0).abs() < 1e-9);
+
+        let out = voter().decide(&result(9.7), &[Some(result(10.4)), Some(result(10.0))]);
+        assert!((consensus(out).total_distance - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_two_against_two_split_never_decides() {
+        // Four nodes, two values. Neither group reaches the strict
+        // majority of three, so the outcome has to be Disagreement and
+        // the caller routes to error management. Returning either half
+        // would publish a value half the fabric rejects.
+        let out = voter().decide(
+            &result(100.0),
+            &[Some(result(100.0)), Some(result(200.0)), Some(result(200.0))],
+        );
+        assert_eq!(out, VotingOutcome::Disagreement);
+    }
+
+    #[test]
+    fn three_of_four_agreeing_still_decides() {
+        let out = voter().decide(
+            &result(100.0),
+            &[Some(result(100.0)), Some(result(100.0)), Some(result(200.0))],
+        );
+        assert!((consensus(out).total_distance - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn too_few_responses_report_insufficient_quorum() {
+        let out = voter().decide(&result(100.0), &[None, None]);
+        assert_eq!(out, VotingOutcome::InsufficientQuorum);
+    }
+
+    #[test]
+    fn the_tolerance_boundary_is_inclusive() {
+        let v = voter();
+        // Exactly at the tolerance the two values still count as one
+        // measurement, one ulp beyond it they do not.
+        let at = v.decide(&result(1.0), &[Some(result(1.0 + TOLERANCE)), None]);
+        assert!(matches!(at, VotingOutcome::Consensus(_)));
+
+        let beyond = v.decide(&result(1.0), &[Some(result(1.0 + TOLERANCE * 2.0)), None]);
+        assert_eq!(beyond, VotingOutcome::Disagreement);
+    }
+
+    #[test]
+    fn differing_flags_break_agreement_regardless_of_distance() {
+        // The booleans are the actual safety decision, so a matching
+        // distance must not paper over a diverging emergency flag.
+        let mut flipped = result(100.0);
+        flipped.emergency_brake = true;
+        let out = voter().decide(&result(100.0), &[Some(flipped), None]);
+        assert_eq!(out, VotingOutcome::Disagreement);
+
+        let mut invalid = result(100.0);
+        invalid.valid_entry = false;
+        let out = voter().decide(&result(100.0), &[Some(invalid), None]);
+        assert_eq!(out, VotingOutcome::Disagreement);
+    }
+
+    #[test]
+    fn nan_agrees_with_nothing_including_itself() {
+        // Two healthy nodes must still reach consensus while the third
+        // delivers NaN, and two NaN values must not form a group.
+        let out = voter().decide(
+            &result(f64::NAN),
+            &[Some(result(50.0)), Some(result(50.0))],
+        );
+        assert!((consensus(out).total_distance - 50.0).abs() < 1e-9);
+
+        let out = voter().decide(&result(f64::NAN), &[Some(result(f64::NAN)), None]);
+        assert_eq!(out, VotingOutcome::Disagreement);
+    }
+
+    #[test]
+    fn dissenters_are_reported_by_roster_slot() {
+        let decision = result(100.0);
+        let peers = [Some(result(100.2)), None, Some(result(500.0))];
+        let (own_dissented, dissenters) = voter().find_dissenters(&result(100.0), &peers, &decision);
+
+        assert!(!own_dissented);
+        assert_eq!(dissenters.as_slice(), &[2]);
+    }
+
+    #[test]
+    fn own_dissent_is_reported_separately() {
+        // The node has to notice that it is the outlier itself,
+        // otherwise a locally corrupted result never reaches the
+        // exclusion vote.
+        let decision = result(100.0);
+        let peers = [Some(result(100.0)), Some(result(100.0))];
+        let (own_dissented, dissenters) = voter().find_dissenters(&result(900.0), &peers, &decision);
+
+        assert!(own_dissented);
+        assert!(dissenters.is_empty());
+    }
+
+    #[test]
+    fn a_silent_peer_is_not_a_dissenter() {
+        let decision = result(100.0);
+        let peers = [None, None];
+        let (_, dissenters) = voter().find_dissenters(&result(100.0), &peers, &decision);
+        assert!(dissenters.is_empty());
+    }
+
+    #[test]
+    fn required_participants_is_reported_unchanged() {
+        assert_eq!(BrakeVoter::new(3, 1.0).required_participants(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "min_participants")]
+    fn zero_participants_is_rejected_at_construction() {
+        BrakeVoter::new(0, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "distance_tolerance")]
+    fn a_nan_tolerance_is_rejected_at_construction() {
+        // A NaN tolerance would make every comparison false and turn
+        // the voter into a permanent Disagreement source.
+        BrakeVoter::new(2, f64::NAN);
+    }
+
+    #[test]
+    fn brake_result_round_trips_on_the_wire() {
+        let value = BrakeResult {
+            total_distance: 1234.5,
+            emergency_brake: true,
+            valid_entry: false,
+        };
+        let mut buf = [0u8; BrakeResult::WIRE_SIZE];
+        let mut w = WireWriter::new(&mut buf);
+        value.to_wire(&mut w);
+        assert_eq!(w.written(), BrakeResult::WIRE_SIZE);
+
+        let mut r = WireReader::new(&buf);
+        assert_eq!(BrakeResult::from_wire(&mut r), Ok(value));
+    }
+
+    #[test]
+    fn a_non_boolean_flag_byte_is_rejected() {
+        // Guards the strict boolean codec end to end: a corrupted flag
+        // byte must fail the decode instead of being read as true.
+        let mut buf = [0u8; BrakeResult::WIRE_SIZE];
+        buf[8] = 0x02;
+        let mut r = WireReader::new(&buf);
+        assert_eq!(BrakeResult::from_wire(&mut r), Err(PayloadError::Invalid));
     }
 }

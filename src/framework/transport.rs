@@ -75,32 +75,54 @@ pub enum RecvOutcome<I: CyclePayload, R: CyclePayload> {
     /// Frame is structurally malformed.
     Malformed(FrameError),
     /// Same or older seq than we last saw for this peer/session.
-    Duplicate { peer_id: u8, seen: u32, last: u32 },
+    Duplicate {
+        /// Sender of the duplicate.
+        peer_id: u8,
+        /// Sequence number carried by the frame.
+        seen: u32,
+        /// Last sequence number accepted from this peer.
+        last: u32,
+    },
     /// Peer's session id changed — likely rebooted.
     NewSession {
+        /// Peer whose session changed.
         peer_id: u8,
+        /// Session id we had recorded.
         previous_session: u64,
+        /// Session id the frame carries.
         new_session: u64,
+        /// The frame itself, for callers that accept the rejoin.
         frame: UdpFrame<I, R>,
     },
     /// Gap detected between last-seen and this seq.
     SeqGap {
+        /// Peer with the gap.
         peer_id: u8,
+        /// Number of frames missed.
         gap: u32,
+        /// The frame itself. Callers advance the cursor and ingest it.
         frame: UdpFrame<I, R>,
     },
     /// Time-sync frame; bypasses seq-num classification.
     /// `local_recv_ns` is the receive timestamp (t2 or t4).
     TimeSync {
+        /// Peer the sync frame came from.
         peer_id: u8,
+        /// The frame itself.
         frame: UdpFrame<I, R>,
+        /// Local receive timestamp, t2 for a request and t4 for a
+        /// response.
         local_recv_ns: u64,
     },
 }
 
+/// Why a transport operation failed.
 #[derive(Debug)]
 pub enum TransportError {
+    /// Socket error from the operating system.
     Io(io::Error),
+    /// The configured network interface has no IPv4 address, or does
+    /// not exist.
     InterfaceNotFound(String),
 }
 

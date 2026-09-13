@@ -1,3 +1,15 @@
+//! Routing received frames into the run state.
+//!
+//! Everything that arrives passes the same gauntlet before it reaches a
+//! buffer: unknown senders are rejected once discovery is closed,
+//! excluded peers are dropped, and frames older than the staleness
+//! threshold are discarded. Only then is the payload filed by variant.
+//!
+//! This is also where the rendezvous flag is raised. A frame whose
+//! header says the sender is already in error management pulls this
+//! node forward into the same phase, so two survivors reach the
+//! exclusion vote in the same cycle instead of timing out separately.
+
 use crate::framework::state::{AckInfo, PeerHealth};
 use crate::framework::state_machine::NodeState;
 use crate::framework::traits::{

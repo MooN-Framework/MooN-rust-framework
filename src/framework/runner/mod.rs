@@ -1,3 +1,22 @@
+//! The cyclic driver.
+//!
+//! [`Runner`] owns the application implementations and the transport
+//! and executes one phase per iteration: call the handler for the
+//! current [`NodeState`], feed the returned [`StateEvent`] through
+//! `NodeState::next`, repeat until a phase lands in failsafe.
+//!
+//! The submodules split that work by concern. `phases` holds the
+//! handlers, `collect` the generic send-and-wait loop they all use,
+//! `ingest` the routing of received frames into the run state, and
+//! `diag` the diagnostic interface, compiled only with the
+//! `diagnostic` feature.
+//!
+//! Deadlines inside a cycle are offsets from the cycle anchor, not
+//! durations from phase entry. Every healthy node therefore sees the
+//! same deadline at the same wall-clock instant, which is what keeps
+//! two survivors from timing out in different phases when a third goes
+//! silent mid-cycle.
+
 mod collect;
 #[cfg(feature = "diagnostic")]
 mod diag;
@@ -34,6 +53,10 @@ macro_rules! diag_bool_helper {
     };
 }
 
+/// Owns the application implementations and drives the phase loop.
+///
+/// Construct with [`Runner::new`], then call [`Runner::run`], which
+/// only returns once the node has reached failsafe.
 pub struct Runner<C, V, S, T, IS, A>
 where
     C: Computation,
@@ -124,6 +147,8 @@ where
     A: ApplicationStateProvider,
     C::Input: for<'de> Deserialize<'de>,
 {
+    /// Assemble a runner from the run state, the transport and the six
+    /// application implementations.
     pub fn new(
         state: RunState<V, C::Input>,
         transport: UdpTransport<C::Input, V::Payload>,
@@ -291,6 +316,8 @@ where
         self.transport.send(real_state, payload)
     }
 
+    /// Push an input into the input source from outside the cycle,
+    /// e.g. from the diagnostic interface.
     pub fn set_input(&mut self, input: C::Input) {
         self.input_source.set(input);
     }
@@ -332,6 +359,12 @@ where
         core::mem::replace(&mut self.pending_cycle_delay_ms, 0)
     }
 
+        /// Run until the node reaches failsafe.
+        ///
+        /// Each iteration runs the handler for the current phase, feeds
+        /// its event through the transition function and logs the
+        /// transition. The sink's `on_failsafe` hook fires once, right
+        /// before this returns.
         pub fn run(&mut self)
         where
             V::Payload: crate::framework::traits::Corruptible,

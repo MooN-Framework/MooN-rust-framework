@@ -1,3 +1,14 @@
+//! Peer roster and health tracking.
+//!
+//! Slot order is id order and is frozen at discovery finalize, because
+//! every mask on the wire is indexed against it.
+//!
+//! Health moves Alive to Lost on a vote-confirmed exclusion, and Lost
+//! to Probation when the fabric unanimously readmits a returning node.
+//! Probation progress is derived from the fabric-agreed cycle counter
+//! rather than counted locally, so two nodes that took different paths
+//! through error management still promote in the same cycle.
+
 use crate::framework::config::MAX_PEERS;
 use crate::framework::types::PeerMask;
 use heapless::Vec;
@@ -7,15 +18,22 @@ use tracing::{debug, warn};
 /// vote-confirmed exclusion. `Lost` is terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerHealth {
+    /// Full participant: counts for voting and for quorum.
     Alive,
+    /// Readmitted but still serving its probation term. Counts for
+    /// liveness, not for voting.
     Probation,
+    /// Excluded. Its frames are dropped and it is neither a voting
+    /// target nor a reporter.
     Lost,
 }
 
 /// Discovery-time and runtime metadata for one peer.
 #[derive(Debug, Clone, Copy)]
 pub struct PeerInfo {
+    /// Node id.
     pub id: u8,
+    /// Current health.
     pub health: PeerHealth,
     /// Cycles completed under probation. Derived from `current_seq`
     /// in `refresh_probation`, never counted up locally.
@@ -27,9 +45,18 @@ pub struct PeerInfo {
 }
 
 /// Discovery and management errors.
+/// Discovery and roster-management errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryError {
-    WrongNodeCount { found: u8, expected: u8 },
+    /// Discovery closed with a node count other than the configured
+    /// nominal one.
+    WrongNodeCount {
+        /// Nodes actually present, own node included.
+        found: u8,
+        /// Nodes the configuration expects.
+        expected: u8,
+    },
+    /// A frame arrived from a node id that is not in the roster.
     UnknownPeer,
 }
 
@@ -50,6 +77,7 @@ impl Default for PeerRoster {
 }
 
 impl PeerRoster {
+    /// Empty roster with discovery still open.
     pub fn new() -> Self {
         Self {
             peers: Vec::new(),
@@ -57,6 +85,9 @@ impl PeerRoster {
         }
     }
 
+    /// Overwrite a peer's health and probation progress from a received
+    /// snapshot, re-deriving the probation anchor from `current_seq`.
+    /// Returns false when the id is not in the roster.
     pub fn set_peer_from_snapshot(
         &mut self,
         id: u8,
@@ -75,14 +106,17 @@ impl PeerRoster {
         false
     }
 
+    /// All peers in slot order.
     pub fn peers(&self) -> &[PeerInfo] {
         &self.peers
     }
 
+    /// True once [`PeerRoster::finalize`] has closed discovery.
     pub fn discovery_locked(&self) -> bool {
         self.discovery_locked
     }
 
+    /// Slot index of `id`, if it is in the roster.
     pub fn peer_index(&self, id: u8) -> Option<usize> {
         self.peers.iter().position(|p| p.id == id)
     }
@@ -147,6 +181,8 @@ impl PeerRoster {
         transitions
     }
 
+    /// Move a Lost peer to Probation, anchored at `current_seq`.
+    /// Returns false when the peer is unknown or not Lost.
     pub fn readmit(&mut self, peer_id: u8, current_seq: u32) -> bool {
         for peer in self.peers.iter_mut() {
             if peer.id == peer_id && peer.health == PeerHealth::Lost {
@@ -159,6 +195,7 @@ impl PeerRoster {
         false
     }
 
+    /// Number of peers that are Alive, i.e. eligible to vote.
     pub fn voting_peer_count(&self) -> usize {
         self.peers
             .iter()
@@ -195,6 +232,7 @@ impl PeerRoster {
         promoted
     }
 
+    /// Number of peers that are not Lost, probation included.
     pub fn active_count(&self) -> usize {
         self.peers
             .iter()

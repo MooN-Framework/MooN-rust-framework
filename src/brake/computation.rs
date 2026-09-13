@@ -36,11 +36,15 @@ fn median(values: &mut [f64]) -> f64 {
 /// every field agrees within its tolerance.
 #[derive(Debug, Clone, Copy)]
 pub struct BrakeInputTolerance {
+    /// Maximum accepted difference on `current_speed` and
+    /// `target_speed`, in m/s.
     pub speed_tolerance: f64,
+    /// Maximum accepted difference on `available_distance`, in metres.
     pub distance_tolerance: f64,
 }
 
 impl BrakeInputTolerance {
+    /// Build a tolerance pair. Both values are absolute, not relative.
     pub const fn new(speed_tolerance: f64, distance_tolerance: f64) -> Self {
         Self {
             speed_tolerance,
@@ -55,12 +59,20 @@ impl BrakeInputTolerance {
     }
 }
 
+/// `Computation` implementation for the braking curve.
+///
+/// Consolidates the sensor inputs of all participating nodes field by
+/// field with `median`, then runs [`compute_braking_curve`] on the
+/// consolidated value, so a single drifting sensor cannot move the
+/// result.
 #[derive(Debug, Clone, Copy)]
 pub struct BrakeComputation {
+    /// Divergence gate applied to peer inputs during ShareInputs.
     pub tolerance: BrakeInputTolerance,
 }
 
 impl BrakeComputation {
+    /// Build a computation with the given input divergence gate.
     pub const fn new(tolerance: BrakeInputTolerance) -> Self {
         Self { tolerance }
     }

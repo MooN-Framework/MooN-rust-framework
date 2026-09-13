@@ -86,35 +86,59 @@ const fn max_usize(a: usize, b: usize) -> usize {
 /// staging arrays inside `compute_crc` and `encode` are non-generic.
 pub const STAGING_SIZE: usize = max_usize(MAX_PAYLOAD_WIRE_SIZE, SYSTEM_STATE_SNAPSHOT_BODY);
 
+/// One node's roster entry inside a system-state snapshot.
+///
+/// Fixed-size array slot rather than a list, so the snapshot body has
+/// a constant wire size regardless of how many nodes are present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SnapshotEntry {
+    /// False for an unused array slot. Invalid entries carry no
+    /// meaning in the other fields.
     pub valid: bool,
+    /// Node id this entry describes.
     pub id: u8,
+    /// Peer health as a wire value: 0 alive, 1 probation, 2 lost.
     pub health: u8,
+    /// Cycles already served under probation.
     pub probation_cycles_ok: u32,
 }
 
+/// Why a received datagram was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameError {
+    /// Fewer bytes than header plus CRC trailer.
     TooShort,
+    /// The payload discriminator byte is not one this version knows.
     UnknownDiscriminator,
+    /// The discriminator was known but its body did not decode.
     InvalidPayload,
+    /// The CRC32 trailer does not match the frame contents.
     CrcMismatch,
 }
 
+/// Why a node broadcast `GoFailsafe`. Diagnostic only: a receiver goes
+/// fail-stop regardless of the reason.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailsafeReason {
+    /// No reason recorded.
     Unspecified = 0x00,
+    /// Too few active nodes left to keep voting.
     QuorumLost = 0x01,
+    /// System-state CRC or snapshot disagreed across the fabric.
     StateDivergence = 0x02,
+    /// The power-on self-test failed.
     SelfTestFailed = 0x03,
+    /// The sink rejected the voted decision as unsafe.
     SinkSafetyViolation = 0x04,
+    /// A local error, e.g. a failed send or an input-source failure.
     LocalFault = 0x05,
+    /// This node is only relaying: a peer announced failsafe first.
     PeerBroadcast = 0x06,
 }
 
 impl FailsafeReason {
+    /// Wire byte for this reason.
     #[inline]
     pub fn to_wire(self) -> u8 {
         self as u8
@@ -130,6 +154,8 @@ impl From<PayloadError> for FrameError {
     }
 }
 
+/// Body of a frame. The discriminator byte in the header selects the
+/// variant, and each variant has a fixed body size.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Payload<I: CyclePayload, R: CyclePayload> {
     /// State beacon with attested observation mask. Bit `k` = sender saw
@@ -138,7 +164,9 @@ pub enum Payload<I: CyclePayload, R: CyclePayload> {
     /// signalled implicitly via `node_state == ResyncLostPeer` in the
     /// frame header, not in this payload.
     State {
+        /// Attested observation mask, see the variant docs above.
         seen_mask: PeerMask,
+        /// Number of non-lost nodes the sender currently counts.
         active_count: u8,
         /// The sender's `current_seq` at the time the beacon was sent,
         /// i.e. which cycle this beacon belongs to.
@@ -155,6 +183,7 @@ pub enum Payload<I: CyclePayload, R: CyclePayload> {
     /// Sensor input attested this cycle. Shared during ShareInputs so
     /// every node can gate for input divergence.
     Input(I),
+    /// Computation result shared during ShareResult.
     Result(R),
     /// Ack beacon. `received_from` attests which peer results this node
     /// ingested this cycle. `publisher_candidate` is the sender's pick.
@@ -165,29 +194,50 @@ pub enum Payload<I: CyclePayload, R: CyclePayload> {
     /// id-indexed (`NodeIdMask`) because every node ANDs it with its
     /// peers' votes directly, without position translation.
     Ack {
+        /// Peer results the sender ingested this cycle, in the sender's
+        /// peer order.
         received_from: PeerMask,
+        /// Node id the sender nominates as publisher.
         publisher_candidate: u8,
+        /// Rejoin endorsements, id-indexed.
         rejoin_vote: NodeIdMask,
     },
+    /// Exclusion proposal exchanged during ErrorManagement.
     ExclusionProposal {
+        /// Peers the sender proposes to exclude, in the sender's peer
+        /// order.
         propose_exclude: PeerMask,
     },
+    /// Cristian's-algorithm request. The responder echoes `t1`.
     TimeSyncReq {
+        /// Requester's send timestamp, monotonic nanoseconds.
         t1: u64,
     },
+    /// Cristian's-algorithm response.
     TimeSyncResp {
+        /// Echo of the request's `t1`, used to match the round trip.
         t1: u64,
+        /// Responder's receive timestamp.
         t2: u64,
+        /// Responder's send timestamp.
         t3: u64,
     },
+    /// System-state CRC attestation exchanged before publishing.
     SystemStateCrc {
+        /// CRC32 over the sender's system state plus application data.
         crc: u32,
     },
+    /// Full system-state snapshot, sent to a rejoining node.
     SystemStateSnapshot {
+        /// Configured nominal node count.
         nominal_participants: u8,
+        /// Configured safety floor on active nodes.
         min_participants: u8,
+        /// Configured probation term, in cycles.
         probation_cycles: u32,
+        /// Sender's cycle counter, the anchor for probation progress.
         current_seq: u32,
+        /// Roster, one slot per possible node.
         entries: [SnapshotEntry; MAX_TOTAL_NODES],
         /// Application-data trailer. `app_data_len` is the number of
         /// valid bytes at the start of `app_data`; the rest is
@@ -195,15 +245,19 @@ pub enum Payload<I: CyclePayload, R: CyclePayload> {
         /// `ApplicationData::from_wire` on `&app_data[..app_data_len]`.
         /// For `NoApplicationData` this is always `(0, [0u8; N])`.
         app_data_len: u8,
+        /// Zero-padded application-state bytes, see `app_data_len`.
         app_data: [u8; MAX_APPLICATION_DATA_SIZE],
     },
     /// Receiver's attestation of the snapshot it adopted. `adopted_crc`
     /// is the receiver-side CRC over the applied state — allows senders
     /// to detect if their own snapshot was in the minority.
     SystemStateSnapshotAck {
+        /// Receiver-side CRC over the state it adopted.
         adopted_crc: u32,
     },
+    /// Fail-stop announcement. Every receiver follows immediately.
     GoFailsafe {
+        /// A [`FailsafeReason`] wire byte. Diagnostic only.
         reason: u8,
     },
 }
@@ -368,6 +422,13 @@ impl<I: CyclePayload, R: CyclePayload> Payload<I, R> {
     }
 }
 
+/// One datagram: a 23-byte little-endian header, a payload body, and a
+/// CRC32 trailer over everything before it.
+///
+/// The header is `node_id | session_id | seq_num | node_state |
+/// timestamp | discriminator`. `node_state` rides in the header rather
+/// than in a payload because every phase handler needs it, including
+/// the rendezvous check that follows a peer into error management.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UdpFrame<I: CyclePayload, R: CyclePayload> {
     node_id: u8,
@@ -385,6 +446,8 @@ impl<I: CyclePayload, R: CyclePayload> UdpFrame<I, R> {
         "CyclePayload::WIRE_SIZE exceeds MAX_PAYLOAD_WIRE_SIZE"
     );
 
+    /// Largest datagram this frame type can produce, computed from the
+    /// widest payload body. Used to size receive buffers.
     pub const MAX_FRAME_SIZE: usize = {
         let body = max_usize(I::WIRE_SIZE, R::WIRE_SIZE);
         let body = max_usize(body, ACK_BODY);
@@ -422,21 +485,30 @@ impl<I: CyclePayload, R: CyclePayload> UdpFrame<I, R> {
         f
     }
 
+    /// Sender's node id.
     pub fn node_id(&self) -> u8 {
         self.node_id
     }
+    /// Sender's session id. Changes on every process restart, which is
+    /// how a reboot is told apart from a sequence gap.
     pub fn session_id(&self) -> u64 {
         self.session_id
     }
+    /// Per-sender sequence number, wrapping.
     pub fn seq_num(&self) -> u32 {
         self.seq_num
     }
+    /// Sender's node state as a raw wire byte. Decode with
+    /// `NodeState::from_wire` when the value has to be interpreted.
     pub fn node_state_wire(&self) -> u8 {
         self.node_state_wire
     }
+    /// Sender's monotonic send timestamp in nanoseconds, translated to
+    /// local time via the clock offsets before use.
     pub fn timestamp(&self) -> u64 {
         self.timestamp
     }
+    /// The frame body.
     pub fn payload(&self) -> Payload<I, R> {
         self.payload
     }
@@ -460,10 +532,12 @@ impl<I: CyclePayload, R: CyclePayload> UdpFrame<I, R> {
         h.finalize()
     }
 
+    /// Recompute the CRC and compare it against the trailer.
     pub fn verify(&self) -> bool {
         self.crc32 == self.compute_crc()
     }
 
+    /// Serialize to a datagram, CRC trailer included.
     pub fn encode(&self) -> Vec<u8> {
         let _: () = Self::_ASSERT_FITS;
 
@@ -485,6 +559,8 @@ impl<I: CyclePayload, R: CyclePayload> UdpFrame<I, R> {
         buf
     }
 
+    /// Parse a received datagram. Checks length, discriminator, body
+    /// encoding and CRC, in that order.
     pub fn decode(bytes: &[u8]) -> Result<Self, FrameError> {
         let _: () = Self::_ASSERT_FITS;
 

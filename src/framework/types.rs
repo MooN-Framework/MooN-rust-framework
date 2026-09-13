@@ -11,6 +11,7 @@ use crate::framework::config::{MAX_PEERS, MAX_TOTAL_NODES};
 pub struct PeerMask(pub u8);
 
 impl PeerMask {
+    /// Mask with no slot set.
     pub const EMPTY: Self = Self(0);
 
     /// Return the mask of all peers in the roster, excluding the own peer.
@@ -20,34 +21,40 @@ impl PeerMask {
         self.0
     }
 
+    /// Wrap a raw wire byte as a peer mask.
     #[inline]
     pub const fn from_u8(b: u8) -> Self {
         PeerMask(b)
     }
 
+    /// Set the bit for `slot`. Debug-asserts that the slot is in range.
     #[inline]
     pub fn set(&mut self, slot: usize) {
         debug_assert!(slot < MAX_PEERS);
         self.0 |= 1 << slot;
     }
 
+    /// Clear the bit for `slot`.
     #[inline]
     pub fn clear(&mut self, slot: usize) {
         debug_assert!(slot < MAX_PEERS);
         self.0 &= !(1 << slot);
     }
 
+    /// True when `slot` is set.
     #[inline]
     pub fn contains(self, slot: usize) -> bool {
         debug_assert!(slot < MAX_PEERS);
         (self.0 >> slot) & 1 == 1
     }
 
+    /// Number of slots set.
     #[inline]
     pub fn count(self) -> u32 {
         self.0.count_ones()
     }
 
+    /// True when no slot is set.
     #[inline]
     pub fn is_empty(self) -> bool {
         self.0 == 0
@@ -74,13 +81,16 @@ impl PeerMask {
 pub struct NodeIdMask(pub u8);
 
 impl NodeIdMask {
+    /// Mask with no node set.
     pub const EMPTY: Self = Self(0);
 
+    /// Raw wire byte of this mask.
     #[inline]
     pub fn as_u8(&self) -> u8 {
         self.0
     }
 
+    /// Wrap a raw wire byte as a node-id mask.
     #[inline]
     pub const fn from_u8(b: u8) -> Self {
         NodeIdMask(b)
@@ -97,6 +107,7 @@ impl NodeIdMask {
         true
     }
 
+    /// True when `node_id` is set. Out-of-range ids read as unset.
     #[inline]
     pub fn contains(self, node_id: u8) -> bool {
         if (node_id as usize) >= MAX_TOTAL_NODES {
@@ -105,11 +116,13 @@ impl NodeIdMask {
         (self.0 >> node_id) & 1 == 1
     }
 
+    /// Number of node ids set.
     #[inline]
     pub fn count(self) -> u32 {
         self.0.count_ones()
     }
 
+    /// True when no node id is set.
     #[inline]
     pub fn is_empty(self) -> bool {
         self.0 == 0

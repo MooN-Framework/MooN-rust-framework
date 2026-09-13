@@ -1,3 +1,17 @@
+//! Everything a node knows about itself and the fabric.
+//!
+//! [`RunState`] is the single mutable object the phase handlers work
+//! on. It holds the roster (`peers`), the per-cycle payload buffers
+//! (`cycle`), the cross-observation evidence (`observation`) and
+//! the exclusion vote (`voting`), plus the clock offsets and the
+//! scalars that describe the current cycle.
+//!
+//! Two invariants run through the whole module. Per-peer buffers are
+//! indexed by roster slot, and slot order is id order fixed at
+//! discovery finalize. And a value that peers have to agree on lives
+//! in the system-state CRC, which is why `current_seq` and the roster
+//! are derived from fabric-wide values rather than counted locally.
+
 mod cycle;
 mod observation;
 mod peers;
@@ -84,6 +98,11 @@ pub fn serialize_app_data<A: ApplicationData>(
     (written as u8, buf)
 }
 
+/// CRC32 over the system-state fields plus the application-data
+    /// trailer. Every node computes this over its own state and the
+    /// values are compared in SystemStateCrcExchange, so a divergence
+    /// in roster, cycle counter, configuration or application state all
+    /// surface the same way.
 pub fn crc_from_snapshot_fields(
     nominal: u8,
     min: u8,
@@ -115,13 +134,21 @@ pub fn crc_from_snapshot_fields(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// A snapshot received from a peer, kept until the majority is picked.
 pub struct StoredSnapshot {
+    /// Sender's configured nominal node count.
     pub nominal: u8,
+    /// Sender's configured safety floor.
     pub min: u8,
+    /// Sender's configured probation term, in cycles.
     pub probation_cycles: u32,
+    /// Sender's cycle counter, the anchor for probation progress.
     pub current_seq: u32,
+    /// Sender's roster, one slot per possible node.
     pub entries: [SnapshotEntry; MAX_TOTAL_NODES],
+    /// Number of valid bytes at the start of `app_data`.
     pub app_data_len: u8,
+    /// Zero-padded application-state bytes.
     pub app_data: [u8; MAX_APPLICATION_DATA_SIZE],
 }
 
@@ -139,10 +166,17 @@ impl StoredSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// Why a received snapshot could not be adopted.
 pub enum SnapshotApplyError {
+    /// The sender's participant configuration differs from ours, so the
+    /// two nodes are not running the same deployment.
     ConfigMismatch,
+    /// The snapshot lists this node as Lost. Adopting it would mean
+    /// declaring ourselves excluded on our own authority.
     SelfMarkedLost,
+    /// The snapshot names a node that is not in our roster.
     UnknownPeerInSnapshot,
+    /// A health field held a byte outside the known encoding.
     InvalidHealthWire,
 }
 
@@ -193,6 +227,8 @@ pub struct RunState<V: Voter, I: CyclePayload> {
 }
 
 impl<V: Voter, I: CyclePayload> RunState<V, I> {
+    /// Fresh state in `Startup` with an empty roster. Per-peer buffers
+    /// stay unsized until [`RunState::finalize_discovery`].
     pub fn new(own_id: u8, session_id: u64, voter: V, participants: ParticipantConfig) -> Self {
         Self {
             own_id,
@@ -255,22 +291,28 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         out
     }
 
+    /// True when this node still has to adopt a fabric snapshot before
+    /// it may take part in voting again.
     pub fn needs_state_sync(&self) -> bool {
         self.needs_state_sync
     }
+    /// Flag or clear the pending state-sync requirement.
     pub fn set_needs_state_sync(&mut self, v: bool) {
         self.needs_state_sync = v;
     }
 
+    /// Drop all collected snapshots and snapshot acks.
     pub fn reset_state_sync_evidence(&mut self) {
         self.sync_snapshots.clear();
         self.sync_acks.clear();
     }
 
+    /// Store the snapshot `peer_id` broadcast during state sync.
     pub fn record_sync_snapshot(&mut self, peer_id: u8, snap: StoredSnapshot) {
         upsert_by_id(&mut self.sync_snapshots, peer_id, snap);
     }
 
+    /// Store the CRC a receiver reported after adopting a snapshot.
     pub fn record_sync_ack(&mut self, peer_id: u8, adopted_crc: u32) {
         upsert_by_id(&mut self.sync_acks, peer_id, adopted_crc);
     }
@@ -289,9 +331,11 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         crc_from_snapshot_fields(nom, min, pc, cs, &entries, app_data_len, app_data)
     }
 
+    /// Snapshots collected this state-sync round, keyed by sender.
     pub fn sync_snapshots(&self) -> &[(u8, StoredSnapshot)] {
         &self.sync_snapshots
     }
+    /// Snapshot acks collected this round, keyed by receiver.
     pub fn sync_acks(&self) -> &[(u8, u32)] {
         &self.sync_acks
     }
@@ -393,6 +437,9 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         Ok(())
     }
 
+    /// Own system state as snapshot fields: nominal count, minimum
+    /// count, probation term, cycle counter and the roster, own node
+    /// included.
     pub fn build_snapshot(&self) -> (u8, u8, u32, u32, [SnapshotEntry; MAX_TOTAL_NODES]) {
         let mut entries = [SnapshotEntry::default(); MAX_TOTAL_NODES];
         let own_health = match self.self_probation_start_seq {
@@ -498,10 +545,12 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         );
     }
 
+    /// Configured participant counts and probation term.
     pub fn participants(&self) -> &ParticipantConfig {
         &self.participants
     }
 
+    /// True once discovery has been closed.
     pub fn discovery_locked(&self) -> bool {
         self.roster.discovery_locked()
     }
@@ -532,12 +581,15 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         Ok(())
     }
 
+    /// Drop all peer CRC attestations for a new exchange.
     pub fn reset_crc_evidence(&mut self) {
         for slot in self.peer_crcs.iter_mut() {
             *slot = None;
         }
     }
 
+    /// Record a peer's system-state CRC. Lost peers are ignored,
+    /// unknown ids are an error.
     pub fn record_peer_crc(&mut self, peer_id: u8, crc: u32) -> Result<(), DiscoveryError> {
         if let Some(idx) = self.resolve_peer_slot(peer_id)? {
             self.peer_crcs[idx] = Some(crc);
@@ -545,9 +597,11 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         Ok(())
     }
 
+    /// Non-lost peers that have not attested a CRC this exchange.
     pub fn healthy_peers_missing_crc(&self) -> Vec<u8, MAX_PEERS> {
         self.collect_peers_where(|idx, _| self.peer_crcs[idx].is_none())
     }
+    /// CRC attested by the peer in `idx`, if one arrived.
     pub fn cycle_peer_crc(&self, idx: usize) -> Option<u32> {
         self.peer_crcs.get(idx).and_then(|s| *s)
     }
@@ -600,14 +654,18 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         out
     }
 
+    /// Roster slot of `id`, if it is a known peer.
     pub fn peer_index(&self, id: u8) -> Option<usize> {
         self.roster.peer_index(id)
     }
 
+    /// Store the local sensor reading for this cycle.
     pub fn record_own_input(&mut self, input: I) {
         self.cycle.own_input = Some(input);
     }
 
+    /// Store a peer's sensor reading. Lost peers are ignored, unknown
+    /// ids are an error.
     pub fn record_peer_input(&mut self, peer_id: u8, input: I) -> Result<(), DiscoveryError> {
         if let Some(idx) = self.resolve_peer_slot(peer_id)? {
             self.cycle.peer_inputs[idx] = Some(input);
@@ -615,18 +673,22 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         Ok(())
     }
 
+    /// The local sensor reading for this cycle, as sent on the wire.
     pub fn own_input(&self) -> Option<I> {
         self.cycle.own_input
     }
 
+    /// Store the consolidated input the computation actually ran on.
     pub fn record_consolidated_input(&mut self, input: I) {
         self.cycle.consolidated_input = Some(input);
     }
 
+    /// The consolidated input, kept for post-mortem traceability.
     pub fn consolidated_input(&self) -> Option<I> {
         self.cycle.consolidated_input
     }
 
+    /// Peer inputs received this cycle, in slot order.
     pub fn peer_inputs(&self) -> &[Option<I>] {
         &self.cycle.peer_inputs
     }
@@ -636,10 +698,13 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         self.collect_peers_where(|idx, _| self.cycle.peer_inputs[idx].is_none())
     }
 
+    /// Store the local computation result for this cycle.
     pub fn record_own_result(&mut self, payload: V::Payload) {
         self.cycle.own_result = Some(payload);
     }
 
+    /// Store a peer's computation result. Lost peers are ignored,
+    /// unknown ids are an error.
     pub fn record_peer_result(
         &mut self,
         peer_id: u8,
@@ -651,6 +716,8 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         Ok(())
     }
 
+    /// Store a peer's ack. Lost peers are ignored, unknown ids are an
+    /// error.
     pub fn record_peer_ack(&mut self, peer_id: u8, ack: AckInfo) -> Result<(), DiscoveryError> {
         if let Some(idx) = self.resolve_peer_slot(peer_id)? {
             self.cycle.peer_acks[idx] = Some(ack);
@@ -735,10 +802,12 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         mask
     }
 
+    /// Drop own and attested observations for a new phase.
     pub fn reset_cycle_sync_evidence(&mut self) {
         self.obs.reset_seen();
     }
 
+    /// Note that we saw the peer in `peer_idx` this phase.
     pub fn set_own_seen_bit(&mut self, peer_idx: usize) {
         let peers = self.roster.peers();
         if peer_idx < peers.len() && peers[peer_idx].health != PeerHealth::Lost {
@@ -746,10 +815,13 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         }
     }
 
+    /// What this node saw itself this phase. Goes on the wire in the
+    /// state beacon.
     pub fn own_seen_mask(&self) -> PeerMask {
         self.obs.own_seen
     }
 
+    /// Store a peer's attested observation mask.
     pub fn record_peer_seen_mask(
         &mut self,
         peer_id: u8,
@@ -792,6 +864,8 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         }
     }
 
+    /// Fold the ShareInputs attribution into the local proposal. Input
+    /// frames carry no attested mask, so only the own view counts here.
     pub fn attribute_input_missing(&mut self) {
         let mut present: Vec<bool, MAX_PEERS> = Vec::new();
         for slot in self.cycle.peer_inputs.iter() {
@@ -818,10 +892,12 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         Ok(())
     }
 
+    /// Drop all recorded peer proposals for a new vote round.
     pub fn reset_exclusion_proposals(&mut self) {
         self.votes.reset();
     }
 
+    /// Store a peer's exclusion proposal.
     pub fn record_peer_exclusion_proposal(
         &mut self,
         peer_id: u8,
@@ -855,14 +931,17 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         self.rejoin_seen
     }
 
+    /// Arm the readmissions agreed for the next cycle boundary.
     pub fn set_pending_rejoin(&mut self, mask: NodeIdMask) {
         self.pending_rejoin = mask;
     }
 
+    /// Readmissions armed for the next cycle boundary.
     pub fn pending_rejoin(&self) -> NodeIdMask {
         self.pending_rejoin
     }
 
+    /// Drop the armed readmissions.
     pub fn clear_pending_rejoin(&mut self) {
         self.pending_rejoin = NodeIdMask::EMPTY;
     }
@@ -932,14 +1011,18 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         self.roster.exclude(confirmed)
     }
 
+    /// Peers that are not Lost, probation included.
     pub fn active_peer_count(&self) -> usize {
         self.roster.active_count()
     }
 
+    /// Peers that are Alive, i.e. eligible to vote.
     pub fn active_peer_count_alive_only(&self) -> usize {
         self.roster.voting_peer_count()
     }
 
+    /// Smallest Alive node id, own node included. Used as the default
+    /// publisher pick.
     pub fn lowest_alive_id(&self) -> u8 {
         self.roster.lowest_alive_id(self.own_id)
     }
@@ -966,6 +1049,7 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         voting_total.saturating_sub(self.participants.min_participants as usize)
     }
 
+    /// Install the clock offsets produced by a sync round.
     pub fn set_peer_clocks(&mut self, clocks: &[PeerClock]) {
         self.peer_clocks.clear();
         for c in clocks {
@@ -976,28 +1060,36 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         }
     }
 
+    /// Install the fabric-wide clock uncertainty used for staleness
+    /// checks.
     pub fn set_sync_epsilon(&mut self, epsilon_ns: i64) {
         self.sync_epsilon_ns = epsilon_ns;
     }
 
+    /// Current per-peer clock offsets.
     pub fn peer_clocks(&self) -> &[PeerClock] {
         &self.peer_clocks
     }
 
+    /// Current clock uncertainty, in nanoseconds.
     pub fn sync_epsilon_ns(&self) -> i64 {
         self.sync_epsilon_ns
     }
 
+    /// Declare the clock offsets usable. Timestamp translation and
+    /// staleness checks only run while this holds.
     pub fn mark_sync_valid(&mut self) {
         self.sync_valid = true;
         info!("time sync valid");
     }
 
+    /// Declare the clock offsets stale, e.g. after a roster change.
     pub fn invalidate_sync(&mut self) {
         self.sync_valid = false;
         warn!("time sync invalidated");
     }
 
+    /// True while the clock offsets are usable.
     pub fn sync_valid(&self) -> bool {
         self.sync_valid
     }
@@ -1025,6 +1117,7 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         self.roster.readmit(peer_id, self.current_seq)
     }
 
+    /// Non-lost node count, own node included.
     pub fn active_count_including_self(&self) -> u8 {
         (1 + self.active_peer_count()) as u8
     }
@@ -1047,10 +1140,13 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         }
     }
 
+    /// True while this node is serving its own probation term. Its
+    /// value must not steer the vote during that time.
     pub fn self_in_probation(&self) -> bool {
         self.self_probation_start_seq.is_some()
     }
 
+    /// Smallest Alive peer id, own node excluded.
     pub fn lowest_alive_peer_id(&self) -> Option<u8> {
         self.roster
             .peers()
@@ -1060,6 +1156,9 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
             .min()
     }
 
+    /// Publisher id agreed by a strict majority of the acks, own pick
+    /// included. `None` means no agreement, which routes the cycle
+    /// through error management.
     pub fn publisher_consensus(&self, own_pick: u8) -> Option<u8> {
         for (idx, peer) in self.roster.peers().iter().enumerate() {
             if peer.health == PeerHealth::Lost {
@@ -1074,6 +1173,8 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         Some(own_pick)
     }
 
+    /// True when nothing at all arrived from any peer this cycle,
+    /// which points at the local receive path rather than at the peers.
     pub fn no_peer_evidence_this_cycle(&self) -> bool {
         for (idx, peer) in self.roster.peers().iter().enumerate() {
             if peer.health == PeerHealth::Lost {
@@ -1090,46 +1191,63 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         true
     }
 
+    /// True when a majority of reporting peers named this node for
+    /// exclusion.
     pub fn self_excluded_by_peers(&self) -> bool {
         self.votes.self_excluded_by_peers(&self.roster, self.own_id)
     }
 
+    /// This node's id.
     pub fn own_id(&self) -> u8 {
         self.own_id
     }
+    /// Session id of the current process run.
     pub fn session_id(&self) -> u64 {
         self.session_id
     }
+    /// Current phase.
     pub fn node_state(&self) -> NodeState {
         self.node_state
     }
+    /// Set the current phase. Called by the runner after each
+    /// transition.
     pub fn set_node_state(&mut self, s: NodeState) {
         self.node_state = s;
     }
+    /// Current system-wide operational mode.
     pub fn system_state(&self) -> SystemState {
         self.system_state
     }
+    /// Set the system-wide operational mode.
     pub fn set_system_state(&mut self, s: SystemState) {
         self.system_state = s;
     }
+    /// Cycle counter. Part of the system-state CRC, so it is identical
+    /// on every node that is in step.
     pub fn current_seq(&self) -> u32 {
         self.current_seq
     }
+    /// The roster, in slot order.
     pub fn peers(&self) -> &[PeerInfo] {
         self.roster.peers()
     }
+    /// Per-cycle payload buffers.
     pub fn cycle(&self) -> &CycleState<V::Payload, I> {
         &self.cycle
     }
+    /// Outcome of the most recent vote in this cycle.
     pub fn last_decision(&self) -> Option<VotingOutcome<V::Decision>> {
         self.last_decision
     }
+    /// The configured voter.
     pub fn voter(&self) -> &V {
         &self.voter
     }
+    /// True when this node was excluded at some point and came back.
     pub fn was_lost(&self) -> bool {
         self.was_lost
     }
+    /// Record whether this node has been through an exclusion.
     pub fn set_was_lost(&mut self, lost: bool) {
         self.was_lost = lost;
     }
@@ -1289,5 +1407,427 @@ mod app_data_tests {
         let crc_seq0 = crc_from_snapshot_fields(3, 2, 10, 0, &entries, len, &buf);
         let crc_seq1 = crc_from_snapshot_fields(3, 2, 10, 1, &entries, len, &buf);
         assert_ne!(crc_seq0, crc_seq1);
+    }
+}
+
+#[cfg(test)]
+mod quorum_and_evidence_tests {
+    //! `RunState` is where the roster, the per-cycle evidence and the
+    //! quorum arithmetic meet. The tests below cover the queries the
+    //! phase handlers branch on: how many nodes are still allowed to
+    //! fail, who owes us a vote, and whether the CRC attestations agree.
+    //! Every one of them decides between continuing and going failsafe.
+    use super::*;
+    use crate::brake::braking_curve::{BrakeInput, BrakeResult};
+    use crate::brake::voter::BrakeVoter;
+
+    type State = RunState<BrakeVoter, BrakeInput>;
+
+    /// Node 0 with `peer_ids` discovered and discovery closed.
+    fn state_with(peer_ids: &[u8], minimum: u8) -> State {
+        let nominal = peer_ids.len() as u8 + 1;
+        let mut s = State::new(
+            0,
+            1,
+            BrakeVoter::new(minimum, 0.5),
+            ParticipantConfig::new(minimum, nominal, 10),
+        );
+        for &id in peer_ids {
+            s.on_peer_discovered(id).expect("discover");
+        }
+        s.finalize_discovery().expect("finalize");
+        s
+    }
+
+    fn mask(bits: &[usize]) -> PeerMask {
+        let mut m = PeerMask::EMPTY;
+        for &b in bits {
+            m.set(b);
+        }
+        m
+    }
+
+    fn result(distance: f64) -> BrakeResult {
+        BrakeResult {
+            total_distance: distance,
+            emergency_brake: false,
+            valid_entry: true,
+        }
+    }
+
+    fn ack(received_from: PeerMask) -> AckInfo {
+        AckInfo {
+            received_from: received_from.as_u8(),
+            publisher_candidate: 0,
+        }
+    }
+
+    #[test]
+    fn discovery_sorts_peers_and_sizes_every_buffer() {
+        // Slot order has to be id order, because every mask on the wire
+        // is indexed against it.
+        let s = state_with(&[7, 3], 2);
+        assert_eq!(s.peers()[0].id, 3);
+        assert_eq!(s.peers()[1].id, 7);
+        assert_eq!(s.cycle().peer_results.len(), 2);
+        assert_eq!(s.cycle().peer_acks.len(), 2);
+        assert!(s.discovery_locked());
+    }
+
+    #[test]
+    fn a_2oo3_fabric_reports_one_tolerable_failure() {
+        let mut s = state_with(&[1, 2], 2);
+        assert!(s.quorum_available());
+        assert_eq!(s.required_agreement(), 2);
+        assert_eq!(s.tolerable_failures_remaining(), 1);
+
+        // One node excluded: still at the floor, nothing left in reserve.
+        assert_eq!(s.apply_confirmed_exclusions(mask(&[0])), 1);
+        assert!(s.quorum_available());
+        assert_eq!(s.required_agreement(), 2);
+        assert_eq!(s.tolerable_failures_remaining(), 0);
+
+        // Second exclusion drops below the floor.
+        assert_eq!(s.apply_confirmed_exclusions(mask(&[1])), 1);
+        assert!(!s.quorum_available());
+        assert_eq!(s.tolerable_failures_remaining(), 0);
+    }
+
+    #[test]
+    fn a_2oo4_fabric_reports_two_tolerable_failures() {
+        let s = state_with(&[1, 2, 3], 2);
+        assert_eq!(s.tolerable_failures_remaining(), 2);
+        // Strict majority of four is three, and that beats the floor.
+        assert_eq!(s.required_agreement(), 3);
+    }
+
+    #[test]
+    fn excluding_a_lost_peer_again_is_a_no_op() {
+        let mut s = state_with(&[1, 2], 2);
+        assert_eq!(s.apply_confirmed_exclusions(mask(&[0])), 1);
+        assert_eq!(s.apply_confirmed_exclusions(mask(&[0])), 0);
+    }
+
+    #[test]
+    fn probation_peers_count_for_liveness_but_not_for_voting() {
+        // A readmitted node is back on the wire, so it is active, but
+        // its value must not influence the vote until promotion.
+        let mut s = state_with(&[1, 2], 2);
+        s.apply_confirmed_exclusions(mask(&[0]));
+        assert!(s.readmit_peer(1));
+
+        assert_eq!(s.active_peer_count(), 2);
+        assert_eq!(s.active_peer_count_alive_only(), 1);
+        assert_eq!(s.peers()[0].health, PeerHealth::Probation);
+    }
+
+    #[test]
+    fn the_expected_sync_mask_drops_excluded_peers() {
+        let mut s = state_with(&[1, 2], 2);
+        assert_eq!(s.expected_sync_mask(), 0b11);
+        s.apply_confirmed_exclusions(mask(&[0]));
+        assert_eq!(s.expected_sync_mask(), 0b10);
+    }
+
+    #[test]
+    fn the_lowest_alive_id_skips_lost_and_probation_peers() {
+        let s = state_with(&[1, 2], 2);
+        assert_eq!(s.lowest_alive_id(), 0, "own id is the lowest here");
+
+        let mut s = State::new(
+            5,
+            1,
+            BrakeVoter::new(2, 0.5),
+            ParticipantConfig::new(2, 3, 10),
+        );
+        s.on_peer_discovered(1).expect("discover");
+        s.on_peer_discovered(2).expect("discover");
+        s.finalize_discovery().expect("finalize");
+        assert_eq!(s.lowest_alive_id(), 1);
+
+        s.apply_confirmed_exclusions(mask(&[0]));
+        assert_eq!(s.lowest_alive_id(), 2);
+
+        s.apply_confirmed_exclusions(mask(&[1]));
+        assert_eq!(s.lowest_alive_id(), 5, "falls back to own id");
+    }
+
+    #[test]
+    fn recordings_from_unknown_and_lost_peers_are_handled_differently() {
+        // An unknown sender is a protocol error and must be reported.
+        // A Lost sender is expected traffic and is dropped silently,
+        // otherwise every excluded node would raise warnings forever.
+        let mut s = state_with(&[1, 2], 2);
+        assert_eq!(
+            s.record_peer_result(9, result(1.0)),
+            Err(DiscoveryError::UnknownPeer)
+        );
+
+        s.apply_confirmed_exclusions(mask(&[0]));
+        assert!(s.record_peer_result(1, result(1.0)).is_ok());
+        assert!(s.cycle().peer_results[0].is_none(), "value must be dropped");
+    }
+
+    #[test]
+    fn crc_unanimity_requires_every_non_lost_peer() {
+        let mut s = state_with(&[1, 2], 2);
+        assert!(!s.crc_unanimous(0xAA), "no attestations yet");
+
+        s.record_peer_crc(1, 0xAA).expect("known peer");
+        assert!(!s.crc_unanimous(0xAA), "one attestation is not enough");
+
+        s.record_peer_crc(2, 0xAA).expect("known peer");
+        assert!(s.crc_unanimous(0xAA));
+        assert!(!s.crc_unanimous(0xBB));
+
+        // A Lost peer is no longer expected to attest.
+        let mut s = state_with(&[1, 2], 2);
+        s.apply_confirmed_exclusions(mask(&[1]));
+        s.record_peer_crc(1, 0xAA).expect("known peer");
+        assert!(s.crc_unanimous(0xAA));
+    }
+
+    #[test]
+    fn missing_crc_attestations_are_listed_by_peer_id() {
+        let mut s = state_with(&[1, 2], 2);
+        s.record_peer_crc(1, 0xAA).expect("known peer");
+        assert_eq!(s.healthy_peers_missing_crc().as_slice(), &[2]);
+
+        s.reset_crc_evidence();
+        assert_eq!(s.healthy_peers_missing_crc().as_slice(), &[1, 2]);
+    }
+
+    #[test]
+    fn a_crc_majority_is_identified_and_the_minority_named() {
+        let mut s = state_with(&[1, 2], 2);
+        s.record_peer_crc(1, 0xAA).expect("known peer");
+        s.record_peer_crc(2, 0xBB).expect("known peer");
+
+        assert_eq!(s.identify_crc_majority(0xAA), Some(0xAA));
+        assert_eq!(s.peers_with_crc_other_than(0xAA).as_slice(), &[2]);
+    }
+
+    #[test]
+    fn an_even_crc_split_has_no_majority() {
+        // Four nodes, two against two. There is no majority to side
+        // with, so the caller has to go failsafe instead of picking the
+        // half it happens to belong to.
+        let mut s = state_with(&[1, 2, 3], 2);
+        s.record_peer_crc(1, 0xAA).expect("known peer");
+        s.record_peer_crc(2, 0xBB).expect("known peer");
+        s.record_peer_crc(3, 0xBB).expect("known peer");
+
+        assert_eq!(s.identify_crc_majority(0xAA), None);
+    }
+
+    #[test]
+    fn strict_majority_needs_more_than_half() {
+        assert_eq!(strict_majority(&[1u32, 1, 2]), Some(1));
+        assert_eq!(strict_majority(&[1u32, 2]), None);
+        assert_eq!(strict_majority(&[1u32, 1, 2, 2]), None);
+        assert_eq!(strict_majority::<u32>(&[]), None);
+        assert_eq!(strict_majority(&[7u32]), Some(7));
+    }
+
+    #[test]
+    fn a_cycle_sync_beacon_alone_makes_a_peer_owe_a_vote() {
+        // Regression guard. Entering error management straight from a
+        // CycleSync timeout means no result and no ack slot has been
+        // touched yet. If only those two counted as evidence, the vote
+        // round would complete with nobody owing anything and the
+        // exclusion would silently never happen.
+        let mut s = state_with(&[1, 2], 2);
+        assert!(
+            s.healthy_peers_missing_vote().is_empty(),
+            "no evidence at all means nobody is expected to reply"
+        );
+
+        s.record_peer_seen_mask(1, mask(&[0])).expect("known peer");
+        assert_eq!(s.healthy_peers_missing_vote().as_slice(), &[1]);
+
+        s.record_peer_exclusion_proposal(1, PeerMask::EMPTY)
+            .expect("known peer");
+        assert!(s.healthy_peers_missing_vote().is_empty());
+    }
+
+    #[test]
+    fn a_peer_we_propose_to_exclude_is_not_expected_to_vote() {
+        // Rule 2b only waits for peers we still consider healthy.
+        // Waiting for the accused would time out every exclusion.
+        let mut s = state_with(&[1, 2], 2);
+        s.record_peer_seen_mask(1, mask(&[0])).expect("known peer");
+        s.propose_exclude(1).expect("known peer");
+        assert!(s.healthy_peers_missing_vote().is_empty());
+    }
+
+    #[test]
+    fn results_and_acks_also_count_as_vote_evidence() {
+        let mut s = state_with(&[1, 2], 2);
+        s.record_peer_result(1, result(1.0)).expect("known peer");
+        s.record_peer_ack(2, ack(mask(&[0]))).expect("known peer");
+        assert_eq!(s.healthy_peers_missing_vote().as_slice(), &[1, 2]);
+    }
+
+    #[test]
+    fn the_exclusion_vote_is_aggregated_from_own_and_peer_proposals() {
+        // End-to-end wiring check between the local proposal, the
+        // recorded peer proposals and the confirmed mask.
+        let mut s = state_with(&[1, 2], 2);
+        s.propose_exclude(2).expect("known peer");
+        // Node 1 orders its peers [0, 2], so node 2 sits at bit 1.
+        s.record_peer_exclusion_proposal(1, mask(&[1]))
+            .expect("known peer");
+
+        let confirmed = s.aggregate_exclusion_votes();
+        assert!(confirmed.contains(1));
+        assert_eq!(s.apply_confirmed_exclusions(confirmed), 1);
+        assert_eq!(s.peers()[1].health, PeerHealth::Lost);
+    }
+
+    #[test]
+    fn attribution_feeds_the_local_proposal() {
+        let mut s = state_with(&[1, 2], 2);
+        s.set_own_seen_bit(0);
+        s.record_peer_seen_mask(1, mask(&[0])).expect("known peer");
+        s.attribute_cycle_sync_missing();
+
+        assert!(s.proposed_exclusions().contains(1), "node 2 was absent");
+        assert!(!s.proposed_exclusions().contains(0));
+    }
+
+    #[test]
+    fn the_local_proposal_is_the_union_over_the_cycle() {
+        // Attribution runs once per phase and the results accumulate,
+        // so a peer that vanished in one phase stays proposed even if a
+        // later phase has no evidence about it.
+        let mut s = state_with(&[1, 2], 2);
+        s.set_own_seen_bit(0);
+        s.record_peer_seen_mask(1, mask(&[0])).expect("known peer");
+        s.attribute_cycle_sync_missing();
+        s.record_peer_result(1, result(1.0)).expect("known peer");
+        s.record_peer_result(2, result(1.0)).expect("known peer");
+        s.attribute_result_missing();
+
+        assert!(s.proposed_exclusions().contains(1));
+    }
+
+    #[test]
+    fn rejoin_votes_need_unanimity_among_healthy_peers() {
+        let mut s = state_with(&[1, 2], 2);
+        s.set_rejoin_seen(3);
+        let mut vote = NodeIdMask::EMPTY;
+        assert!(vote.set(3));
+
+        // One peer silent: no rejoin this cycle.
+        s.record_peer_rejoin_vote(1, vote).expect("known peer");
+        assert_eq!(s.aggregate_rejoin_votes(), NodeIdMask::EMPTY);
+
+        s.record_peer_rejoin_vote(2, vote).expect("known peer");
+        assert!(s.aggregate_rejoin_votes().contains(3));
+
+        // A peer that saw nothing vetoes the readmission.
+        let mut s = state_with(&[1, 2], 2);
+        s.set_rejoin_seen(3);
+        s.record_peer_rejoin_vote(1, vote).expect("known peer");
+        s.record_peer_rejoin_vote(2, NodeIdMask::EMPTY)
+            .expect("known peer");
+        assert_eq!(s.aggregate_rejoin_votes(), NodeIdMask::EMPTY);
+    }
+
+    #[test]
+    fn a_vote_without_our_own_observation_is_empty() {
+        let mut s = state_with(&[1, 2], 2);
+        let mut vote = NodeIdMask::EMPTY;
+        assert!(vote.set(3));
+        s.record_peer_rejoin_vote(1, vote).expect("known peer");
+        s.record_peer_rejoin_vote(2, vote).expect("known peer");
+        assert_eq!(s.aggregate_rejoin_votes(), NodeIdMask::EMPTY);
+    }
+
+    #[test]
+    fn voting_without_an_own_result_is_insufficient_quorum() {
+        // The node cannot vote on a cycle it did not compute, and it
+        // must not fall back to the peer values alone.
+        let mut s = state_with(&[1, 2], 2);
+        s.record_peer_result(1, result(10.0)).expect("known peer");
+        s.record_peer_result(2, result(10.0)).expect("known peer");
+        assert_eq!(s.run_vote(), VotingOutcome::InsufficientQuorum);
+    }
+
+    #[test]
+    fn voting_passes_only_alive_peer_values_to_the_voter() {
+        // A probation peer is on the wire but must not carry the vote.
+        // With its value counted, the two agreeing values below would
+        // be outvoted by a third.
+        let mut s = state_with(&[1, 2], 2);
+        s.apply_confirmed_exclusions(mask(&[0]));
+        assert!(s.readmit_peer(1));
+
+        s.record_own_result(result(10.0));
+        s.record_peer_result(1, result(900.0)).expect("known peer");
+        s.record_peer_result(2, result(10.0)).expect("known peer");
+
+        match s.run_vote() {
+            VotingOutcome::Consensus(d) => assert!((d.total_distance - 10.0).abs() < 1e-9),
+            other => panic!("expected consensus, got {other:?}"),
+        }
+        assert!(s.last_decision().is_some());
+    }
+
+    #[test]
+    fn starting_a_new_cycle_clears_the_per_cycle_evidence() {
+        let mut s = state_with(&[1, 2], 2);
+        s.record_own_result(result(10.0));
+        s.record_peer_result(1, result(10.0)).expect("known peer");
+        s.record_peer_ack(1, ack(mask(&[0]))).expect("known peer");
+        s.propose_exclude(2).expect("known peer");
+        s.set_rejoin_seen(3);
+        let before = s.current_seq();
+
+        s.start_new_cycle();
+
+        assert_eq!(s.current_seq(), before + 1);
+        assert!(s.cycle().own_result.is_none());
+        assert!(s.cycle().peer_results[0].is_none());
+        assert!(s.cycle().peer_acks[0].is_none());
+        assert_eq!(s.proposed_exclusions(), PeerMask::EMPTY);
+        assert_eq!(s.own_rejoin_vote(), NodeIdMask::EMPTY);
+        assert!(s.last_decision().is_none());
+    }
+
+    #[test]
+    fn discovery_rejects_a_fabric_of_the_wrong_size() {
+        // Finalizing with fewer nodes than configured would let a
+        // partially started fabric run with a silently reduced quorum.
+        let mut s = State::new(
+            0,
+            1,
+            BrakeVoter::new(2, 0.5),
+            ParticipantConfig::new(2, 3, 10),
+        );
+        s.on_peer_discovered(1).expect("discover");
+        assert_eq!(
+            s.finalize_discovery(),
+            Err(DiscoveryError::WrongNodeCount {
+                found: 2,
+                expected: 3
+            })
+        );
+    }
+
+    #[test]
+    fn discovering_our_own_id_or_a_duplicate_is_ignored() {
+        let mut s = State::new(
+            0,
+            1,
+            BrakeVoter::new(2, 0.5),
+            ParticipantConfig::new(2, 3, 10),
+        );
+        s.on_peer_discovered(0).expect("own id");
+        s.on_peer_discovered(1).expect("peer");
+        s.on_peer_discovered(1).expect("duplicate");
+        s.on_peer_discovered(2).expect("peer");
+        s.finalize_discovery().expect("exactly three nodes");
+        assert_eq!(s.peers().len(), 2);
     }
 }

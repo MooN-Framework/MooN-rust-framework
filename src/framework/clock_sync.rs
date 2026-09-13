@@ -27,9 +27,13 @@ pub const SAMPLES_PER_PEER: usize = 8;
 /// A single Cristian measurement with all four timestamps.
 #[derive(Debug, Clone, Copy)]
 pub struct SyncSample {
+    /// Requester send time, local clock.
     pub t1: u64,
+    /// Responder receive time, peer clock.
     pub t2: u64,
+    /// Responder send time, peer clock.
     pub t3: u64,
+    /// Requester receive time, local clock.
     pub t4: u64,
 }
 
@@ -59,9 +63,14 @@ impl SyncSample {
 /// Aggregated per-peer clock sync result after the phase completes.
 #[derive(Debug, Clone, Copy)]
 pub struct PeerClock {
+    /// Peer this offset belongs to.
     pub peer_id: u8,
+    /// Best estimate of `peer_clock - own_clock`, in nanoseconds.
     pub offset_ns: i64,
+    /// Upper bound on the error of `offset_ns`, in nanoseconds. Feeds
+    /// the fabric-wide epsilon used for staleness checks.
     pub error_bound_ns: i64,
+    /// How many samples the estimate was picked from.
     pub samples_used: u32,
 }
 
@@ -277,16 +286,26 @@ impl ClockSync {
 /// Discriminated view over the time-sync payload variants extracted from
 /// a received frame.
 pub enum SyncFields {
+    /// An incoming request that has to be answered.
     Request {
+        /// Requesting peer.
         peer_id: u8,
+        /// Requester send time, echoed back unchanged.
         t1: u64,
+        /// Local receive time for this request.
         t2_local: u64,
     },
+    /// A response to one of our own requests.
     Response {
+        /// Responding peer.
         peer_id: u8,
+        /// Echo of our send time, used to match the round trip.
         t1: u64,
+        /// Peer receive time.
         t2: u64,
+        /// Peer send time.
         t3: u64,
+        /// Local receive time for this response.
         t4_local: u64,
     },
 }

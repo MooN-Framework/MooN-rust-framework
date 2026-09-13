@@ -46,22 +46,33 @@ use tracing::{debug, error, info, warn};
 /// relevant send/receive sites and decremented on effect.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct InjectionState {
-    // Per-frame-type drop counters. Each `should_drop_*` call decrements.
+    /// Remaining Input frames to suppress.
     pub drop_next_n_inputs: u32,
+    /// Remaining Result frames to suppress.
     pub drop_next_n_results: u32,
+    /// Remaining Ack frames to suppress.
     pub drop_next_n_acks: u32,
+    /// Remaining CycleSync beacons to suppress.
     pub drop_next_n_cyclesync: u32,
+    /// Remaining CRC attestations to suppress.
     pub drop_next_n_crc: u32,
+    /// Remaining exclusion proposals to suppress.
     pub drop_next_n_votes: u32,
 
-    // Value corruption counters.
+    /// Remaining cycles to report a bogus system-state CRC.
     pub fake_crc_remaining: u32,
+    /// Remaining cycles to nominate the wrong publisher.
     pub divergent_publisher_remaining: u32,
 
-    // Whole-node behaviour.
+    /// Remaining cycles of soft shutdown. Reversible, unlike a real
+    /// process exit.
     pub mute_cycles_remaining: u32,
+    /// Extra milliseconds to sleep in ReadInputs while the delay is
+    /// active.
     pub cycle_delay_ms: u32,
+    /// Remaining cycles to apply `cycle_delay_ms`.
     pub cycle_delay_remaining: u32,
+    /// Remaining cycles to corrupt the own result before sending.
     pub corrupt_result_remaining: u32,
 
     /// Bit N set means: drop every incoming frame whose sender node id
@@ -72,6 +83,7 @@ pub struct InjectionState {
     /// runner replaces the node_state_wire byte with
     /// `fake_phase_header_value`. Decremented once per send.
     pub fake_phase_header_remaining: u32,
+    /// State byte written in place of the real one.
     pub fake_phase_header_value: u8,
 }
 
@@ -81,50 +93,118 @@ pub struct InjectionState {
 pub enum IncomingTelegram {
     /// New computation input broadcast to all nodes. Opaque JSON — the
     /// runner deserialises against `C::Input` on apply.
-    Input { value: serde_json::Value },
+    Input {
+        /// Opaque input value, deserialized against `C::Input` on apply.
+        value: serde_json::Value,
+    },
     /// Command targeted at specific nodes. `Command::TargetedInput`
     /// carries a value that only the targeted nodes will pick up,
     /// enabling per-node input divergence tests (T5).
     Command {
+        /// Node ids this command applies to.
         targets: Vec<u8>,
+        /// The command itself.
         #[serde(flatten)]
         payload: Command,
     },
 }
 
+/// A command addressed to one or more nodes.
+///
+/// Everything except `GetStatus` is staged and applied at the next
+/// cycle boundary, so an injection takes effect on every targeted node
+/// in the same cycle.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
+    /// Ask for a status response. Answered immediately, not staged.
     GetStatus,
 
-    // Frame-type suppression.
-    InjectDropInputs { count: u32 },
-    InjectDropResults { count: u32 },
-    InjectDropAcks { count: u32 },
-    InjectDropCyclesync { count: u32 },
-    InjectDropCrc { count: u32 },
-    InjectDropVotes { count: u32 },
+    /// Suppress the next `count` Input frames.
+    InjectDropInputs {
+        /// Frames to suppress.
+        count: u32,
+    },
+    /// Suppress the next `count` Result frames.
+    InjectDropResults {
+        /// Frames to suppress.
+        count: u32,
+    },
+    /// Suppress the next `count` Ack frames.
+    InjectDropAcks {
+        /// Frames to suppress.
+        count: u32,
+    },
+    /// Suppress the next `count` CycleSync beacons.
+    InjectDropCyclesync {
+        /// Frames to suppress.
+        count: u32,
+    },
+    /// Suppress the next `count` CRC attestations.
+    InjectDropCrc {
+        /// Frames to suppress.
+        count: u32,
+    },
+    /// Suppress the next `count` exclusion proposals.
+    InjectDropVotes {
+        /// Frames to suppress.
+        count: u32,
+    },
 
-    // Value corruption.
-    InjectFakeCrc { count: u32 },
-    InjectDivergentPublisher { count: u32 },
+    /// Report a bogus system-state CRC for `count` cycles.
+    InjectFakeCrc {
+        /// Cycles to stay active.
+        count: u32,
+    },
+    /// Nominate the wrong publisher for `count` cycles.
+    InjectDivergentPublisher {
+        /// Cycles to stay active.
+        count: u32,
+    },
 
-    // Whole-node behaviour.
+    /// Exit the process at the next cycle boundary.
     InjectShutdown,
-    InjectMute { cycles: u32 },
-    InjectCycleDelay { ms: u32, count: u32 },
-    InjectTargetedInput { value: serde_json::Value },
-    InjectCorruptResult { count: u32 },
+    /// Go silent for `cycles` cycles without exiting. Reversible.
+    InjectMute {
+        /// Cycles to stay muted.
+        cycles: u32,
+    },
+    /// Sleep `ms` extra milliseconds in ReadInputs for `count` cycles.
+    InjectCycleDelay {
+        /// Extra sleep per affected cycle.
+        ms: u32,
+        /// Cycles to stay active.
+        count: u32,
+    },
+    /// Apply an input only on the targeted nodes, which produces input
+    /// divergence without touching the other nodes.
+    InjectTargetedInput {
+        /// Opaque input value for the targeted nodes.
+        value: serde_json::Value,
+    },
+    /// Corrupt the own result before sending, for `count` cycles.
+    InjectCorruptResult {
+        /// Cycles to stay active.
+        count: u32,
+    },
 
     /// T10 — asymmetric view. `peers_mask` bit N = drop frames whose
     /// sender node id is N. Persistent until ClearInjection.
-    InjectDropFromPeer { peers_mask: u8 },
+    InjectDropFromPeer {
+        /// Bit N set means drop frames from node id N.
+        peers_mask: u8,
+    },
 
     /// T16 — phase-header spoof. For `count` outgoing frames, replace
     /// the node_state_wire byte with `wire_value`. `wire_value` should
     /// decode to a valid NodeState variant, otherwise the runner logs
     /// a warning and falls back to the real state.
-    InjectFakePhaseHeader { count: u32, wire_value: u8 },
+    InjectFakePhaseHeader {
+        /// Frames to spoof.
+        count: u32,
+        /// State byte to write instead of the real one.
+        wire_value: u8,
+    },
 
     /// One-shot: on the next `handle_read_inputs`, skip the
     /// `record_own_input` call so the following ShareInputs sees no
@@ -136,40 +216,65 @@ pub enum Command {
     /// the `LocalFault` failsafe path. Self-clearing.
     InjectComputationFail,
 
+    /// Clear every active injection, persistent ones included.
     ClearInjection,
 }
 
+/// A node's reply on the diagnostic channel.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutgoingTelegram<'a> {
+    /// Acknowledges that a command was accepted and will take effect at
+    /// the next cycle boundary.
     Staged {
+        /// Replying node.
         source_node_id: u8,
+        /// Which command was staged.
         staged_kind: &'a str,
     },
+    /// Answer to `GetStatus`.
     Status {
+        /// Replying node.
         source_node_id: u8,
+        /// The status itself.
         data: StatusResponse,
     },
+    /// A command could not be accepted.
     Error {
+        /// Replying node.
         source_node_id: u8,
+        /// What went wrong.
         message: String,
     },
 }
 
+/// One node's view of itself, as reported to the diagnostic tool.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct StatusResponse {
+    /// Reporting node.
     pub node_id: u8,
+    /// Session id of the current process run.
     pub session_id: u64,
+    /// Current phase, `Debug`-formatted.
     pub node_state: String,
+    /// Current cycle counter.
     pub current_seq: u32,
+    /// Duration of the last completed cycle, in microseconds.
     pub last_cycle_us: Option<u128>,
+    /// Whether the clock offsets are currently usable.
     pub sync_valid: bool,
+    /// Current clock uncertainty, in nanoseconds.
     pub sync_epsilon_ns: i64,
+    /// Cycles since the last clock-sync round.
     pub cycles_since_last_sync: u32,
+    /// Peers as this node sees them.
     pub peers: Vec<PeerStatus>,
+    /// Injections currently active on this node.
     pub injection: InjectionSnapshot,
+    /// Whether an input is staged for the next cycle boundary.
     pub pending_input: bool,
+    /// Whether an injection change is staged for the next boundary.
     pub pending_injection_update: bool,
 
     /// Failsafe reason latched by the first `mark_failsafe` call this
@@ -184,40 +289,65 @@ pub struct StatusResponse {
     pub recent_transitions: Vec<TransitionRecord>,
 }
 
+/// One recorded state-machine transition.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TransitionRecord {
+    /// State the node was in.
     pub from: String,
+    /// Event the phase handler returned.
     pub event: String,
+    /// State the node moved to.
     pub to: String,
 }
 
+/// One peer as seen by the reporting node.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct PeerStatus {
+    /// Peer node id.
     pub id: u8,
+    /// Peer health, `Debug`-formatted.
     pub health: String,
+    /// Consecutive cycles this peer was faulted.
     pub consecutive_faults: u32,
+    /// Consecutive healthy cycles, i.e. probation progress.
     pub consecutive_healthy_cycles: u32,
 }
 
+/// Serializable copy of [`InjectionState`] for the status reply.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct InjectionSnapshot {
+    /// Remaining Input frames to suppress.
     pub drop_next_n_inputs: u32,
+    /// Remaining Result frames to suppress.
     pub drop_next_n_results: u32,
+    /// Remaining Ack frames to suppress.
     pub drop_next_n_acks: u32,
+    /// Remaining CycleSync beacons to suppress.
     pub drop_next_n_cyclesync: u32,
+    /// Remaining CRC attestations to suppress.
     pub drop_next_n_crc: u32,
+    /// Remaining exclusion proposals to suppress.
     pub drop_next_n_votes: u32,
+    /// Remaining cycles reporting a bogus CRC.
     pub fake_crc_remaining: u32,
+    /// Remaining cycles nominating the wrong publisher.
     pub divergent_publisher_remaining: u32,
+    /// Remaining muted cycles.
     pub mute_cycles_remaining: u32,
+    /// Extra sleep per affected cycle, in milliseconds.
     pub cycle_delay_ms: u32,
+    /// Remaining cycles applying the delay.
     pub cycle_delay_remaining: u32,
+    /// Remaining cycles corrupting the own result.
     pub corrupt_result_remaining: u32,
+    /// Senders currently being dropped, one bit per node id.
     pub drop_from_peers_mask: u8,
+    /// Remaining frames with a spoofed state byte.
     pub fake_phase_header_remaining: u32,
+    /// State byte written in place of the real one.
     pub fake_phase_header_value: u8,
 }
 
@@ -225,24 +355,39 @@ pub struct InjectionSnapshot {
 /// fields have overwrite semantics.
 #[derive(Debug, Default)]
 pub struct PendingChanges {
+    /// Input broadcast to every node.
     pub input_json: Option<serde_json::Value>,
+    /// Input for this node only.
     pub targeted_input_json: Option<serde_json::Value>,
 
+    /// Staged Input suppression count.
     pub drop_next_n_inputs: Option<u32>,
+    /// Staged Result suppression count.
     pub drop_next_n_results: Option<u32>,
+    /// Staged Ack suppression count.
     pub drop_next_n_acks: Option<u32>,
+    /// Staged CycleSync suppression count.
     pub drop_next_n_cyclesync: Option<u32>,
+    /// Staged CRC suppression count.
     pub drop_next_n_crc: Option<u32>,
+    /// Staged exclusion-proposal suppression count.
     pub drop_next_n_votes: Option<u32>,
 
+    /// Staged bogus-CRC cycle count.
     pub fake_crc_remaining: Option<u32>,
+    /// Staged divergent-publisher cycle count.
     pub divergent_publisher_remaining: Option<u32>,
 
+    /// Staged mute duration in cycles.
     pub mute_cycles_remaining: Option<u32>,
-    pub cycle_delay: Option<(u32, u32)>, // (ms, count)
+    /// Staged cycle delay as `(milliseconds, cycles)`.
+    pub cycle_delay: Option<(u32, u32)>,
 
+    /// Clear every active injection at the next boundary.
     pub clear_injection: bool,
+    /// Exit the process at the next boundary.
     pub shutdown: bool,
+    /// Staged result-corruption cycle count.
     pub corrupt_result_remaining: Option<u32>,
 
     /// T10 staging.
@@ -250,16 +395,20 @@ pub struct PendingChanges {
     /// T16 staging: (count, wire_value).
     pub fake_phase_header: Option<(u32, u8)>,
 
-    /// One-shot flags picked up by the runner in apply_pending_diagnostic.
+    /// One-shot: skip `record_own_input` in the next ReadInputs.
     pub inject_input_provider_fail: bool,
+    /// One-shot: fail the next compute step without calling the
+    /// application's `compute`.
     pub inject_computation_fail: bool,
 }
 
 impl PendingChanges {
+    /// True when an input is staged, broadcast or targeted.
     pub fn has_input(&self) -> bool {
         self.input_json.is_some() || self.targeted_input_json.is_some()
     }
 
+    /// True when any injection change is staged.
     pub fn has_injection_update(&self) -> bool {
         self.drop_next_n_inputs.is_some()
             || self.drop_next_n_results.is_some()
@@ -280,15 +429,22 @@ impl PendingChanges {
     }
 }
 
+/// The node's end of the diagnostic channel.
+///
+/// Owns the socket, the active injections and the changes staged for
+/// the next cycle boundary.
 pub struct Diagnostic {
     socket: UdpSocket,
     multicast_addr: SocketAddrV4,
     node_id: u8,
+    /// Injections currently in effect.
     pub injection: InjectionState,
+    /// Changes waiting for the next cycle boundary.
     pub pending: PendingChanges,
 }
 
 impl Diagnostic {
+    /// Bind the diagnostic socket and join its multicast group.
     pub fn new(cfg: &DiagnosticConfig, node_id: u8) -> Result<Self, io::Error> {
         let iface_ip = interface_ipv4(&cfg.interface_name).ok_or_else(|| {
             io::Error::new(
@@ -325,6 +481,9 @@ impl Diagnostic {
         })
     }
 
+    /// Poll the socket once, non-blocking. Staging commands are
+    /// applied to `pending` and return `None`; `GetStatus` is returned
+    /// to the caller, which has the state needed to answer it.
     pub fn try_recv(&mut self) -> Option<Command> {
         let mut buf = [0u8; 4096];
         let (n, _) = match self.socket.recv_from(&mut buf) {
@@ -354,6 +513,8 @@ impl Diagnostic {
         }
     }
 
+    /// Broadcast a reply. Failures are logged, never propagated: the
+    /// diagnostic channel must not affect the cycle.
     pub fn send(&self, telegram: &OutgoingTelegram) {
         let bytes = match serde_json::to_vec(telegram) {
             Ok(b) => b,
@@ -423,6 +584,8 @@ impl Diagnostic {
         }
     }
 
+    /// Take the staged input, if any. Targeted input wins over a
+    /// broadcast one.
     pub fn take_pending_input(&mut self) -> Option<serde_json::Value> {
         self.pending
             .targeted_input_json
@@ -430,30 +593,45 @@ impl Diagnostic {
             .or_else(|| self.pending.input_json.take())
     }
 
+    /// Take the staged shutdown flag.
     pub fn take_pending_shutdown(&mut self) -> bool {
         core::mem::replace(&mut self.pending.shutdown, false)
     }
 
     // --- Drop counters ---------------------------------------------------
 
+    /// True when an Input frame should be suppressed this cycle.
+    /// Decrements the counter.
     pub fn should_drop_input(&mut self) -> bool {
         dec(&mut self.injection.drop_next_n_inputs)
     }
+    /// True when a Result frame should be suppressed this cycle.
+    /// Decrements the counter.
     pub fn should_drop_result(&mut self) -> bool {
         dec(&mut self.injection.drop_next_n_results)
     }
+    /// True when an Ack frame should be suppressed this cycle.
+    /// Decrements the counter.
     pub fn should_drop_ack(&mut self) -> bool {
         dec(&mut self.injection.drop_next_n_acks)
     }
+    /// True when a CycleSync beacon should be suppressed this cycle.
+    /// Decrements the counter.
     pub fn should_drop_cyclesync(&mut self) -> bool {
         dec(&mut self.injection.drop_next_n_cyclesync)
     }
+    /// True when a CRC attestation should be suppressed this cycle.
+    /// Decrements the counter.
     pub fn should_drop_crc(&mut self) -> bool {
         dec(&mut self.injection.drop_next_n_crc)
     }
+    /// True when an exclusion proposal should be suppressed this cycle.
+    /// Decrements the counter.
     pub fn should_drop_vote(&mut self) -> bool {
         dec(&mut self.injection.drop_next_n_votes)
     }
+    /// True when the own result should be corrupted before sending.
+    /// Decrements the counter.
     pub fn should_corrupt_result(&mut self) -> bool {
         dec(&mut self.injection.corrupt_result_remaining)
     }
@@ -515,6 +693,7 @@ impl Diagnostic {
         (mute_active, delay_ms)
     }
 
+    /// Node id this diagnostic instance belongs to.
     pub fn node_id(&self) -> u8 {
         self.node_id
     }

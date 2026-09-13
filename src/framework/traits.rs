@@ -1,3 +1,20 @@
+//! The seams between the framework and an application.
+//!
+//! A MooN deployment is the framework plus six domain decisions: what a
+//! cycle reads ([`InputSource`]), what it computes ([`Computation`]),
+//! how the results are reduced to one value ([`Voter`]), what happens
+//! to that value ([`DecisionSink`]), what the node checks before it
+//! joins ([`SelfTest`]), and what domain state has to stay in step
+//! across nodes ([`ApplicationStateProvider`]).
+//!
+//! Two conventions run through all of them. Payloads have a fixed wire
+//! size so the cyclic path never allocates, and fallible operations
+//! fail loudly: the framework routes an `Err` to failsafe rather than
+//! guessing a recovery, because guessing is a domain decision the
+//! application has to make itself.
+//!
+//! See [`crate::brake`] for a worked implementation of all six.
+
 use crate::framework::config::MAX_DISSENTERS;
 use crate::framework::wire::{PayloadError, WireReader, WireWriter};
 use core::fmt;
@@ -7,13 +24,23 @@ use heapless::Vec;
 /// Value each node computes and shares per cycle. Wire size is fixed for
 /// deterministic memory use on safety-critical paths.
 pub trait CyclePayload: Copy + PartialEq + core::fmt::Debug {
+    /// Exact number of bytes this payload occupies on the wire.
     const WIRE_SIZE: usize;
 
+    /// Serialize into `w`. Must write exactly `WIRE_SIZE` bytes.
     fn to_wire(&self, w: &mut WireWriter<'_>);
+    /// Deserialize from `r`, rejecting anything that is not a valid
+    /// encoding of this type.
     fn from_wire(r: &mut WireReader<'_>) -> Result<Self, PayloadError>;
 }
 
+/// Fault-injection hook, active only under the `diagnostic` feature.
+///
+/// Without the feature a blanket no-op impl applies, so production
+/// builds carry no injection path at all.
 pub trait Corruptible: CyclePayload {
+    /// Alter the value so it is guaranteed to fail the voter's
+    /// agreement check.
     fn corrupt(&mut self);
 }
 
@@ -22,10 +49,15 @@ impl<T: CyclePayload> Corruptible for T {
     fn corrupt(&mut self) {}
 }
 
+/// What the voter made of one cycle's values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VotingOutcome<D> {
+    /// A sufficient group agreed; carries the representative value.
     Consensus(D),
+    /// Enough values arrived, but no group reached the required
+    /// agreement. An even split lands here.
     Disagreement,
+    /// Too few values arrived to decide at all.
     InsufficientQuorum,
 }
 
@@ -40,7 +72,9 @@ pub enum VotingOutcome<D> {
 ///   indices it returns are roster slots and are mapped back to peer
 ///   ids by the runner.
 pub trait Voter {
+    /// Per-node value being voted on.
     type Payload: CyclePayload;
+    /// Value produced once the vote succeeds.
     type Decision: Copy;
 
     /// Values of the `Alive` peers only, compacted — `None` means that
@@ -71,10 +105,14 @@ pub trait Voter {
 
 /// Domain-specific computation: raw inputs -> shareable payload.
 pub trait Computation {
+    /// Sensor value one cycle operates on.
     type Input: Copy + CyclePayload;
+    /// Value produced per cycle and handed to the voter.
     type Payload: CyclePayload;
+    /// Why a computation failed. Routes the node to failsafe.
     type Error: fmt::Debug;
 
+    /// Run the safety function for one cycle.
     fn compute(&mut self, input: Self::Input) -> Result<Self::Payload, Self::Error>;
 
     /// Divergence gate on sensor inputs. Returns true when `own` and
@@ -112,7 +150,10 @@ pub trait Computation {
 /// emergency brake) before the runner terminates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkVerdict {
+    /// The decision is safe to hand to the actuator.
     Deliver,
+    /// The decision itself is a reason to stop: the whole system goes
+    /// fail-stop after it has been published.
     Failsafe,
 }
 
@@ -128,6 +169,7 @@ pub enum SinkVerdict {
 ///   into its safe state. Called exactly once, right before the runner
 ///   exits.
 pub trait DecisionSink {
+    /// Value handed down by the voter.
     type Decision;
 
     /// Domain-specific safety gate. Every node calls this after voting
@@ -157,8 +199,10 @@ pub trait DecisionSink {
 /// arbitrary checks (deterministic-compute vectors, sensor sanity,
 /// memory patterns, watchdog probes) behind `run`.
 pub trait SelfTest {
+    /// Why the check failed. Logged before the node goes to failsafe.
     type Error: fmt::Debug;
 
+    /// Run every check. `Err` prevents the node from joining.
     fn run(&mut self) -> Result<(), Self::Error>;
 }
 
@@ -183,7 +227,9 @@ pub trait SelfTest {
 /// mode to propagate. Default is a no-op; impls that only pull from
 /// hardware can ignore it.
 pub trait InputSource {
+    /// Sensor value produced per cycle.
     type Input: CyclePayload;
+    /// Why a read failed. Routes the node to failsafe.
     type Error: fmt::Debug;
 
     /// Fetch the current sensor value for this cycle. `Err` triggers
@@ -207,10 +253,13 @@ pub struct LatchedInput<T: CyclePayload> {
 }
 
 impl<T: CyclePayload> LatchedInput<T> {
+    /// Latch holding `initial` until something calls
+    /// [`InputSource::set`].
     pub fn new(initial: T) -> Self {
         Self { current: initial }
     }
 
+    /// The currently latched value.
     pub fn current(&self) -> T {
         self.current
     }
@@ -242,9 +291,14 @@ impl<T: CyclePayload> InputSource for LatchedInput<T> {
 /// `WIRE_SIZE` is checked at compile time against
 /// `MAX_APPLICATION_DATA_SIZE` in `framework::config`.
 pub trait ApplicationData: Copy + PartialEq + fmt::Debug {
+    /// Exact number of bytes this state occupies inside the snapshot
+    /// payload. Checked against `MAX_APPLICATION_DATA_SIZE` at compile
+    /// time.
     const WIRE_SIZE: usize;
 
+    /// Serialize into `w`. Must write exactly `WIRE_SIZE` bytes.
     fn to_wire(&self, w: &mut WireWriter<'_>);
+    /// Deserialize from `r`.
     fn from_wire(r: &mut WireReader<'_>) -> Result<Self, PayloadError>;
 }
 
@@ -259,9 +313,13 @@ pub trait ApplicationData: Copy + PartialEq + fmt::Debug {
 /// Use `NoApplicationData` + `NoAppState` for use cases without any
 /// per-node domain state that needs syncing.
 pub trait ApplicationStateProvider {
+    /// The state that travels with the CRC and the snapshot.
     type Data: ApplicationData;
 
+    /// Current application state, hashed into the system-state CRC and
+    /// broadcast during state sync.
     fn snapshot(&self) -> Self::Data;
+    /// Adopt the fabric-agreed state after a successful state sync.
     fn apply(&mut self, data: &Self::Data);
 }
 
