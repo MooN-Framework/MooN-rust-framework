@@ -11,22 +11,13 @@
 //! to CycleSync. Everything else is startup, resynchronisation, or a
 //! fault path.
 //!
+//! [`NodeState::Isolation`] and [`NodeState::Failsafe`] are terminal by
+//! design. Isolation has no outgoing edge at all: a node that has been
+//! voted out stays out until an external restart brings it back through
+//! the normal rejoin path.
+//!
 //! Wire values are part of the protocol version and must not be
 //! renumbered.
-
-/// System-wide operational mode. Set by the runner as the fault-tolerance
-/// buffer of the fabric changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SystemState {
-    /// Discovery and initial synchronisation are still running.
-    Startup,
-    /// Full node count, all configured redundancy available.
-    Operational,
-    /// At least one node excluded, still above the safety floor.
-    Degraded,
-    /// Fail-stop. Terminal.
-    Failsafe,
-}
 
 /// Per-node lifecycle state. Wire values are stable — protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +45,8 @@ pub enum NodeState {
     /// Exchange exclusion proposals and apply the confirmed ones.
     ErrorManagement = 0x08,
     /// Excluded from consensus but not fail-stop: stop broadcasting and
-    /// let the remaining fabric drive the actuator.
+    /// let the remaining fabric drive the actuator. Terminal, an
+    /// external restart is required to return to service.
     Isolation = 0x09,
     /// Cristian's-algorithm clock synchronisation round.
     ClockSync = 0x0A,
@@ -71,8 +63,13 @@ pub enum NodeState {
 pub enum StateEvent {
     /// Power-on self-test passed.
     SelfTestOk,
-    /// Power-on self-test failed, or discovery ended inconsistently.
+    /// Power-on self-test failed. Only ever raised from `Startup`.
     SelfTestErr,
+    /// Discovery closed with a roster the configuration does not allow,
+    /// e.g. the wrong node count. Distinct from a timeout: peers were
+    /// reachable, they just do not add up to a valid fabric, so there is
+    /// nothing to wait for and nothing to vote on.
+    DiscoveryInconsistent,
     /// All configured nodes discovered.
     InitialSyncOk,
     /// Discovery did not complete before its timeout.
@@ -167,6 +164,7 @@ impl NodeState {
             (Startup, SelfTestErr) => Failsafe,
 
             (InitSync, InitialSyncOk) => ClockSync,
+            (InitSync, DiscoveryInconsistent) => Failsafe,
             (InitSync, GoResyncLostPeer) => ResyncLostPeer,
             (InitSync, InitialSyncTimeout) => Failsafe,
 
@@ -207,6 +205,7 @@ impl NodeState {
             
             (ResyncLostPeer, ResyncLostPeerTimeout) => ErrorManagement,
             (ResyncLostPeer, ResyncLostPeerOk) => SystemStateSync,
+            (ResyncLostPeer, DiscoveryInconsistent) => Failsafe,
 
             (SystemStateSync, SystemStateSyncOk) => ClockSync,
             // SystemStateSync failures go to Failsafe rather than
@@ -221,7 +220,6 @@ impl NodeState {
             (SystemStateSync, SystemStateSyncMinority) => Failsafe,
 
             (ErrorManagement, StateOk) => CycleSync,
-            (ErrorManagement, StateDiverged) => Failsafe,
             (ErrorManagement, StateTimeout) => Failsafe,
             (ErrorManagement, TooFewNodes) => Failsafe,
             (ErrorManagement, SelfExcluded) => Isolation,
@@ -313,6 +311,7 @@ mod transition_tests {
         (Startup, SelfTestOk, InitSync),
         (Startup, SelfTestErr, Failsafe),
         (InitSync, InitialSyncOk, ClockSync),
+        (InitSync, DiscoveryInconsistent, Failsafe),
         (InitSync, GoResyncLostPeer, ResyncLostPeer),
         (InitSync, InitialSyncTimeout, Failsafe),
         (ClockSync, ClockSyncOk, CycleSync),
@@ -344,11 +343,11 @@ mod transition_tests {
         (PublishResult, SelfExcluded, Isolation),
         (ResyncLostPeer, ResyncLostPeerTimeout, ErrorManagement),
         (ResyncLostPeer, ResyncLostPeerOk, SystemStateSync),
+        (ResyncLostPeer, DiscoveryInconsistent, Failsafe),
         (SystemStateSync, SystemStateSyncOk, ClockSync),
         (SystemStateSync, SystemStateSyncTimeout, Failsafe),
         (SystemStateSync, SystemStateSyncMinority, Failsafe),
         (ErrorManagement, StateOk, CycleSync),
-        (ErrorManagement, StateDiverged, Failsafe),
         (ErrorManagement, StateTimeout, Failsafe),
         (ErrorManagement, TooFewNodes, Failsafe),
         (ErrorManagement, SelfExcluded, Isolation),
@@ -358,6 +357,7 @@ mod transition_tests {
     const ALL_EVENTS: &[StateEvent] = &[
         SelfTestOk,
         SelfTestErr,
+        DiscoveryInconsistent,
         InitialSyncOk,
         InitialSyncTimeout,
         ClockSyncOk,

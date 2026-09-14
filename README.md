@@ -1,4 +1,4 @@
-# MooN-Framework
+# swb_fault_tolerance
 
 Software-based fault tolerance for MooN systems, in Rust.
 
@@ -29,7 +29,6 @@ in the code is Pi-specific.
 
 ```text
 configs/    One TOML file per node. Self-verifying, see Configuration.
-scripts/    Legacy deployment helpers from the predecessor project.
 src/
   bin/node.rs           Entry point for the brake example.
   brake/                The example application.
@@ -95,7 +94,7 @@ stateDiagram-v2
 
     InitSync --> ClockSync : InitialSyncOk
     InitSync --> ResyncLostPeer : GoResyncLostPeer
-    InitSync --> Failsafe : InitialSyncTimeout
+    InitSync --> Failsafe : InitialSyncTimeout / DiscoveryInconsistent
 
     ClockSync --> CycleSync : ClockSyncOk
     ClockSync --> Failsafe : ClockSyncTimeout
@@ -129,13 +128,14 @@ stateDiagram-v2
 
     ResyncLostPeer --> SystemStateSync : ResyncLostPeerOk
     ResyncLostPeer --> ErrorManagement : ResyncLostPeerTimeout
+    ResyncLostPeer --> Failsafe : DiscoveryInconsistent
 
     SystemStateSync --> ClockSync : SystemStateSyncOk
     SystemStateSync --> Failsafe : SystemStateSyncTimeout / SystemStateSyncMinority
 
     ErrorManagement --> CycleSync : StateOk
     ErrorManagement --> Isolation : SelfExcluded
-    ErrorManagement --> Failsafe : StateDiverged / StateTimeout / TooFewNodes
+    ErrorManagement --> Failsafe : StateTimeout / TooFewNodes
 
     Failsafe --> [*]
 ```
@@ -144,9 +144,20 @@ stateDiagram-v2
 does not name falls through to `Failsafe`. An unexpected event in a
 safety context is a reason to stop, not to improvise.
 
-`Isolation` has no outgoing edge. A node that isolates itself stops
-broadcasting and lets the remaining fabric drive the actuator; it does
-not rejoin without a process restart.
+`Isolation` is a terminal state by design. A node that has been voted
+out stops broadcasting, hands the actuator over to the remaining fabric
+and stops consuming the transport, so it does not observe a later
+fabric-wide failsafe either. That rests on one contract: `on_isolation`
+releases the actuator, after which the node drives nothing and has
+nothing left to bring into a safe state. Returning to service takes an
+external restart of the process, which then goes through the normal
+rejoin path. The handler blocks permanently, so the dead end is
+enforced in the runner and not only by the absence of a transition.
+
+The returning node's `ResyncLostPeer` timeout goes to failsafe rather
+than to error management: at that point discovery has not been
+finalised, so the node is not a participant and has no standing to vote
+on exclusions.
 
 ## Design notes
 
@@ -297,10 +308,8 @@ ports 5555 and 6666 without any sign of it in the application logs.
 
 Hardware deployment goes through the signed image and package tooling in
 the `MooN-pi-gen` repository, and through the deploy and test tabs of the
-diagnostic tool. The scripts in `scripts/` predate that and are kept only
-for reference: they still assume a `config.json`, a `CONFIG_PATH`
-environment variable and a binary called `main`, none of which match this
-code. Do not use them against current nodes.
+diagnostic tool. This repository carries no deployment scripts of its
+own.
 
 ## Diagnostic channel
 

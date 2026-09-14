@@ -186,6 +186,12 @@ pub trait DecisionSink {
 
     /// This node is entering `Isolation`. System operation continues on
     /// the remaining nodes. Default is no-op.
+    ///
+    /// This call must release the actuator. Isolation is terminal and
+    /// the runner stops consuming the transport there, so the node
+    /// never observes a later fabric-wide failsafe and `on_failsafe`
+    /// will not be called. An implementation that keeps any actuation
+    /// past this point has no path left to a safe state.
     fn on_isolation(&mut self) {}
 
     /// System-wide fail-stop is being triggered. Default is no-op.

@@ -12,7 +12,7 @@ use crate::framework::clock_sync::{extract_sync_fields, ClockSync, SyncFields, S
 use crate::framework::state::{
     crc_from_snapshot_fields, serialize_app_data, PeerHealth, StoredSnapshot,
 };
-use crate::framework::state_machine::{NodeState, StateEvent, SystemState};
+use crate::framework::state_machine::{NodeState, StateEvent};
 use crate::framework::traits::SinkVerdict;
 use crate::framework::traits::{
     ApplicationStateProvider, Computation, DecisionSink, InputSource, SelfTest, Voter,
@@ -42,8 +42,6 @@ where
     /// node proceeds to `InitSync`; on `Err` it goes straight to Failsafe
     /// via `SelfTestErr`.
     pub(super) fn handle_startup(&mut self) -> StateEvent {
-        self.state.set_system_state(SystemState::Startup);
-
         // Test hook: `MOON_INJECT_SELFTEST_FAIL=1` in the environment
         // forces this to take the SelfTestFailed path. Only compiled
         // under `feature = "diagnostic"`; production builds ignore
@@ -79,6 +77,23 @@ where
     /// ack round and the publisher election, so a GoFailsafe from the
     /// remaining fabric would not change the local actuator state. Only a
     /// restart brings the node back.
+    /// Isolation: terminal, by design.
+    ///
+    /// The handler never returns. It stops all broadcasting and stops
+    /// consuming the transport entirely, so this node no longer
+    /// observes the fabric, including a later `GoFailsafe`. That is
+    /// deliberate and rests on one precondition: `on_isolation` hands
+    /// the actuator over, after which this node drives nothing and has
+    /// nothing left to bring into a safe state. A `DecisionSink` that
+    /// keeps any actuation after `on_isolation` breaks the assumption
+    /// and must not be used with this framework.
+    ///
+    /// Returning to service takes an external restart of the process,
+    /// which then goes through the normal rejoin path.
+    ///
+    /// The loop still services the diagnostic channel, at one-second
+    /// granularity: a `GetStatus` against an isolated node answers with
+    /// up to that much delay.
     pub(super) fn handle_isolation(&mut self) -> StateEvent {
         warn!("isolation entered, notifying sink");
         self.sink.on_isolation();
@@ -182,7 +197,7 @@ where
                 if is_returning {
                     if let Err(e) = self.state.finalize_discovery() {
                         error!(error = ?e, "finalize_discovery failed");
-                        return StateEvent::SelfTestErr;
+                        return StateEvent::DiscoveryInconsistent;
                     }
                     self.state.set_was_lost(false);
                     // The snapshot adopted in SystemStateSync carries our
@@ -197,6 +212,18 @@ where
             PhaseOutcome::Timeout => {
                 self.state.clear_pending_rejoin();
                 warn!(is_returning, expected = ?expected_size.get(), "resync deadline exceeded");
+                if is_returning {
+                    // A returning node reaches this phase before
+                    // `finalize_discovery`, so its per-peer buffers are
+                    // still unsized while the roster already holds the
+                    // peers it heard from. Error management indexes
+                    // those buffers by roster slot, so routing there
+                    // would panic. It is also the wrong place to go:
+                    // a node that failed to rejoin is not a participant
+                    // and has no standing to vote on exclusions.
+                    self.mark_failsafe(FailsafeReason::LocalFault);
+                    return StateEvent::Fault;
+                }
                 StateEvent::ResyncLostPeerTimeout
             }
             PhaseOutcome::Fault => {
@@ -253,11 +280,10 @@ where
 
                 if let Err(e) = self.state.finalize_discovery() {
                     error!(error = ?e, "finalize_discovery failed");
-                    return StateEvent::SelfTestErr;
+                    return StateEvent::DiscoveryInconsistent;
                 }
 
                 self.state.start_new_cycle();
-                self.state.set_system_state(SystemState::Operational);
                 StateEvent::InitialSyncOk
             }
             PhaseOutcome::Timeout => {

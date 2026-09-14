@@ -21,7 +21,7 @@ use crate::framework::config::{
     ParticipantConfig, MAX_APPLICATION_DATA_SIZE, MAX_PEERS, MAX_TOTAL_NODES,
 };
 use crate::framework::clock_sync::PeerClock;
-use crate::framework::state_machine::{NodeState, SystemState};
+use crate::framework::state_machine::NodeState;
 use crate::framework::traits::{ApplicationData, CyclePayload, Voter, VotingOutcome};
 use crate::framework::types::{NodeIdMask, PeerMask};
 use crate::framework::wire::{SnapshotEntry, WireReader, WireWriter};
@@ -190,7 +190,6 @@ pub struct RunState<V: Voter, I: CyclePayload> {
     participants: ParticipantConfig,
 
     node_state: NodeState,
-    system_state: SystemState,
     current_seq: u32,
 
     roster: PeerRoster,
@@ -236,7 +235,6 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
             voter,
             participants,
             node_state: NodeState::Startup,
-            system_state: SystemState::Startup,
             current_seq: 0,
             roster: PeerRoster::new(),
             cycle: CycleState::empty(),
@@ -1214,14 +1212,6 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
     pub fn set_node_state(&mut self, s: NodeState) {
         self.node_state = s;
     }
-    /// Current system-wide operational mode.
-    pub fn system_state(&self) -> SystemState {
-        self.system_state
-    }
-    /// Set the system-wide operational mode.
-    pub fn set_system_state(&mut self, s: SystemState) {
-        self.system_state = s;
-    }
     /// Cycle counter. Part of the system-state CRC, so it is identical
     /// on every node that is in step.
     pub fn current_seq(&self) -> u32 {
@@ -1793,6 +1783,28 @@ mod quorum_and_evidence_tests {
         assert_eq!(s.proposed_exclusions(), PeerMask::EMPTY);
         assert_eq!(s.own_rejoin_vote(), NodeIdMask::EMPTY);
         assert!(s.last_decision().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn per_peer_queries_require_a_finalized_roster() {
+        // Documents a real precondition rather than a nicety: between
+        // `on_peer_discovered` and `finalize_discovery` the roster
+        // already holds peers while the per-peer buffers are still
+        // unsized, and every query that indexes by roster slot will
+        // panic. A returning node sits in exactly that window during
+        // ResyncLostPeer, which is why its timeout path must not route
+        // into error management. If this ever stops panicking because
+        // the queries were made defensive, drop the test and simplify
+        // the timeout branch in `handle_resync_lost_node` with it.
+        let mut s = State::new(
+            0,
+            1,
+            BrakeVoter::new(2, 0.5),
+            ParticipantConfig::new(2, 3, 10),
+        );
+        s.on_peer_discovered(1).expect("discover");
+        let _ = s.healthy_peers_missing_vote();
     }
 
     #[test]
