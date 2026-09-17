@@ -997,6 +997,36 @@ impl<V: Voter, I: CyclePayload> RunState<V, I> {
         })
     }
 
+    /// True when at least one non-Lost peer delivered an exclusion
+    /// proposal in the current vote round.
+    ///
+    /// Error management uses this as its witness check. A round that
+    /// completes without a single proposal from a non-Lost peer has no
+    /// evidence that anyone else is still there, and "we are blind" and
+    /// "everyone else is dead" cannot be told apart from here.
+    pub fn any_peer_vote_received(&self) -> bool {
+        self.roster
+            .peers()
+            .iter()
+            .enumerate()
+            .any(|(idx, p)| p.health != PeerHealth::Lost && self.votes.proposals[idx].is_some())
+    }
+
+    /// Non-lost peers that attested an ack this cycle but no CRC in the
+    /// current exchange. Candidates for a unilateral exclusion proposal
+    /// after the CRC phase timed out.
+    pub fn peers_with_ack_but_missing_crc(&self) -> Vec<u8, MAX_PEERS> {
+        self.collect_peers_where(|idx, _| {
+            self.cycle.peer_acks[idx].is_some() && self.peer_crcs[idx].is_none()
+        })
+    }
+
+    /// True when at least one peer attested a CRC in the current
+    /// exchange.
+    pub fn any_peer_crc(&self) -> bool {
+        self.peer_crcs.iter().any(|c| c.is_some())
+    }
+
     /// Aggregate peer exclusion proposals + own vote into a confirmed mask.
     /// Rule 1a: target's own vote is ignored.
     pub fn aggregate_exclusion_votes(&self) -> PeerMask {
@@ -1450,6 +1480,40 @@ mod quorum_and_evidence_tests {
             received_from: received_from.as_u8(),
             publisher_candidate: 0,
         }
+    }
+
+    #[test]
+    fn a_vote_round_without_any_proposal_has_no_witness() {
+        let mut s = state_with(&[1, 2], 2);
+        assert!(!s.any_peer_vote_received());
+        s.record_peer_exclusion_proposal(2, PeerMask::EMPTY)
+            .expect("record proposal");
+        assert!(s.any_peer_vote_received());
+        s.reset_exclusion_proposals();
+        assert!(!s.any_peer_vote_received());
+    }
+
+    #[test]
+    fn a_proposal_from_a_lost_peer_is_no_witness() {
+        let mut s = state_with(&[1, 2], 2);
+        s.record_peer_exclusion_proposal(1, PeerMask::EMPTY)
+            .expect("record proposal");
+        s.apply_confirmed_exclusions(mask(&[0]));
+        assert!(!s.any_peer_vote_received());
+    }
+
+    #[test]
+    fn missing_crc_is_only_attributed_to_peers_that_acked() {
+        let mut s = state_with(&[1, 2], 2);
+        s.reset_crc_evidence();
+        assert!(!s.any_peer_crc());
+        assert!(s.peers_with_ack_but_missing_crc().is_empty());
+
+        s.record_peer_ack(1, ack(mask(&[0]))).expect("ack 1");
+        s.record_peer_ack(2, ack(mask(&[0]))).expect("ack 2");
+        s.record_peer_crc(1, 0xDEAD_BEEF).expect("crc 1");
+        assert!(s.any_peer_crc());
+        assert_eq!(s.peers_with_ack_but_missing_crc().as_slice(), &[2]);
     }
 
     #[test]

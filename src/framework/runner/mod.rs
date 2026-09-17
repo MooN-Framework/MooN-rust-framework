@@ -53,6 +53,27 @@ macro_rules! diag_bool_helper {
     };
 }
 
+/// Consecutive error-management rounds without a decision in between
+/// after which the node goes failsafe.
+///
+/// Every cycle that does not end in a decision passes through error
+/// management, so this caps the number of consecutive cycles without a
+/// delivered result. Beyond that the fabric is formally quorate but no
+/// longer productive, for example under a persistent one-sided frame
+/// loss or a peer that keeps forging an ErrorManagement header, and the
+/// actuator would otherwise keep its last value indefinitely.
+///
+/// Sizing: a lost beacon, a rendezvous at startup or an exclusion
+/// costs one round, rarely two. The largest transient disturbance in
+/// the test catalogue is T16, twenty forged ErrorManagement headers.
+/// Every collect phase sends at least twice before it completes (on
+/// entry and on completion), and one rendezvous cycle of the forging
+/// node spans at least ShareInputs, ErrorManagement and CycleSync, so
+/// each round consumes at least six forged frames. Twenty frames
+/// therefore force at most four consecutive rounds (6 + 6 + 6 + 2),
+/// and the limit has to sit above that.
+pub const MAX_ROUNDS_WITHOUT_DECISION: u32 = 5;
+
 /// Owns the application implementations and drives the phase loop.
 ///
 /// Construct with [`Runner::new`], then call [`Runner::run`], which
@@ -95,6 +116,10 @@ where
     pub(super) drops_stale: u32,
     pub(super) drops_lost_peer: u32,
     pub(super) cycles_since_last_sync: u32,
+    /// Error-management rounds entered since the last cycle that
+    /// produced a decision. Compared against
+    /// [`MAX_ROUNDS_WITHOUT_DECISION`].
+    pub(super) rounds_without_decision: u32,
     #[cfg(feature = "diagnostic")]
     pub(super) diagnostic: Option<Diagnostic>,
 
@@ -192,6 +217,7 @@ where
             drops_stale: 0,
             drops_lost_peer: 0,
             cycles_since_last_sync: 0,
+            rounds_without_decision: 0,
             #[cfg(feature = "diagnostic")]
             diagnostic,
             peer_in_error_seen: false,
@@ -363,8 +389,9 @@ where
         ///
         /// Each iteration runs the handler for the current phase, feeds
         /// its event through the transition function and logs the
-        /// transition. The sink's `on_failsafe` hook fires once, right
-        /// before this returns.
+        /// transition. On failsafe the sink's `on_failsafe` hook fires
+        /// once, before the `GoFailsafe` broadcast, and this returns
+        /// after the broadcast.
         pub fn run(&mut self)
         where
             V::Payload: crate::framework::traits::Corruptible,
@@ -426,8 +453,8 @@ where
 
     #[inline]
     pub(super) fn mark_failsafe(&mut self, reason: FailsafeReason) {
-        // Erster Grund gewinnt — spaetere Ueberschreibungen sind meist
-        // Folgefehler, die weniger informativ sind.
+        // First reason wins. Later ones are usually consequential
+        // faults and carry less information.
         if self.pending_failsafe_reason.is_none() {
             self.pending_failsafe_reason = Some(reason);
         }
@@ -440,9 +467,14 @@ where
             "failsafe entered"
         );
 
-        // Best-effort GoFailsafe-Broadcast an alle Peers. Bypasst
-        // absichtlich send_frame — im Failsafe-Pfad wollen wir keine
-        // Injection-Effekte auf die GoFailsafe-Semantik.
+        // Actuator first. The broadcast below takes three sends with a
+        // pause after each, and none of that may delay the local safe
+        // state.
+        self.sink.on_failsafe();
+
+        // Best-effort GoFailsafe broadcast to all peers. Deliberately
+        // bypasses send_frame so no injection can alter the GoFailsafe
+        // semantics on this path.
         let node_state = self.state.node_state();
         for _ in 0..3 {
             if let Err(e) = self.transport.send(
@@ -455,8 +487,5 @@ where
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-
-        // Aktor in sicheren Zustand.
-        self.sink.on_failsafe();
     }
 }

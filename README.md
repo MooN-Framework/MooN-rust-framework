@@ -116,7 +116,7 @@ stateDiagram-v2
     SendAck --> ErrorManagement : AckTimeout / PeerInError
 
     SystemStateCrcExchange --> PublishResult : CrcOk
-    SystemStateCrcExchange --> ErrorManagement : CrcDivergent / PeerInError
+    SystemStateCrcExchange --> ErrorManagement : CrcDivergent / CrcTimeout / PeerInError
     SystemStateCrcExchange --> Isolation : SelfExcluded
 
     PublishResult --> CycleSync : ResultPublished
@@ -135,7 +135,7 @@ stateDiagram-v2
 
     ErrorManagement --> CycleSync : StateOk
     ErrorManagement --> Isolation : SelfExcluded
-    ErrorManagement --> Failsafe : StateTimeout / TooFewNodes
+    ErrorManagement --> Failsafe : StateTimeout / TooFewNodes / NoProgress
 
     Failsafe --> [*]
 ```
@@ -196,6 +196,33 @@ already-excluded node, and an exclusion vote that times out with no
 votes received goes failsafe rather than parking in isolation.
 Isolation is silent but never triggers the sink's emergency hook, which
 is the wrong state to end up in by accident.
+
+**No vote round without a witness.** Error management only completes
+once at least one non-lost peer has voted, even when no peer owes a
+vote because none delivered anything this cycle. A live peer follows
+into the round via the rendezvous rule, a dead fabric does not, and the
+round then times out into failsafe instead of returning to `CycleSync`
+and looping there.
+
+**Bounded time without a decision.** Every cycle that does not end in a
+decision passes through error management. After
+`MAX_ROUNDS_WITHOUT_DECISION` such rounds in a row the node goes
+failsafe (`NoProgress`), so a fabric that is formally quorate but no
+longer productive, e.g. under a persistent one-sided frame loss or a
+peer that keeps forging an ErrorManagement header, stops instead of
+leaving the actuator on its last value. The limit is 5: the twenty
+forged headers of T16 force at most four rounds in a row, see the
+sizing note on the constant.
+
+**A missing CRC is a timeout like any other.** A CRC exchange that runs
+out routes through error management. Peers that acked but sent no CRC
+are proposed for exclusion, so a single silent node in a full fabric is
+voted out instead of taking everyone into failsafe.
+
+**The safe state comes first.** On failsafe the sink's `on_failsafe`
+hook runs before the `GoFailsafe` broadcast. Every waiting phase aborts
+as soon as it receives a `GoFailsafe`, and clock sync gives up as soon
+as every peer is unreachable instead of waiting out its deadline.
 
 ## Configuration
 

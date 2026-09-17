@@ -208,6 +208,13 @@ impl ClockSync {
         has_responsive
     }
 
+    /// True when every peer has been flagged unreachable. The phase can
+    /// then never complete, so the caller gives up at once instead of
+    /// waiting out its full deadline.
+    pub fn all_unreachable(&self) -> bool {
+        !self.peers.is_empty() && self.peers.iter().all(|p| p.unreachable)
+    }
+
     /// Peer IDs flagged unreachable during this phase. Diagnostic use —
     /// callers may want to log which peers were excluded from the sync.
     pub fn unreachable_peers(&self) -> Vec<u8> {
@@ -430,6 +437,16 @@ mod tests {
         ps.mark_unreachable_if_stale(10_000_000_000, 100_000_000);
         assert_eq!(ps.unreachable_peers(), vec![1, 2]);
         assert!(!ps.is_complete(), "no responsive peer left → not complete");
+        assert!(ps.all_unreachable(), "caller must be able to give up early");
+    }
+
+    #[test]
+    fn one_responsive_peer_is_not_all_unreachable() {
+        let mut ps = ClockSync::new(&[1, 2], 0);
+        round_trip(&mut ps, 1, 150_000_000, 100_000, 50_000);
+        ps.mark_unreachable_if_stale(200_000_000, 100_000_000);
+        assert_eq!(ps.unreachable_peers(), vec![2]);
+        assert!(!ps.all_unreachable());
     }
 
     #[test]

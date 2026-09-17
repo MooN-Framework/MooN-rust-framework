@@ -481,34 +481,47 @@ impl Diagnostic {
         })
     }
 
-    /// Poll the socket once, non-blocking. Staging commands are
-    /// applied to `pending` and return `None`; `GetStatus` is returned
-    /// to the caller, which has the state needed to answer it.
+    /// Read the socket non-blocking until a `GetStatus` for this node
+    /// turns up or nothing is left. Staging commands met on the way are
+    /// applied to `pending`. `GetStatus` is returned to the caller,
+    /// which has the state needed to answer it. `None` means the socket
+    /// is drained.
     pub fn try_recv(&mut self) -> Option<Command> {
+        // Every node shares the diagnostic group, so the socket also
+        // carries commands for other nodes, their status replies and our
+        // own replies looped back. Those are skipped here instead of
+        // being reported as `None`: callers drain until `None`, and
+        // stopping at the first foreign datagram left a backlog behind.
+        // In Isolation, which polls only once per second, that backlog
+        // grew faster than it was drained and status requests went
+        // unanswered.
         let mut buf = [0u8; 4096];
-        let (n, _) = match self.socket.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
-            Err(e) => {
-                warn!(error = ?e, "diagnostic recv failed");
-                return None;
-            }
-        };
-        let telegram = match serde_json::from_slice::<IncomingTelegram>(&buf[..n]) {
-            Ok(t) => t,
-            Err(_) => return None,
-        };
-        match telegram {
-            IncomingTelegram::Input { value } => {
-                self.pending.input_json = Some(value);
-                self.stage_ack("input");
-                None
-            }
-            IncomingTelegram::Command { targets, payload } => {
-                if !targets.contains(&self.node_id) {
+        loop {
+            let (n, _) = match self.socket.recv_from(&mut buf) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
+                Err(e) => {
+                    warn!(error = ?e, "diagnostic recv failed");
                     return None;
                 }
-                self.handle_command(payload)
+            };
+            let telegram = match serde_json::from_slice::<IncomingTelegram>(&buf[..n]) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            match telegram {
+                IncomingTelegram::Input { value } => {
+                    self.pending.input_json = Some(value);
+                    self.stage_ack("input");
+                }
+                IncomingTelegram::Command { targets, payload } => {
+                    if !targets.contains(&self.node_id) {
+                        continue;
+                    }
+                    if let Some(cmd) = self.handle_command(payload) {
+                        return Some(cmd);
+                    }
+                }
             }
         }
     }

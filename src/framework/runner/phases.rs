@@ -6,7 +6,7 @@
 //! sleep on a fixed duration, they wait until a cycle-anchored
 //! deadline.
 
-use super::PhaseOutcome;
+use super::{PhaseOutcome, MAX_ROUNDS_WITHOUT_DECISION};
 use crate::framework::config::{MAX_PEERS, MAX_TOTAL_NODES};
 use crate::framework::clock_sync::{extract_sync_fields, ClockSync, SyncFields, SAMPLES_PER_PEER};
 use crate::framework::state::{
@@ -385,6 +385,19 @@ where
                 self.last_cycle_start = None;
                 self.state.start_new_cycle();
                 return StateEvent::ClockSyncOk;
+            }
+
+            // Nobody left to sync with. `is_complete` can never become
+            // true from here, so waiting out the deadline would only
+            // delay the failsafe by up to `clock_sync_timeout`.
+            if clock_sync.all_unreachable() {
+                error!(
+                    unreachable = ?clock_sync.unreachable_peers().as_slice(),
+                    threshold_ms = unreachable_threshold.as_millis(),
+                    "clock sync: every peer unreachable, giving up before the deadline"
+                );
+                self.mark_failsafe(FailsafeReason::QuorumLost);
+                return StateEvent::ClockSyncTimeout;
             }
 
             if Instant::now() > deadline {
@@ -1278,9 +1291,16 @@ where
                 }
             }
             super::PhaseOutcome::Timeout => {
-                error!("crc phase timeout, failsafe");
-                self.mark_failsafe(FailsafeReason::QuorumLost);
-                StateEvent::Fault
+                // Same treatment as every other in-cycle timeout: name
+                // the peers that went quiet and let the exclusion vote
+                // decide. A single silent node in a full fabric is then
+                // excluded instead of taking everyone into failsafe.
+                warn!(
+                    missing = ?self.state.healthy_peers_missing_crc().as_slice(),
+                    "crc phase timed out, routing to error management"
+                );
+                self.fault_peers_missing_crc_unilateral();
+                StateEvent::CrcTimeout
             }
             super::PhaseOutcome::Fault => {
                 self.mark_failsafe(FailsafeReason::LocalFault);
@@ -1373,6 +1393,11 @@ where
                     }
                 };
                 let own_id = self.state.own_id();
+
+                // A decision exists and the publisher is agreed, so this
+                // cycle delivers a result. That is what the no-progress
+                // watchdog in error management counts against.
+                self.rounds_without_decision = 0;
 
                 let own_result = self.state.cycle().own_result;
                 let dissenter_analysis = own_result.map(|own| {
@@ -1488,13 +1513,27 @@ where
     /// - Vote timed out with a healthy peer silent (Rule 2b) — tagged as
     ///   `QuorumLost` because a silent healthy peer is indistinguishable
     ///   from a lost one at this point.
+    /// - Vote timed out without a single proposal from a non-Lost peer
+    ///   (witness rule). The round only completes once at least one
+    ///   non-Lost peer has voted, even when no peer owes a vote because
+    ///   none delivered anything this cycle. A live peer answers within
+    ///   the round, typically by following us here via the rendezvous
+    ///   rule, which is how a node that merely missed the CycleSync
+    ///   beacons gets back in step. If nobody answers, 'we are blind'
+    ///   and 'everyone else is dead' are indistinguishable, both mean
+    ///   stop. Without this rule the node would complete at once,
+    ///   return to CycleSync, time out there again and loop without
+    ///   ever publishing or stopping.
     /// - Quorum lost after applying transitions.
-    /// - Fabric now in degraded mode AND no peer evidence this cycle:
-    ///   'we are blind' and 'peer is dead' are indistinguishable without a
-    ///   third witness, both mean stop.
+    /// - Voting pool shrank while no failure was tolerable any more.
+    /// - `MAX_ROUNDS_WITHOUT_DECISION` rounds in a row without a
+    ///   decision in between (no-progress watchdog). Checked after the
+    ///   exclusions are applied, so a round that shrinks the roster is
+    ///   judged against the reduced fabric.
     pub(super) fn handle_error_management(&mut self) -> StateEvent {
         self.state.reset_exclusion_proposals();
         let _ = self.take_peer_in_error();
+        self.rounds_without_decision = self.rounds_without_decision.saturating_add(1);
 
         let suppress = self.is_muted() || self.should_drop_vote();
         if suppress {
@@ -1523,7 +1562,11 @@ where
                 }
                 Ok(())
             },
-            |this| this.state.healthy_peers_missing_vote().is_empty(),
+            |this| {
+                let witness = this.state.active_peer_count() == 0
+                    || this.state.any_peer_vote_received();
+                witness && this.state.healthy_peers_missing_vote().is_empty()
+            },
             |this, frame| this.ingest_frame(frame),
         );
 
@@ -1564,12 +1607,30 @@ where
                 let voting_pool_after = 1 + self.state.active_peer_count_alive_only();
                 let voting_pool_shrank = voting_pool_after < voting_pool_before;
                 if no_buffer_before_vote && voting_pool_shrank {
-                     self.mark_failsafe(FailsafeReason::QuorumLost);
-                     return StateEvent::TooFewNodes;
+                    self.mark_failsafe(FailsafeReason::QuorumLost);
+                    return StateEvent::TooFewNodes;
+                }
+
+                if self.rounds_without_decision >= MAX_ROUNDS_WITHOUT_DECISION {
+                    error!(
+                        rounds = self.rounds_without_decision,
+                        limit = MAX_ROUNDS_WITHOUT_DECISION,
+                        "no decision for too many error-management rounds, failsafe"
+                    );
+                    self.mark_failsafe(FailsafeReason::QuorumLost);
+                    return StateEvent::NoProgress;
                 }
                 StateEvent::StateOk
             }
             super::PhaseOutcome::Timeout => {
+                if self.state.any_peer_vote_received() {
+                    error!(
+                        missing = ?self.state.healthy_peers_missing_vote().as_slice(),
+                        "exclusion vote timed out with owed votes missing, failsafe"
+                    );
+                } else {
+                    error!("exclusion vote timed out without any peer vote, no witness left, failsafe");
+                }
                 self.mark_failsafe(FailsafeReason::QuorumLost);
                 StateEvent::StateTimeout
             }
@@ -1609,6 +1670,26 @@ where
             })
             .collect();
         for peer_id in missing_ids {
+            let _ = self.state.propose_exclude(peer_id);
+        }
+    }
+
+    /// Attribute missing CRCs unilaterally, analogous to
+    /// `fault_peers_missing_ack_unilateral`. Only peers that acked this
+    /// cycle are named: they demonstrably reached the end of the cycle
+    /// and then fell silent.
+    ///
+    /// Guard: attribute only when at least one CRC arrived, otherwise
+    /// our own inbound is suspect. Without an attribution the silent
+    /// peer still owes a vote (it acked), so error management runs into
+    /// its timeout and goes failsafe.
+    fn fault_peers_missing_crc_unilateral(&mut self) {
+        if !self.state.any_peer_crc() {
+            warn!("no crcs received, skipping unilateral MissedCrc attribution");
+            return;
+        }
+        for peer_id in self.state.peers_with_ack_but_missing_crc() {
+            warn!(peer_id, "peer acked but sent no crc, proposing exclude");
             let _ = self.state.propose_exclude(peer_id);
         }
     }

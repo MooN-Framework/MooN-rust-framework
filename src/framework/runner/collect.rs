@@ -8,6 +8,11 @@
 //! The loop also answers incoming time-sync requests transparently, so
 //! a peer that is still synchronising does not stall while everyone
 //! else is busy in a cycle phase.
+//!
+//! A `GoFailsafe` from any peer ends the phase at once, before the
+//! phase-specific ingest closure sees the frame. Several closures only
+//! look at their own payload type, so leaving the check to them would
+//! silently drop the broadcast in exactly those phases.
 
 use crate::framework::clock_sync::{extract_sync_fields, SyncFields};
 use crate::framework::state::PeerHealth;
@@ -15,7 +20,7 @@ use crate::framework::traits::{
     ApplicationStateProvider, Computation, DecisionSink, InputSource, SelfTest, Voter,
 };
 use crate::framework::transport::RecvOutcome;
-use crate::framework::wire::UdpFrame;
+use crate::framework::wire::{FailsafeReason, Payload, UdpFrame};
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
@@ -26,7 +31,8 @@ pub enum PhaseOutcome {
     Complete,
     /// Deadline reached without meeting the termination condition.
     Timeout,
-    /// Send path failed hard; caller should transition to failsafe.
+    /// Send path failed hard, or a peer broadcast `GoFailsafe`. The
+    /// caller should transition to failsafe.
     Fault,
 }
 
@@ -95,7 +101,12 @@ where
             }
 
             match self.transport.try_recv() {
-                RecvOutcome::Valid(frame) => ingest(self, frame),
+                RecvOutcome::Valid(frame) => {
+                    if self.take_go_failsafe(phase, &frame) {
+                        return PhaseOutcome::Fault;
+                    }
+                    ingest(self, frame)
+                }
                 RecvOutcome::SeqGap {
                     peer_id,
                     gap,
@@ -103,6 +114,9 @@ where
                 } => {
                     warn!(peer_id, gap, "seq gap, advancing cursor");
                     self.transport.accept(&frame);
+                    if self.take_go_failsafe(phase, &frame) {
+                        return PhaseOutcome::Fault;
+                    }
                     ingest(self, frame);
                 }
                 RecvOutcome::NewSession {
@@ -111,6 +125,12 @@ where
                     new_session,
                     frame,
                 } => {
+                    // A restarted peer that fails straight away still
+                    // takes the fabric with it: fail-safe beats
+                    // availability, same as for a Lost sender.
+                    if self.take_go_failsafe(phase, &frame) {
+                        return PhaseOutcome::Fault;
+                    }
                     let was_lost = self
                         .state
                         .peer_index(peer_id)
@@ -151,5 +171,27 @@ where
                 _ => {}
             }
         }
+    }
+
+    /// Check a received frame for `GoFailsafe`. On a hit the reason is
+    /// latched as `PeerBroadcast` and the flag for the run loop is set.
+    /// Latching here, before the caller maps `Fault` to its own reason,
+    /// keeps the peer broadcast as the recorded cause.
+    ///
+    /// Honours the asymmetric-view injection, so a peer that is being
+    /// ignored on purpose is ignored for this frame too.
+    fn take_go_failsafe(&mut self, phase: &'static str, frame: &UdpFrame<C::Input, V::Payload>) -> bool {
+        let Payload::GoFailsafe { reason } = frame.payload() else {
+            return false;
+        };
+        let peer_id = frame.node_id();
+        if self.should_drop_frame_from_peer(peer_id) {
+            debug!(peer_id, phase, "injection: dropping GoFailsafe from peer");
+            return false;
+        }
+        warn!(peer_id, reason, phase, "peer broadcast GoFailsafe, aborting phase");
+        self.peer_failsafe_seen = true;
+        self.mark_failsafe(FailsafeReason::PeerBroadcast);
+        true
     }
 }

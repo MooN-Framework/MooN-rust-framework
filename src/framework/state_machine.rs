@@ -122,6 +122,11 @@ pub enum StateEvent {
     CrcOk,
     /// At least one node reported a different system-state CRC.
     CrcDivergent,
+    /// At least one non-lost peer's CRC did not arrive before the
+    /// deadline. Routed through ErrorManagement like every other
+    /// in-cycle timeout, so a single silent node is excluded instead of
+    /// taking a full fabric into failsafe.
+    CrcTimeout,
 
     /// Snapshot exchange completed and the local state was adopted.
     SystemStateSyncOk,
@@ -135,6 +140,11 @@ pub enum StateEvent {
     /// Applying the exclusions would drop the fabric below the safety
     /// floor.
     TooFewNodes,
+    /// Too many consecutive error-management rounds without a decision
+    /// in between. The fabric is still formally quorate but no longer
+    /// delivers results, e.g. under a persistent one-sided frame loss,
+    /// so it stops instead of looping.
+    NoProgress,
     /// Unrecoverable local error, e.g. a failed send.
     Fault,
     /// A majority of peers named this node for exclusion.
@@ -193,8 +203,9 @@ impl NodeState {
 
             (SystemStateCrcExchange, CrcOk) => PublishResult,
             (SystemStateCrcExchange, CrcDivergent) => ErrorManagement,
+            (SystemStateCrcExchange, CrcTimeout) => ErrorManagement,
             (SystemStateCrcExchange, PeerInError) => ErrorManagement,
-            (SystemStateCrcExchange,  SelfExcluded) => Isolation,
+            (SystemStateCrcExchange, SelfExcluded) => Isolation,
 
             (PublishResult, ResultPublished) => CycleSync,
             (PublishResult, ResyncDue) => ClockSync,
@@ -222,6 +233,7 @@ impl NodeState {
             (ErrorManagement, StateOk) => CycleSync,
             (ErrorManagement, StateTimeout) => Failsafe,
             (ErrorManagement, TooFewNodes) => Failsafe,
+            (ErrorManagement, NoProgress) => Failsafe,
             (ErrorManagement, SelfExcluded) => Isolation,
 
             (Failsafe, _) => Failsafe,
@@ -333,6 +345,7 @@ mod transition_tests {
         (SendAck, PeerInError, ErrorManagement),
         (SystemStateCrcExchange, CrcOk, PublishResult),
         (SystemStateCrcExchange, CrcDivergent, ErrorManagement),
+        (SystemStateCrcExchange, CrcTimeout, ErrorManagement),
         (SystemStateCrcExchange, PeerInError, ErrorManagement),
         (SystemStateCrcExchange, SelfExcluded, Isolation),
         (PublishResult, ResultPublished, CycleSync),
@@ -350,6 +363,7 @@ mod transition_tests {
         (ErrorManagement, StateOk, CycleSync),
         (ErrorManagement, StateTimeout, Failsafe),
         (ErrorManagement, TooFewNodes, Failsafe),
+        (ErrorManagement, NoProgress, Failsafe),
         (ErrorManagement, SelfExcluded, Isolation),
     ];
 
@@ -382,11 +396,13 @@ mod transition_tests {
         StateDiverged,
         CrcOk,
         CrcDivergent,
+        CrcTimeout,
         SystemStateSyncOk,
         SystemStateSyncTimeout,
         SystemStateSyncMinority,
         StateTimeout,
         TooFewNodes,
+        NoProgress,
         Fault,
         SelfExcluded,
         InputSourceFailed,
