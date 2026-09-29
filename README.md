@@ -1,4 +1,4 @@
-# swb_fault_tolerance
+# MooN-Framework
 
 Software-based fault tolerance for MooN systems, in Rust.
 
